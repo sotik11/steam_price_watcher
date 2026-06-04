@@ -1,0 +1,27 @@
+{
+  "_meta": {
+    "code": "claude",
+    "name": "Claude",
+    "type": "dark",
+    "row_select_bg": "#1e3a5a",
+    "active_tab_bg": "#84BD3A"
+  },
+  "colors": {
+    "primary":   "#1A9FFF",
+    "secondary": "#6B7280",
+    "success":   "#16A34A",
+    "info":      "#1A9FFF",
+    "warning":   "#F59E0B",
+    "danger":    "#DC2626",
+    "light":     "#F5F5F0",
+    "dark":      "#1E1E1C",
+    "bg":        "#1E1F1F",
+    "fg":        "#F5F5F0",
+    "selectbg":  "#353636",
+    "selectfg":  "#F5F5F0",
+    "border":    "#3F3D3B",
+    "inputfg":   "#F5F5F0",
+    "inputbg":   "#2B2C2C",
+    "active":    "#2B2C2C"
+  }
+}

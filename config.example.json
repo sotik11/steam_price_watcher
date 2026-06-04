@@ -1,0 +1,21 @@
+{
+  "telegram": {
+    "bot_token": "PUT_TOKEN_FROM_BOTFATHER_HERE",
+    "chat_id": "PUT_YOUR_CHAT_ID_HERE"
+  },
+  "market": {
+    "currency": 18,
+    "country": "UA"
+  },
+  "schedule": {
+    "interval_minutes": 5
+  },
+  "ui": {
+    "theme": "superhero",
+    "language": "en"
+  },
+  "antispam": {
+    "repeat_if_lower": true,
+    "remind_after_hours": 24
+  }
+}
