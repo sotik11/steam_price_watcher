@@ -100,7 +100,8 @@ def _set_rate_limit(state: dict, now: datetime, retry_after: int | None) -> None
 def _process_list(kind: str, list_path: Path, *,
                   config, state, currency, country,
                   template, token, chat_id,
-                  repeat_if_lower, remind_after_hours, now):
+                  repeat_if_lower, remind_after_hours, now,
+                  poll_delay=1.5):
     """Poll one card-list (buy or sell), update last_seen, send alerts.
 
     Returns (state_dirty, list_dirty) so the caller can decide whether to
@@ -147,7 +148,10 @@ def _process_list(kind: str, list_path: Path, *,
     log.info(t("log.checking", count=len(active)) + f"  ({kind})")
 
     from steam import fetch_prices_batch
-    from telegram import send_alert
+    # telegram.send_alert is called inside alerts.evaluate_and_alert; the
+    # import lives there. Keep the alerts import here so we don't pay for it
+    # if the early "no active cards" return fires.
+    from alerts import evaluate_and_alert
 
     # Sell list may contain duplicate (appid, name) entries (the user is
     # selling multiple copies of the same card). De-dup before hitting
@@ -162,7 +166,8 @@ def _process_list(kind: str, list_path: Path, *,
         seen.add(ident)
         unique_active.append(c)
 
-    results = fetch_prices_batch(unique_active, currency=currency, country=country)
+    results = fetch_prices_batch(unique_active, currency=currency, country=country,
+                                 delay=poll_delay)
 
     # If the batch was aborted by a 429, stamp the cooldown so the next
     # scheduled run skips entirely instead of pounding Steam again.
@@ -230,49 +235,25 @@ def _process_list(kind: str, list_path: Path, *,
         # Sell: alert only when market dropped STRICTLY below my target —
         #   equal price doesn't undercut my listing yet, no reason to
         #   panic-relist.
-        hit_target = (lowest <= target) if kind == "buy" else (lowest < target)
-        if not hit_target:
-            continue
-
-        entry = state.get(key, {})
-        last_alerted_price = entry.get("last_alerted_price")
-        last_alert_time_str = entry.get("last_alert_time")
-
-        should_alert = False
-        reason = ""
-
-        if not last_alerted_price:
-            should_alert = True
-            reason = t("log.reason.first_alert")
-        elif repeat_if_lower and lowest < last_alerted_price:
-            should_alert = True
-            reason = t("log.reason.price_dropped", now=lowest, prev=last_alerted_price)
-        elif last_alert_time_str:
-            last_time = datetime.fromisoformat(last_alert_time_str)
-            if now - last_time > timedelta(hours=remind_after_hours):
-                should_alert = True
-                reason = t("log.reason.reminder", hours=remind_after_hours)
-
-        if not should_alert:
-            continue
-
-        log.info(t("log.sending_alert", name=name, reason=reason))
-        try:
-            send_alert(token, chat_id, item, template)
-            state[key] = {
-                "last_alerted_price": lowest,
-                "last_alert_time": now.isoformat(),
-            }
+        # Real decision lives in alerts.evaluate_and_alert so the GUI's
+        # manual "Оновити зараз" path can call the SAME logic — single
+        # source of truth means antispam state stays consistent regardless
+        # of who triggered the poll.
+        sd, did_alert, _reason = evaluate_and_alert(
+            kind=kind, info=item, state=state,
+            token=token, chat_id=chat_id, template=template,
+            repeat_if_lower=repeat_if_lower,
+            remind_after_hours=remind_after_hours, now=now,
+        )
+        if sd:
             state_dirty = True
+        if did_alert:
             # Mark EVERY matching row as alerted (sell list may have
             # duplicates — they all hit target at the same time).
             for w in matching:
                 if w.get("status") != "alerted":
                     w["status"] = "alerted"
                     list_dirty = True
-            log.info(t("log.alert_sent", name=name))
-        except Exception as exc:
-            log.error(t("log.alert_failed", name=name, err=str(exc)))
 
     if list_dirty:
         save_json(list_path, items)
@@ -295,6 +276,10 @@ def main():
     chat_id = str(config["telegram"]["chat_id"])
     currency = config["market"].get("currency", 18)
     country = config["market"].get("country", "UA")
+    # Pause between price-fetch requests inside one poll. The orderbook
+    # endpoint we use doesn't enforce a hard rate limit (tested at 0.3s
+    # without throttle), but 1.5s keeps the traffic profile polite.
+    poll_delay = float(config["market"].get("poll_delay_sec", 1.5))
     template = (config.get("message_template") or "").strip() or t("tg.message.default")
     antispam = config.get("antispam", {})
     remind_after_hours = antispam.get("remind_after_hours", 24)
@@ -336,7 +321,7 @@ def main():
             template=template, token=token, chat_id=chat_id,
             repeat_if_lower=repeat_if_lower,
             remind_after_hours=remind_after_hours,
-            now=now,
+            now=now, poll_delay=poll_delay,
         )
         if sd:
             state_changed = True

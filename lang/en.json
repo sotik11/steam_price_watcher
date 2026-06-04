@@ -68,6 +68,7 @@
   "lbl.currency":        "Currency:",
   "lbl.country":         "Country:",
   "lbl.interval":        "Interval (min):",
+  "lbl.poll_delay":      "Delay (sec):",
   "lbl.theme":           "UI theme:",
   "lbl.language":        "Language:",
   "lbl.antispam_hours":  "Antispam — remind\nafter (hours):",

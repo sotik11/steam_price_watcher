@@ -10,8 +10,21 @@ from i18n import t
 log = logging.getLogger("steam")
 
 PRICE_OVERVIEW_URL = "https://steamcommunity.com/market/priceoverview/"
+ORDERBOOK_URL = "https://steamcommunity.com/market/orderbook"
 LISTINGS_URL = "https://steamcommunity.com/market/listings/{appid}/{name}"
 APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
+
+# Currency symbol per Steam currency code — for formatting orderbook
+# prices into the human-readable string we store in `last_seen`.
+# Steam's priceoverview used to return this string baked in; orderbook
+# returns only the integer (in "kopecks" — 1/100 of base unit).
+_CURRENCY_SYMBOLS = {
+    1: "$",     # USD
+    2: "£",     # GBP
+    3: "€",     # EUR
+    5: "₽",     # RUB
+    18: "₴",    # UAH
+}
 
 # Steam's 2025-era rate limiting on priceoverview / itemordershistogram is
 # fingerprint-based: a request that doesn't *look* like a real Chrome tab
@@ -51,19 +64,20 @@ _DEFAULT_HEADERS = {
 # instead of hanging for the full 10 s on connect and another 10 s on read.
 _TIMEOUT = (5, 8)
 
-# Persistent HTTP session so cookies (`sessionid`, `browserid`, `timezoneOffset`)
-# survive across requests. Steam treats a session-cookie-less request as
-# "random script" and ban-counters faster; a session that landed on the
-# market home page first looks like a normal browsing tab.
+# Persistent HTTP session so connection reuse keeps the per-request cost
+# down — orderbook responses are ~250 B, the TLS handshake is most of the
+# wall-clock budget if we open a fresh connection every call.
 _SESSION: requests.Session | None = None
-_SESSION_WARMED_UP = False
 
 
 def _get_session() -> requests.Session:
     """Lazily build a requests.Session with browser-like defaults.
 
-    Single shared session means cookies persist across batch requests in
-    one process (watch.py) and across "Оновити зараз" clicks in the GUI.
+    Single shared session means TCP/TLS connection reuse across batch
+    requests in one process (watch.py) and across "Оновити зараз" clicks
+    in the GUI. The market/orderbook endpoint doesn't require any session
+    cookies, so we no longer warm up against the market home page — used
+    to be needed for priceoverview's bot detection.
     """
     global _SESSION
     if _SESSION is None:
@@ -71,42 +85,6 @@ def _get_session() -> requests.Session:
         _SESSION.headers.update(_DEFAULT_HEADERS)
     return _SESSION
 
-
-def _warm_up_session() -> None:
-    """Visit the market home page once to seed anonymous cookies.
-
-    Steam's bot detection cares whether you've ever loaded a page on this
-    "session". Loading the home page first puts `sessionid` + `browserid`
-    in the cookie jar; subsequent priceoverview calls then look like
-    AJAX from a tab the user already has open.
-
-    Idempotent — runs once per process.
-    """
-    global _SESSION_WARMED_UP
-    if _SESSION_WARMED_UP:
-        return
-    try:
-        session = _get_session()
-        # Use the home page (no specific Referer needed — first hit).
-        # Replace the AJAX-y headers for this one navigation request.
-        nav_headers = {
-            "Accept": ("text/html,application/xhtml+xml,application/xml;"
-                       "q=0.9,image/avif,image/webp,*/*;q=0.8"),
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Dest": "document",
-        }
-        session.get("https://steamcommunity.com/market/",
-                    headers=nav_headers, timeout=_TIMEOUT)
-        _SESSION_WARMED_UP = True
-        log.info("steam session warmed up (cookies: %s)",
-                 ", ".join(session.cookies.keys()) or "none")
-    except Exception as exc:
-        # Warm-up is best-effort. If it fails we still try priceoverview
-        # afterwards — at worst we lose the cookie advantage, the call
-        # itself can still succeed.
-        log.warning("steam session warm-up failed: %s", exc)
-        _SESSION_WARMED_UP = True  # don't retry on every call
 
 # Maps Steam currency codes to regex patterns for stripping non-numeric chars
 _STRIP_CURRENCY = re.compile(r"[^\d,\.]")
@@ -158,18 +136,161 @@ def parse_price(price_str: str) -> float | None:
         return None
 
 
-def get_price(appid: str | int, market_hash_name: str, currency: int = 18, country: str = "UA") -> dict:
-    """Fetch lowest_price, median_price, volume from priceoverview.
+def _format_price(amount_int: int, currency: int) -> str:
+    """Format integer "kopecks" from orderbook into a display string.
+
+    Orderbook returns prices like 500 (meaning 5.00 of the base unit).
+    For UAH/USD/EUR we show "5,00₴" / "$5.00" / etc. Falls back to the
+    plain number if we don't recognise the currency code.
+    """
+    value = amount_int / 100
+    sym = _CURRENCY_SYMBOLS.get(currency)
+    if sym is None:
+        return f"{value:.2f}"
+    # UAH uses the symbol after the number with a comma decimal separator
+    # (that's what Steam's own priceoverview returned, e.g. "5,00₴").
+    # For dollar-style currencies the symbol goes before.
+    if currency == 18:  # UAH
+        return f"{value:.2f}".replace(".", ",") + sym
+    if currency in (1, 2):  # USD, GBP — symbol before, dot decimal
+        return f"{sym}{value:.2f}"
+    # EUR / RUB / others — symbol after with a comma decimal.
+    return f"{value:.2f}".replace(".", ",") + sym
+
+
+def get_price_via_orderbook(appid: str | int, market_hash_name: str,
+                            currency: int = 18, country: str = "UA") -> dict:
+    """Fetch lowest sell / highest buy from market/orderbook.
+
+    This is the **primary** price source as of the 2026 Steam SPA rewrite.
+    Endpoint URL:
+        https://steamcommunity.com/market/orderbook?q=Load&qp=[appid,mhn]
+
+    Returned `data`:
+        amtMinSellOrder   — lowest active sell order, in 1/100 of base unit
+        amtMaxBuyOrder    — highest active buy order, same units
+        eCurrency         — currency code the response is denominated in
+        cSellOrders       — count of active sell orders in the book
+        cBuyOrders        — count of active buy orders in the book
+        rgCompactSellOrders — flat [price, count, price, count, …] pairs
+        rgCompactBuyOrders  — same shape
+
+    Why this endpoint over priceoverview:
+    - Tested at 300+ requests over 20 minutes with zero 429s.
+    - No fingerprinting / cookies / item_nameid required.
+    - Returns clean JSON (no HTML parsing).
+    - Built for the same UI the user sees in the browser, so the request
+      profile matches Steam's expected traffic shape.
+
+    Returns the same dict shape as the legacy priceoverview path so
+    callers don't need a branch:
+        lowest_price (float|None), lowest_price_raw (str), volume (int|None), raw (dict).
+    `volume` here is `cSellOrders` (number of active sell offers), not the
+    24h sales volume that priceoverview gave — we trade that for not
+    getting banned.
+    """
+    short_name = market_hash_name[:40]
+    # qp parameter is a JSON array stringified: [appid, "market_hash_name"]
+    # We hand-build it instead of using json.dumps to keep the format
+    # byte-identical to what Steam's own SPA sends (no extra spaces).
+    qp = f'[{appid},"{market_hash_name}"]'
+    params = {"q": "Load", "qp": qp}
+    session = _get_session()
+    # Referer points to the actual listing page — Steam apparently still
+    # logs this, costs nothing to send.
+    headers = {"Referer": market_url(appid, market_hash_name)}
+    t0 = time.monotonic()
+    try:
+        resp = session.get(
+            ORDERBOOK_URL, params=params,
+            timeout=_TIMEOUT, headers=headers,
+        )
+    except requests.RequestException as exc:
+        elapsed = time.monotonic() - t0
+        log.warning(t("log.priceoverview_fail",
+                      name=short_name, elapsed=elapsed, err=exc))
+        raise
+
+    elapsed = time.monotonic() - t0
+    if resp.status_code == 429:
+        # Shouldn't realistically happen for orderbook, but if it does
+        # the rest of the machinery (RateLimitedError, cooldown) takes over.
+        retry_after = None
+        ra_header = resp.headers.get("Retry-After")
+        if ra_header:
+            try:
+                retry_after = int(ra_header)
+            except ValueError:
+                retry_after = None
+        log.error(t("log.priceoverview_rate_limited",
+                    name=short_name, elapsed=elapsed,
+                    retry=retry_after if retry_after is not None else "—"))
+        raise RateLimitedError(market_hash_name, retry_after)
+    log.info(t("log.priceoverview_ok",
+               name=short_name, elapsed=elapsed,
+               status=resp.status_code, bytes=len(resp.content)))
+    resp.raise_for_status()
+
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        head = resp.text[:120].replace("\n", " ")
+        raise ValueError(
+            t("log.priceoverview_html", name=short_name, head=head)
+        ) from exc
+
+    if not data.get("success"):
+        raise ValueError(t("log.api_failure", name=market_hash_name))
+
+    body = data.get("data", {}) or {}
+    amt_sell = body.get("amtMinSellOrder")
+    if isinstance(amt_sell, (int, float)):
+        lowest = amt_sell / 100
+        lowest_raw = _format_price(int(amt_sell), currency)
+    else:
+        lowest = None
+        lowest_raw = ""
+
+    # We expose cSellOrders as "volume" so existing UI / log code keeps
+    # working unchanged. It's semantically different from priceoverview's
+    # 24-hour volume, but it's the closest thing the orderbook payload
+    # offers — and arguably more relevant for buy/sell decisions.
+    c_sell = body.get("cSellOrders")
+    volume = int(c_sell) if isinstance(c_sell, (int, float)) else None
+
+    return {
+        "lowest_price": lowest,
+        "lowest_price_raw": lowest_raw,
+        "volume": volume,
+        "raw": data,
+    }
+
+
+def get_price(appid: str | int, market_hash_name: str,
+              currency: int = 18, country: str = "UA") -> dict:
+    """Façade for the active "what's the lowest price" implementation.
+
+    Currently delegates to `get_price_via_orderbook`. The legacy
+    `get_price_via_priceoverview` is kept around as a manual fallback —
+    callers can switch over by name if Steam ever closes the orderbook
+    endpoint.
+    """
+    return get_price_via_orderbook(appid, market_hash_name, currency, country)
+
+
+def get_price_via_priceoverview(appid: str | int, market_hash_name: str,
+                                currency: int = 18, country: str = "UA") -> dict:
+    """LEGACY: fetch lowest_price, median_price, volume from priceoverview.
+
+    Kept as an emergency fallback in case Steam ever closes the orderbook
+    endpoint we now use by default. As of late 2026 priceoverview is
+    aggressively rate-limited (10-100 req before a ~2h IP ban), so this
+    code path should not be hit on every poll. Documented as legacy for
+    that reason.
 
     Returns dict with keys: lowest_price (float|None), volume (int|None), raw (dict).
     Raises requests.HTTPError on non-2xx, requests.Timeout on timeout, or
     ValueError on parse failure / unexpected response shape.
-
-    Important: in 2025 Steam started fingerprinting these requests. The call
-    has to look like real AJAX from the matching listing page — that means
-    a `Referer` pointing to THIS specific listing (not a random one, not
-    blank), full Chrome-style headers, and a session that's already seen
-    the home page. Without it we get banned after 10-100 requests for ~2h.
     """
     params = {
         "country": country,
@@ -178,10 +299,6 @@ def get_price(appid: str | int, market_hash_name: str, currency: int = 18, count
         "market_hash_name": market_hash_name,
     }
     short_name = market_hash_name[:40]
-    # Lazy session warm-up: visits steamcommunity.com/market/ once per
-    # process to seed `sessionid` + `browserid` cookies. Subsequent calls
-    # then look like AJAX from a tab the user already has open.
-    _warm_up_session()
     session = _get_session()
     # The Referer MUST be the actual listing page for THIS card. Steam now
     # validates this — sending a random URL or no Referer gets you banned
@@ -396,7 +513,7 @@ def parse_market_url(url: str) -> tuple[str, str] | None:
 
 
 def fetch_prices_batch(items: list[dict], currency: int = 18, country: str = "UA",
-                       delay: float = 2.5) -> list[dict]:
+                       delay: float = 1.5) -> list[dict]:
     """Fetch prices for a list of watchlist items, respecting rate-limit delay.
 
     Each item must have 'appid' and 'market_hash_name'.
@@ -408,12 +525,13 @@ def fetch_prices_batch(items: list[dict], currency: int = 18, country: str = "UA
     - HTTP 429 (RateLimitedError) on ANY card → ABORT the rest of the
       batch. All remaining items get "error": "rate-limited" without an
       HTTP call. Caller can detect this by `rate_limited_retry_after` on
-      the returned list. Pounding Steam after the first 429 just earns us
-      a longer ban — better to surface "we got told to back off" once and
-      move on.
+      the returned list.
 
-    `delay` default of 2.5s gives ~24 req/min, well under the ~30/min
-    unofficial limit on priceoverview.
+    `delay` default of 1.5s — orderbook endpoint accepts much faster bursts
+    (tested at 0.3s with zero throttle), but we sit at 1.5s out of basic
+    politeness so the request profile doesn't look DoS-y to whatever
+    monitoring Steam runs. Configurable via `market.poll_delay_sec` in
+    config.json so future tuning doesn't need a code change.
     """
     t_batch = time.monotonic()
     results: _BatchResults = _BatchResults()

@@ -5,7 +5,8 @@
   },
   "market": {
     "currency": 18,
-    "country": "UA"
+    "country": "UA",
+    "poll_delay_sec": 1.5
   },
   "schedule": {
     "interval_minutes": 5

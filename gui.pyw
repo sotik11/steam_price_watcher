@@ -1,6 +1,7 @@
 """Steam Card Price Watch — GUI (ttkbootstrap, no console window)."""
 import csv
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -9,6 +10,7 @@ import tkinter as tk
 import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
 
@@ -26,6 +28,27 @@ SALELIST_PATH = BASE / "salelist.json"
 STATE_PATH = BASE / "state.json"
 PURCHASES_PATH = BASE / "purchases.json"
 LOG_PATH = BASE / "watch.log"
+
+# Shared logger writing to watch.log so user-initiated actions ("Оновити
+# зараз", "Запустити зараз") show up in the Журнал tab alongside what
+# watch.py logs from its scheduled runs. Same rotation policy.
+# Note: two processes (gui.pyw + watch.py) writing to the same file is
+# safe enough in this single-user setup — Python's RotatingFileHandler
+# uses opportunistic locking; rare interleave is acceptable for INFO-grade
+# logs and the rotation moments are far apart in normal usage.
+_gui_log_handler = RotatingFileHandler(
+    LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+)
+_gui_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+)
+log = logging.getLogger("gui")
+log.addHandler(_gui_log_handler)
+log.setLevel(logging.INFO)
+# Don't propagate to the root logger — steam.py's module-level logger has
+# its own console handler when run standalone, and we don't want double
+# lines in any case.
+log.propagate = False
 
 # Map a kind ("buy" / "sell") to its on-disk store. The two share a schema
 # and most of the GUI surface, but live in separate files so they can be
@@ -968,10 +991,13 @@ class App(tb.Window):
             # silently skip non-alerted ones).
             has_alerted = any(x.get("status") == "alerted" for x in sel_items)
             not_state = NORMAL if has_alerted else DISABLED
-            # "Оновити зараз" — cap at 3 cards per click so the user can't
-            # accidentally trigger 17 Steam API requests at once and get
-            # the IP rate-limited. For batch updates use the scheduler.
-            check_state = NORMAL if (sel_items and len(sel_items) <= 3) else DISABLED
+            # "Оновити зараз" — enabled whenever at least one row is selected.
+            # The old hard-cap of 3 cards was a safety against the priceoverview
+            # IP ban; we've since switched to the orderbook endpoint which
+            # took 300+ requests in 20 min without a single 429, so the cap
+            # no longer earns its keep. If we ever switch back to priceoverview,
+            # cap restoration is one if-clause.
+            check_state = NORMAL if sel_items else DISABLED
             if "completed" in buttons:
                 buttons["completed"].configure(state=completed_state)
             if "not" in buttons:
@@ -1399,12 +1425,17 @@ class App(tb.Window):
         if len(selected) == 1:
             pretty = pretty_name(selected[0])
             self._set_status(t("status.checking", name=pretty))
+            log.info(f"GUI: Оновити зараз ({kind}) — {pretty!r}")
         else:
             self._set_status(t("status.checking_multi", count=len(selected)))
+            log.info(f"GUI: Оновити зараз ({kind}) — {len(selected)} карток "
+                     f"(унікальних: {len(unique_cards)})")
 
         def _work():
             from steam import get_price, RateLimitedError
+            from alerts import evaluate_and_alert
             import time
+            t_start = time.monotonic()
             cfg = self.config_data
             currency = cfg.get("market", {}).get("currency", 18)
             country = cfg.get("market", {}).get("country", "UA")
@@ -1413,11 +1444,12 @@ class App(tb.Window):
             errors: list[str] = []
             first_err = None
             rate_limited = False
+            poll_delay = float(cfg.get("market", {}).get("poll_delay_sec", 1.5))
             for i, (key, sample) in enumerate(unique_cards.items()):
                 if i > 0:
-                    # Match watch.py's 2.5s gap to stay below the unofficial
-                    # priceoverview rate limit (~30 req/min).
-                    time.sleep(2.5)
+                    # Same pause that watch.py uses between batch requests.
+                    # Configurable via market.poll_delay_sec in config.json.
+                    time.sleep(poll_delay)
                 try:
                     info = get_price(key[0], key[1], currency, country)
                     results[key] = info
@@ -1435,15 +1467,25 @@ class App(tb.Window):
             items = load_json(path, []) or []
             state = load_json(STATE_PATH, {}) or {}
             state_dirty = False
+            alerted_count = 0
+            now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
 
             # If Steam rate-limited us, write the cooldown stamp now so that
             # watch.py's next scheduled run picks it up and skips politely
             # instead of pounding again.
             if rate_limited:
-                now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
                 deadline = now_dt + timedelta(minutes=30)
                 state["__rate_limited_until"] = deadline.isoformat()
                 state_dirty = True
+
+            # Telegram / antispam config for the alert-evaluation path.
+            tg_cfg = cfg.get("telegram", {})
+            token = tg_cfg.get("bot_token", "")
+            chat_id = str(tg_cfg.get("chat_id", ""))
+            template = (cfg.get("message_template") or "").strip() or t("tg.message.default")
+            spam = cfg.get("antispam", {})
+            repeat_if_lower = spam.get("repeat_if_lower", True)
+            remind_after_hours = spam.get("remind_after_hours", 24)
 
             for w in items:
                 if w.get("id") not in sel_ids:
@@ -1481,9 +1523,55 @@ class App(tb.Window):
                             if state.pop(state_key, None) is not None:
                                 state_dirty = True
 
+                # Now run the alert evaluation — same logic watch.py uses.
+                # Merge the polled price info onto the card record so
+                # `info` has both target_price (from card) and lowest_price
+                # (from poll) plus all the metadata send_alert wants.
+                if token and chat_id:
+                    alert_info = {**w, **info}
+                    sd, did_alert, _reason = evaluate_and_alert(
+                        kind=kind, info=alert_info, state=state,
+                        token=token, chat_id=chat_id, template=template,
+                        repeat_if_lower=repeat_if_lower,
+                        remind_after_hours=remind_after_hours,
+                        now=now_dt,
+                    )
+                    if sd:
+                        state_dirty = True
+                    if did_alert:
+                        alerted_count += 1
+                        # Mark every duplicate of this card alerted, not
+                        # just the one we walked — matches watch.py.
+                        ident = (w.get("appid"), w.get("name"))
+                        for x in items:
+                            if (x.get("appid"), x.get("name")) == ident:
+                                if x.get("status") != "alerted":
+                                    x["status"] = "alerted"
+
             save_json(path, items)
             if state_dirty:
                 save_json(STATE_PATH, state)
+
+            # Log the outcome to watch.log so the Журнал tab shows what
+            # the user-triggered Refresh actually did — they were missing
+            # this feedback before, especially on multi-select where there's
+            # no result dialog.
+            ok_count = sum(1 for v in results.values() if v is not None)
+            elapsed = time.monotonic() - t_start
+            alert_suffix = f", сповіщень: {alerted_count}" if alerted_count else ""
+            if rate_limited:
+                log.error(f"GUI: Оновити зараз ({kind}) — Steam rate-limited; "
+                          f"оновлено {ok_count}, відмінено "
+                          f"{len(unique_cards) - ok_count}; зайняло {elapsed:.2f}с")
+            elif errors:
+                log.warning(f"GUI: Оновити зараз ({kind}) — оновлено {ok_count}/"
+                            f"{len(unique_cards)} карток{alert_suffix}, "
+                            f"помилок: {len(errors)} (перша: {first_err!r}); "
+                            f"зайняло {elapsed:.2f}с")
+            else:
+                log.info(f"GUI: Оновити зараз ({kind}) — успішно, оновлено "
+                         f"{ok_count}/{len(unique_cards)} карток{alert_suffix}; "
+                         f"зайняло {elapsed:.2f}с")
 
             # UX after fetch:
             # - rate-limited → loud warning dialog (this is THE explanation
@@ -1880,7 +1968,19 @@ class App(tb.Window):
         self.var_interval = tk.IntVar(value=sched.get("interval_minutes", 5))
         ttk.Spinbox(f, from_=1, to=60, textvariable=self.var_interval, width=8).grid(row=4, column=1, sticky=W)
 
-        row("lbl.theme", 5)
+        # Pause between price-fetch requests inside one batch. Put just
+        # under "Interval" — both knobs concern Steam-polling cadence.
+        # Picked up on the fly: _save_settings refreshes self.config_data,
+        # and `_check_now` re-reads market.poll_delay_sec on every click.
+        # watch.py reads it fresh from disk on each scheduled run anyway.
+        row("lbl.poll_delay", 5)
+        self.var_poll_delay = tk.DoubleVar(value=mkt.get("poll_delay_sec", 1.5))
+        ttk.Spinbox(
+            f, from_=0.5, to=10.0, increment=0.1, format="%.1f",
+            textvariable=self.var_poll_delay, width=8,
+        ).grid(row=5, column=1, sticky=W)
+
+        row("lbl.theme", 6)
         # Built-in ttkbootstrap themes — all 18 of them, in dark-then-light
         # order so users see the more contrast-y options first. Custom
         # themes from themes/*.json are appended at the end as requested.
@@ -1894,12 +1994,12 @@ class App(tb.Window):
         themes = builtin_themes + custom_codes
         self.var_theme = tk.StringVar(value=ui.get("theme", "superhero"))
         cb_theme = ttk.Combobox(f, values=themes, textvariable=self.var_theme, state="readonly", width=16)
-        cb_theme.grid(row=5, column=1, sticky=W)
+        cb_theme.grid(row=6, column=1, sticky=W)
         cb_theme.bind("<<ComboboxSelected>>", self._on_theme_change)
 
         # Language picker — values are display names from each lang/*.json
         # `_meta.name`, but we map back to ISO codes when saving.
-        row("lbl.language", 6)
+        row("lbl.language", 7)
         self._lang_options = i18n.available_languages()
         self._lang_name_to_code = {opt["name"]: opt["code"] for opt in self._lang_options}
         current_code = i18n.get_language()
@@ -1912,20 +2012,20 @@ class App(tb.Window):
             f, values=[opt["name"] for opt in self._lang_options],
             textvariable=self.var_language, state="readonly", width=16,
         )
-        cb_lang.grid(row=6, column=1, sticky=W)
+        cb_lang.grid(row=7, column=1, sticky=W)
         cb_lang.bind("<<ComboboxSelected>>", self._on_language_change)
 
-        row("lbl.antispam_hours", 7)
+        row("lbl.antispam_hours", 8)
         self.var_remind_hours = tk.IntVar(value=spam.get("remind_after_hours", 24))
-        ttk.Spinbox(f, from_=1, to=168, textvariable=self.var_remind_hours, width=8).grid(row=7, column=1, sticky=W)
+        ttk.Spinbox(f, from_=1, to=168, textvariable=self.var_remind_hours, width=8).grid(row=8, column=1, sticky=W)
 
-        row("lbl.repeat_if_lower", 8)
+        row("lbl.repeat_if_lower", 9)
         self.var_repeat_lower = tk.BooleanVar(value=spam.get("repeat_if_lower", True))
-        ttk.Checkbutton(f, variable=self.var_repeat_lower).grid(row=8, column=1, sticky=W)
+        ttk.Checkbutton(f, variable=self.var_repeat_lower).grid(row=9, column=1, sticky=W)
 
-        row("lbl.template", 9)
+        row("lbl.template", 10)
         template_holder = ttk.Frame(f)
-        template_holder.grid(row=9, column=1, sticky=W, pady=4)
+        template_holder.grid(row=10, column=1, sticky=W, pady=4)
         # tk.Text isn't a ttk widget so it doesn't pick up the style-level
         # selection colours we configured for ttk.Entry. Apply explicitly so
         # selected text reads against the input background.
@@ -1954,14 +2054,14 @@ class App(tb.Window):
         # Text widget — looks much tidier than floating in the middle.
         self.btn_edit_template.pack(side=LEFT, padx=(4, 0), anchor=N)
         ttk.Label(f, text=t("lbl.template_vars"),
-                  foreground="gray").grid(row=10, column=1, sticky=W)
+                  foreground="gray").grid(row=11, column=1, sticky=W)
 
-        row("lbl.steam_login", 11)
-        ttk.Button(f, text=t("btn.in_development"), state=DISABLED).grid(row=11, column=1, sticky=W)
+        row("lbl.steam_login", 12)
+        ttk.Button(f, text=t("btn.in_development"), state=DISABLED).grid(row=12, column=1, sticky=W)
 
         ttk.Button(f, text=t("btn.save"),
                    command=self._save_settings, bootstyle="success"
-                   ).grid(row=12, column=1, sticky=W, pady=(16, 0))
+                   ).grid(row=13, column=1, sticky=W, pady=(16, 0))
 
     def _toggle_edit(self, widget, button: ttk.Button, lock_state: str = "readonly") -> None:
         """Flip a locked input widget between edit and locked modes.
@@ -2052,6 +2152,11 @@ class App(tb.Window):
             "market": {
                 "currency": currency_val,
                 "country": self.var_country.get().strip().upper(),
+                # Float — rounded to one decimal to match the Spinbox display.
+                # Picked up "on the fly": self.config_data is reassigned below,
+                # _check_now re-reads it on every click. watch.py reads its
+                # own copy of config.json on every scheduled run.
+                "poll_delay_sec": round(float(self.var_poll_delay.get()), 1),
             },
             "schedule": {
                 "interval_minutes": self.var_interval.get(),
