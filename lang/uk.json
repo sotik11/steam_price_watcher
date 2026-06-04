@@ -68,6 +68,7 @@
   "lbl.currency":        "Валюта:",
   "lbl.country":         "Країна:",
   "lbl.interval":        "Інтервал (хв):",
+  "lbl.poll_delay":      "Затримка (с):",
   "lbl.theme":           "Тема інтерфейсу:",
   "lbl.language":        "Мова:",
   "lbl.antispam_hours":  "Антиспам — нагадати\nчерез (год):",
