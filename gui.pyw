@@ -324,11 +324,23 @@ class App(tb.Window):
         theme_meta = getattr(self, "_custom_theme_by_code", {}).get(current, {})
         active_tab_bg = theme_meta.get("active_tab_bg") or s.colors.primary
         active_tab_fg = "#FFFFFF" if _is_dark(active_tab_bg) else "#000000"
+        # Pin explicit tab padding so future ttkbootstrap updates can't
+        # accidentally inflate the tab strip — the user widget floats in
+        # the empty strip ABOVE the tabs (see notebook.pack pady in
+        # _build_ui), and that strip's height assumes compact tabs.
+        s.configure("TNotebook.Tab", padding=(10, 4))
         s.map("TNotebook.Tab",
               background=[("selected", active_tab_bg)],
               lightcolor=[("selected", active_tab_bg)],
               bordercolor=[("selected", active_tab_bg)],
               foreground=[("selected", active_tab_fg)])
+
+        # Scrollbar accent. ttkbootstrap paints the thumb from PhotoImage
+        # assets (not via ttk colour options), so plain `style.configure`
+        # doesn't reach it. Instead each Scrollbar is constructed with
+        # bootstyle="success" — and we alias `colors.success` in
+        # themes/claude.json to the same Steam-green as the active tab.
+        # One source of truth in the theme palette, nothing to do here.
 
         # Text-selection inside Entry / Spinbox / Combobox / Text. ttkbootstrap
         # uses the theme's `selectbg` both for "readonly Entry background" AND
@@ -499,13 +511,53 @@ class App(tb.Window):
             if opts:
                 tree.tag_configure(tag, **opts)
 
+    @staticmethod
+    def _autohide_scrollbar(sb: ttk.Scrollbar, first, last) -> None:
+        """yscrollcommand wrapper: hides the scrollbar when content fits.
+
+        Standard ttk.Scrollbar doesn't have a built-in auto-hide behaviour —
+        it stays at full size even when there's nothing to scroll, eating
+        horizontal space and looking like dead UI. This wrapper inspects
+        the `first`/`last` fractions Tk hands us on each scroll update:
+        if they span the entire range [0.0, 1.0] the content fits in view
+        and we hide the bar via grid_remove; otherwise we put it back with
+        grid() (grid_remove preserves the previous grid options, so calling
+        grid() with no args restores them).
+
+        Requires the scrollbar to be packed via `grid()`, not `pack()` —
+        pack_forget loses the position info and re-pack ends up appending
+        the bar to the wrong slot, making it never reappear.
+        """
+        first_f, last_f = float(first), float(last)
+        if first_f <= 0.0 and last_f >= 1.0:
+            sb.grid_remove()
+        else:
+            sb.grid()
+        sb.set(first, last)
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self):
+        # Pack the status bar FIRST. Tk's pack manager allocates space
+        # in pack order; if the notebook (which expand=YES) packs before
+        # the status bar, the status bar gets pushed out of view when the
+        # window is resized smaller. Reserving the BOTTOM slot now means
+        # whatever notebook claims is "everything except the bottom row".
+        self.statusbar = ttk.Label(self, text="  " + t("status.ready"),
+                                    relief="sunken", anchor=W)
+        self.statusbar.pack(fill=X, side=BOTTOM, ipady=2)
+
         self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=BOTH, expand=YES, padx=8, pady=(8, 0))
+        # pady=(25, 0) leaves a 25-px gap between the title bar and the
+        # tab row. The Steam user widget floats into that gap via place(),
+        # so it visually lives there without claiming a pack row of its own.
+        self.notebook.pack(fill=BOTH, expand=YES, padx=8, pady=(25, 0))
+
+        # Steam user widget — placed into the empty strip above the
+        # notebook's tab row. Floats over `self`, anchored to top-right.
+        self._build_user_widget()
 
         # New tab order: Придбання | Продаж | Історія | Планувальник |
         # Журнал | Налаштування. Index 0 = buy list, 1 = sell list — used by
@@ -545,8 +597,129 @@ class App(tb.Window):
         self._build_history_tab()
         self._build_log_tab()
 
-        self.statusbar = ttk.Label(self, text="  " + t("status.ready"), relief="sunken", anchor=W)
-        self.statusbar.pack(fill=X, side=BOTTOM, ipady=2)
+    # ------------------------------------------------------------------
+    # Steam user widget (top-right)
+    # ------------------------------------------------------------------
+
+    # Avatar canvas dimensions. Steam's site header uses ~32 px round
+    # avatars; we bump to 40 so the icon is comfortably readable inside
+    # the 25-px floating strip above the tab row.
+    _AVATAR_SIZE = 40
+
+    def _build_user_widget(self) -> None:
+        """Floating Steam user cluster in the strip above the tabs.
+
+        Layout mirrors Steam's site header — username on top, balance in
+        smaller muted text below, round avatar pinned to the right edge.
+        Placed via `place(relx=1.0, anchor='ne', ...)` so the widget tracks
+        the right edge of the window when resized, and floats over the
+        25-px gap between the title bar and the notebook's tab row (see
+        notebook.pack pady in _build_ui).
+
+        Default state: bundled Steam logo + "Username" + "0.00 ₴".
+        `_update_user_widget` swaps them once Steam login is wired up.
+        """
+        # x=-14 keeps a margin from the right edge; y=5 nudges down a
+        # touch so the cluster doesn't crash into the title bar above.
+        cluster = ttk.Frame(self)
+        cluster.place(relx=1.0, x=-14, y=5, anchor="ne")
+
+        # Two-line text column (username on top, balance below). Right-aligned
+        # so longer nicknames push leftward, leaving the avatar pinned.
+        text_col = ttk.Frame(cluster)
+        text_col.pack(side=LEFT, padx=(0, 8))
+
+        self.lbl_username = ttk.Label(
+            text_col, text="Username", anchor=E, font=("", 10, "bold"),
+        )
+        self.lbl_username.pack(side=TOP, anchor=E)
+
+        # Wallet balance — same currency symbol the rest of the app uses
+        # so it stays consistent if the user later switches currency.
+        sym = self._currency_symbol()
+        # Muted foreground — match Steam's secondary-text colour.
+        muted_fg = "#888888"
+        self.lbl_balance = ttk.Label(
+            text_col, text=f"0.00 {sym}", anchor=E,
+            foreground=muted_fg,
+        )
+        self.lbl_balance.pack(side=TOP, anchor=E)
+
+        # Round avatar canvas. By default carries the Steam logo from
+        # assets/steam_icon.png (circular-masked); when login lands, the
+        # user's real avatar swaps in via _update_user_widget.
+        self.avatar_canvas = tk.Canvas(
+            cluster, width=self._AVATAR_SIZE, height=self._AVATAR_SIZE,
+            highlightthickness=0, borderwidth=0,
+        )
+        self.avatar_canvas.pack(side=LEFT)
+        # Match canvas background to theme so the round-corner letterbox
+        # blends in instead of showing a flat square.
+        bg = self.style.colors.bg
+        self.avatar_canvas.configure(background=bg)
+        self._draw_placeholder_avatar()
+
+        # The notebook is packed BEFORE the user-widget is placed (see
+        # _build_ui). Without lift(), the notebook's frame paints over
+        # our placed cluster and the avatar disappears. lift() raises us
+        # in the z-order so the overlay stays visible.
+        cluster.lift()
+
+    def _draw_placeholder_avatar(self) -> None:
+        """Show the bundled Steam logo, circular-cropped, on the avatar canvas.
+
+        Falls back to a hand-drawn 'S' circle if Pillow / the asset are
+        missing — happens on a fresh checkout before the user runs
+        `pip install -r requirements.txt`.
+        """
+        size = self._AVATAR_SIZE
+        c = self.avatar_canvas
+        c.delete("all")
+        asset_path = BASE / "assets" / "steam_icon.png"
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+            img = Image.open(asset_path).convert("RGBA")
+            img = img.resize((size, size), Image.LANCZOS)
+            # Circular alpha mask so the square PNG ends up as a round
+            # avatar that blends with the theme background.
+            mask = Image.new("L", (size, size), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
+            img.putalpha(mask)
+            # Keep a reference on the instance — Tk drops images that are
+            # only held by canvas items (the canvas keeps a weakref).
+            self._avatar_placeholder_photo = ImageTk.PhotoImage(img)
+            c.create_image(size / 2, size / 2,
+                           image=self._avatar_placeholder_photo)
+        except Exception:
+            # Pillow missing or asset not bundled — paint a basic Steam-blue
+            # circle with a white "S" so something is still on screen.
+            c.create_oval(1, 1, size - 1, size - 1,
+                          fill="#1B2838", outline="")
+            c.create_text(size / 2, size / 2,
+                          text="S", fill="#FFFFFF",
+                          font=("Segoe UI", int(size * 0.55), "bold"))
+
+    def _update_user_widget(self, *, username: str | None = None,
+                            balance: str | None = None,
+                            avatar_image: tk.PhotoImage | None = None) -> None:
+        """Public API for the Steam-login feature to plug real data in.
+
+        Pass any subset — the others keep their current value. `avatar_image`
+        should already be cropped to a circle and sized to _AVATAR_SIZE;
+        passing None redraws the placeholder.
+        """
+        if username is not None:
+            self.lbl_username.configure(text=username)
+        if balance is not None:
+            self.lbl_balance.configure(text=balance)
+        if avatar_image is not None:
+            # Keep a reference — Tk's image GC will collect it otherwise.
+            self._user_avatar_ref = avatar_image
+            self.avatar_canvas.delete("all")
+            self.avatar_canvas.create_image(
+                self._AVATAR_SIZE / 2, self._AVATAR_SIZE / 2,
+                image=avatar_image,
+            )
 
     # ------------------------------------------------------------------
     # Active-kind helpers — used by action callbacks to figure out which
@@ -792,10 +965,22 @@ class App(tb.Window):
         # _install_clipboard_shortcuts.
         tree.bind("<Control-KeyPress>", self._on_tree_ctrl_a)
 
-        vsb = ttk.Scrollbar(tree_frame, orient=VERTICAL, command=tree.yview)
-        tree.configure(yscrollcommand=vsb.set)
-        vsb.pack(side=RIGHT, fill=Y)
-        tree.pack(side=LEFT, fill=BOTH, expand=YES)
+        # bootstyle="success" gives ttkbootstrap's image-rendered thumb the
+        # `s.colors.success` tint — which we re-aliased to the active-tab
+        # accent (Steam-green for claude). Plain `style.configure` on
+        # Vertical.TScrollbar doesn't reach the thumb because ttkbootstrap
+        # paints it from PhotoImage assets, not ttk colours.
+        vsb = ttk.Scrollbar(tree_frame, orient=VERTICAL, command=tree.yview,
+                            bootstyle="success")
+        tree.configure(yscrollcommand=lambda f, l, sb=vsb: self._autohide_scrollbar(sb, f, l))
+        # Grid layout — auto-hide via grid_remove() preserves the column/row
+        # slot so the scrollbar can pop back in the same place when needed.
+        # weight=1 on tree-column lets the table expand into the freed space
+        # while the scrollbar is hidden.
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
         self.list_trees[kind] = tree
 
         row1 = ttk.Frame(btn_frame)
@@ -2388,10 +2573,16 @@ class App(tb.Window):
         self.hist_tree.bind("<Motion>", self._on_hist_tree_motion)
         # Same Ctrl+A toggle as the card-list trees.
         self.hist_tree.bind("<Control-KeyPress>", self._on_tree_ctrl_a)
-        vsb2 = ttk.Scrollbar(hist_frame, orient=VERTICAL, command=self.hist_tree.yview)
-        self.hist_tree.configure(yscrollcommand=vsb2.set)
-        vsb2.pack(side=RIGHT, fill=Y)
-        self.hist_tree.pack(side=LEFT, fill=BOTH, expand=YES)
+        vsb2 = ttk.Scrollbar(hist_frame, orient=VERTICAL, command=self.hist_tree.yview,
+                             bootstyle="success")
+        self.hist_tree.configure(
+            yscrollcommand=lambda f, l, sb=vsb2: self._autohide_scrollbar(sb, f, l)
+        )
+        # Grid layout — same auto-hide pattern as the card-list trees.
+        self.hist_tree.grid(row=0, column=0, sticky="nsew")
+        vsb2.grid(row=0, column=1, sticky="ns")
+        hist_frame.grid_rowconfigure(0, weight=1)
+        hist_frame.grid_columnconfigure(0, weight=1)
         for key, cmd in [
             ("btn.history_open",   self._hist_open_browser),
             ("btn.history_export", self._hist_export_csv),
@@ -2897,10 +3088,16 @@ class App(tb.Window):
 
         self.log_text = tk.Text(log_frame, wrap=tk.WORD, state=DISABLED,
                                 font=("Consolas", 9), borderwidth=0)
-        vsb3 = ttk.Scrollbar(log_frame, orient=VERTICAL, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=vsb3.set)
-        vsb3.pack(side=RIGHT, fill=Y)
-        self.log_text.pack(side=LEFT, fill=BOTH, expand=YES)
+        vsb3 = ttk.Scrollbar(log_frame, orient=VERTICAL, command=self.log_text.yview,
+                             bootstyle="success")
+        self.log_text.configure(
+            yscrollcommand=lambda f, l, sb=vsb3: self._autohide_scrollbar(sb, f, l)
+        )
+        # Grid layout — same auto-hide pattern as the trees.
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        vsb3.grid(row=0, column=1, sticky="ns")
+        log_frame.grid_rowconfigure(0, weight=1)
+        log_frame.grid_columnconfigure(0, weight=1)
 
         # Severity tags — colours chosen for the superhero (dark) theme, but
         # they stay readable on light themes too (red/orange/grey are
