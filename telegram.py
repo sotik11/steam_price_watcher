@@ -41,7 +41,11 @@ def send_alert(token: str, chat_id: str, item: dict, template: str) -> None:
     """
     from steam import market_url, pretty_name
 
-    browser_url = market_url(item["appid"], item["market_hash_name"])
+    # `?buy=1` on the listing URL: Steam opens the page with the buy
+    # dialog already up, so the user goes click → confirm instead of
+    # click → click buy → confirm. Works the same in a regular browser
+    # and inside the Steam-client embedded browser.
+    browser_url = market_url(item["appid"], item["market_hash_name"]) + "?buy=1"
 
     # Display fields. Centralised in pretty_name() — never the raw mhn.
     display_name = pretty_name(item)
