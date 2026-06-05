@@ -986,7 +986,9 @@ class App(tb.Window):
         row1 = ttk.Frame(btn_frame)
         row1.pack(fill=X, pady=(0, 4))
         # Button order in row1: Add → Edit target → Move-to-other-list →
-        # Check now → Remove → Open in browser. The move button's text is
+        # Check now → Remove. The "Open in browser" action used to live
+        # here too, but it was redundant — every row already has a clickable
+        # link in the "Посилання" column. The move button's text is
         # kind-dependent ("→ До продажу" on buy tab, "→ До покупки" on
         # sell tab); we keep a reference to it so _update_action_buttons
         # can enable/disable it together with the other selection-dependent
@@ -998,7 +1000,6 @@ class App(tb.Window):
             (move_key,              self._move_to_other_list),
             ("btn.check_now",       self._check_now),
             ("btn.remove",          self._remove_card),
-            ("btn.open_in_browser", self._open_in_browser),
         ]
         btn_move = None
         btn_check = None
@@ -1023,11 +1024,21 @@ class App(tb.Window):
                              command=self._mark_not_bought,
                              bootstyle="warning")
         btn_not.pack(side=LEFT, padx=2)
+        # Import-from-Steam placeholder — yellow/gold to match the other
+        # call-to-action buttons here. Action is wired up in Phase 3 (TODO),
+        # where it will pull the user's current Steam Market listings /
+        # buy orders and offer to sync them into watchlist/salelist.json.
+        # For now it just announces "in development" so the slot is visible.
+        btn_import = ttk.Button(row2, text=t("btn.import"),
+                                command=self._import_from_steam,
+                                bootstyle="warning")
+        btn_import.pack(side=LEFT, padx=2)
         self.list_action_buttons[kind] = {
             "completed": btn_completed,
             "not": btn_not,
             "move": btn_move,
             "check": btn_check,
+            "import": btn_import,
         }
         self._update_action_buttons()
 
@@ -1806,36 +1817,6 @@ class App(tb.Window):
 
         threading.Thread(target=_work, daemon=True).start()
 
-    def _open_in_browser(self):
-        from steam import market_url
-
-        selected = self._require_selection()
-        if not selected:
-            return
-
-        # Dedup by listing URL — selecting 3 duplicates of the same card
-        # in salelist shouldn't pop 3 identical tabs.
-        unique_urls: list[str] = []
-        seen: set[tuple] = set()
-        for item in selected:
-            key = (item.get("appid"), item.get("market_hash_name"))
-            if key in seen:
-                continue
-            seen.add(key)
-            unique_urls.append(market_url(item["appid"], item["market_hash_name"]))
-
-        # Sanity check: opening too many tabs at once is rarely intended.
-        if len(unique_urls) > 3:
-            if not messagebox.askyesno(
-                t("dlg.open_many.title"),
-                t("dlg.open_many.body", count=len(unique_urls)),
-                parent=self,
-            ):
-                return
-
-        for url in unique_urls:
-            webbrowser.open(url)
-
     def _mark_completed(self):
         """User confirms the transaction(s) — buy or sell, depending on tab.
 
@@ -1962,6 +1943,20 @@ class App(tb.Window):
         save_json(path, items)
         save_json(STATE_PATH, state)
         self._refresh_card_list(kind)
+
+    def _import_from_steam(self):
+        """Placeholder for the Phase-3 «Import from Steam» feature.
+
+        When fully wired, this will fetch the user's active Steam Market
+        listings (sell tab) or buy orders (buy tab) and offer to sync them
+        with the local watchlist/salelist — see DESIGN.md «Phase 3» for
+        the full conflict-resolution flow (new → add, same price → skip,
+        different price → ask). For now the button just announces that
+        the feature is in development, so the UI slot stays visible and
+        the keyboard / mouse focus path is exercised.
+        """
+        messagebox.showinfo(t("dlg.import.title"),
+                            t("dlg.import.in_development"), parent=self)
 
     def _move_to_other_list(self):
         """Move selected card(s) from the active list to the other one.

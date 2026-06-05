@@ -35,12 +35,15 @@
   "btn.edit_target":     "Змінити ціль",
   "btn.remove":          "Видалити",
   "btn.check_now":       "Оновити зараз",
-  "btn.open_in_browser": "Відкрити в браузері",
   "btn.bought":          "✅ Вже придбав",
   "btn.sold":            "✅ Вже продав",
   "btn.not_bought":      "❌ Ще ні, стежити далі",
   "btn.move_to_sell":    "→ До продажу",
   "btn.move_to_buy":     "→ До покупки",
+  "btn.import":          "📥 Імпорт",
+
+  "dlg.import.title":          "Імпорт зі Steam",
+  "dlg.import.in_development": "Функція ще в розробці. Тут буде синхронізація з вашими активними листингами та замовленнями на купівлю в Steam Market.",
 
   "dlg.completed.title":    "Підтвердити операцію",
   "dlg.completed.body_buy":  "За якою ціною ви придбали «{name}»? ({sym})",

@@ -35,12 +35,15 @@
   "btn.edit_target":     "Edit target",
   "btn.remove":          "Remove",
   "btn.check_now":       "Check now",
-  "btn.open_in_browser": "Open in browser",
   "btn.bought":          "✅ Already purchased",
   "btn.sold":            "✅ Already sold",
   "btn.not_bought":      "❌ Not yet, keep watching",
   "btn.move_to_sell":    "→ To sales",
   "btn.move_to_buy":     "→ To purchase",
+  "btn.import":          "📥 Import",
+
+  "dlg.import.title":          "Import from Steam",
+  "dlg.import.in_development": "This feature is still in development. It will sync your active Steam Market listings and buy orders here.",
 
   "dlg.completed.title":    "Confirm transaction",
   "dlg.completed.body_buy":  "What price did you buy «{name}» at? ({sym})",
