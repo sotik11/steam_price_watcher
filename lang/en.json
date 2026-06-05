@@ -74,6 +74,8 @@
   "lbl.poll_delay":      "Delay (sec):",
   "lbl.theme":           "UI theme:",
   "lbl.language":        "Language:",
+  "lbl.font_scale":      "Font size:",
+  "font_scale.default":  "Default",
   "lbl.antispam_hours":  "Antispam — remind\nafter (hours):",
   "lbl.repeat_if_lower": "Repeat if lower:",
   "lbl.template":        "Message template:",
@@ -83,6 +85,10 @@
   "btn.test_message":   "Test message",
   "btn.in_development": "(in development)",
   "btn.save":           "Save",
+  "btn.reset":          "Reset",
+
+  "dlg.reset.title":    "Reset settings",
+  "dlg.reset.body":     "Reset all settings to defaults (theme, language, font size, interval, etc.)? Window size will reset too.\n\nBot token and Chat ID will be preserved — they won't be touched.",
 
   "btn.scheduler_create":  "Create / Update",
   "btn.scheduler_enable":  "Enable",

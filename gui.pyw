@@ -230,6 +230,14 @@ class App(tb.Window):
         self.resizable(True, True)
         self._configure_styles()
         self._install_clipboard_shortcuts()
+        # Snapshot the default font sizes BEFORE any scaling, so the user
+        # can ratchet up/down repeatedly without compounding rounding
+        # errors. Then apply the saved scale (1..5) — done before
+        # _build_ui so widgets are constructed at the final size instead
+        # of resizing after first paint.
+        self._snapshot_default_fonts()
+        font_scale = int(ui_cfg.get("font_scale", 1) or 1)
+        self._apply_font_scale(font_scale)
         self._build_ui()
         # ttkbootstrap reshuffles some style maps as the notebook widget
         # comes online during _build_ui; re-pin the tab-selected colour
@@ -238,6 +246,21 @@ class App(tb.Window):
         # Tint the native Windows title bar to match the theme bg. Has to
         # happen after the window is fully realised (HWND exists).
         self._apply_native_titlebar_theme()
+        # Restore the previous window size + position. Applied AFTER the
+        # widget tree is built so geometry isn't fighting with the initial
+        # `size=(1100, 620)` arg passed to super().__init__. The string
+        # format is Tk's "WxH+X+Y" — straight pass-through to self.geometry,
+        # which tolerates "WxH" without coords too (Tk picks placement).
+        saved_geom = ui_cfg.get("window_geometry")
+        if saved_geom:
+            try:
+                self.geometry(saved_geom)
+            except tk.TclError:
+                pass
+        # Persist window geometry on close — covers the "user resized to
+        # taste, then quit" path. _save_settings also stamps the current
+        # geometry, so a Save click while resized works too.
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_watchlist()
         self._refresh_scheduler_status()
         self._refresh_history()
@@ -247,9 +270,276 @@ class App(tb.Window):
         # background thread so the GUI doesn't block on Steam Store.
         threading.Thread(target=self._backfill_metadata, daemon=True).start()
 
+    def _on_close(self) -> None:
+        """Persist window geometry then destroy.
+
+        Loads + rewrites instead of overwriting because _save_settings is
+        the canonical schema producer; we only want to nudge a single key
+        without re-deriving the rest. Errors are swallowed — closing the
+        app must never be blocked by a disk hiccup.
+        """
+        try:
+            cfg = load_json(CONFIG_PATH, {}) or {}
+            cfg.setdefault("ui", {})["window_geometry"] = self.geometry()
+            save_json(CONFIG_PATH, cfg)
+        except Exception:
+            pass
+        self.destroy()
+
     # ------------------------------------------------------------------
     # Styling
     # ------------------------------------------------------------------
+
+    # Named Tk fonts that drive every standard widget — we scale ALL of
+    # them together so the UI stays visually consistent (a half-scaled
+    # combobox next to a full-scale label would look broken).
+    _SCALABLE_FONTS = (
+        "TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont",
+        "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont",
+        "TkIconFont", "TkTooltipFont",
+    )
+    # ttk.Treeview rowheight is tied to the row's font; we cache a base
+    # value and multiply on scale. ~22 px is what ttkbootstrap settles on
+    # for the default font; lookup at runtime in case the theme overrode.
+    _BASE_ROW_HEIGHT = 22
+
+    # User picks "За замовчуванням" / "x2".."x5" in Settings — each step
+    # multiplies the baseline font sizes by these factors. Range topped
+    # at 3.0 because anything bigger pushed buttons off-screen on a 1080p
+    # monitor. Five buckets in [1.0, 3.0] gives a smooth ramp.
+    _FONT_SCALE_FACTORS = {1: 1.0, 2: 1.5, 3: 2.0, 4: 2.5, 5: 3.0}
+
+    def _font_scale_combo_values(self) -> list[str]:
+        """Combobox labels for the font-scale dropdown.
+
+        x1 is renamed to a localised «За замовчуванням» (Default) so the
+        user has an obvious "go back to normal" choice — picking it after
+        scaling up resets fonts to their baseline.
+        """
+        return [t("font_scale.default"), "x2", "x3", "x4", "x5"]
+
+    def _font_scale_to_label(self, scale: int) -> str:
+        """Map int 1..5 → the user-facing combobox label."""
+        scale = max(1, min(5, int(scale or 1)))
+        return t("font_scale.default") if scale == 1 else f"x{scale}"
+
+    def _font_scale_from_label(self, label: str) -> int:
+        """Parse a combobox label back to its 1..5 int scale."""
+        s = (label or "").strip()
+        if s == t("font_scale.default"):
+            return 1
+        try:
+            return max(1, min(5, int(s.lstrip("xX"))))
+        except ValueError:
+            return 1
+
+    def _snapshot_default_fonts(self) -> None:
+        """Remember the *unscaled* size of every named font.
+
+        Called once at startup before any scaling. _apply_font_scale then
+        multiplies these baselines instead of compounding on top of the
+        current size — important for ratcheting up and down through the
+        Settings dropdown.
+        """
+        import tkinter.font as tkfont
+        self._original_font_sizes = {}
+        for name in self._SCALABLE_FONTS:
+            try:
+                f = tkfont.nametofont(name)
+                # `actual('size')` gives the real point size after Tk's
+                # own DPI scaling. We use absolute value because Tk uses
+                # negative numbers for pixel-sized fonts.
+                self._original_font_sizes[name] = abs(int(f.actual("size"))) or 9
+            except tk.TclError:
+                # Font not registered on this platform — skip silently.
+                pass
+        # Cache the theme's default rowheight too, with a sensible fallback.
+        try:
+            self._original_row_height = int(self.style.lookup("Treeview", "rowheight") or self._BASE_ROW_HEIGHT)
+        except (tk.TclError, ValueError):
+            self._original_row_height = self._BASE_ROW_HEIGHT
+        if self._original_row_height <= 0:
+            self._original_row_height = self._BASE_ROW_HEIGHT
+        # Holds (widget, base_size, weight) tuples for labels that set
+        # their font explicitly (font=("", 10, "bold") and the like).
+        # Those don't follow named fonts so _apply_font_scale wouldn't
+        # touch them otherwise. _scaled_font(...) registers + initial set.
+        self._explicit_font_widgets = []
+        self._font_scale = 1
+
+    def _make_scalable_check(self, parent, variable: tk.BooleanVar) -> ttk.Label:
+        """Build a font-scaling replacement for ttk.Checkbutton.
+
+        ttkbootstrap renders Checkbutton's indicator as a PhotoImage baked
+        at theme creation — the indicator box ignores named-font sizes,
+        so at higher font scales the text grows but the box stays tiny.
+        Workaround: a plain ttk.Label that flips between ☐ and ☑ glyphs
+        on click. Both glyphs are real font characters so they ramp with
+        the Settings font-scale knob, the same way every other label does.
+
+        The BooleanVar stays the canonical source of truth — _save_settings
+        keeps reading it untouched, and a `trace_add` keeps the glyph in
+        sync if the var is mutated programmatically (e.g. on Reset).
+        """
+        # cursor="hand2" telegraphs "this is clickable" — without it the
+        # bare glyph looks like a decorative label.
+        lbl = ttk.Label(
+            parent,
+            text="☑" if variable.get() else "☐",
+            cursor="hand2",
+        )
+        # Slightly larger baseline (13 vs default 9) so the glyph reads
+        # well at x1; ramps to ~39pt at x5 which sits comfortably next to
+        # the label text on its row.
+        self._scaled_font(lbl, 13)
+
+        def _sync(*_):
+            lbl.configure(text="☑" if variable.get() else "☐")
+
+        def _toggle(_event=None):
+            variable.set(not variable.get())
+            # The trace below will redraw the glyph — no need to do it
+            # explicitly here.
+
+        lbl.bind("<Button-1>", _toggle)
+        # variable.trace_add fires on every .set() — covers both user clicks
+        # and external resets (Скинути button).
+        variable.trace_add("write", _sync)
+        return lbl
+
+    def _scaled_font(self, widget, base_size: int, weight: str = "") -> None:
+        """Register a widget with an explicit font size for scaling.
+
+        Sets the widget's `font` to its baseline size right now AND remembers
+        it so future _apply_font_scale calls keep it in sync with the rest
+        of the UI. Used for labels that needed a non-default font (the
+        Steam username / wallet, the Scheduler status header, etc).
+        """
+        self._explicit_font_widgets.append((widget, base_size, weight))
+        self._set_widget_font(widget, base_size, weight)
+
+    def _set_widget_font(self, widget, base_size: int, weight: str) -> None:
+        mult = self._FONT_SCALE_FACTORS.get(self._font_scale, 1.0)
+        size = max(1, int(round(base_size * mult)))
+        spec = ("", size, weight) if weight else ("", size)
+        try:
+            widget.configure(font=spec)
+        except tk.TclError:
+            pass
+
+    def _apply_font_scale(self, scale: int) -> None:
+        """Multiply every cached font size by the bucket factor.
+
+        Treeview rowheight scales together with the font so rows don't
+        clip the now-taller text. Explicit-font widgets registered via
+        _scaled_font are recomputed too. No widgets are recreated — Tk
+        redraws them automatically when their font changes.
+        """
+        import tkinter.font as tkfont
+        scale = max(1, min(5, int(scale or 1)))
+        self._font_scale = scale
+        mult = self._FONT_SCALE_FACTORS[scale]
+        for name, base in self._original_font_sizes.items():
+            try:
+                tkfont.nametofont(name).configure(size=max(1, int(round(base * mult))))
+            except tk.TclError:
+                pass
+        for widget, base, weight in self._explicit_font_widgets:
+            self._set_widget_font(widget, base, weight)
+        try:
+            self.style.configure("Treeview",
+                                 rowheight=max(1, int(round(self._original_row_height * mult))))
+        except tk.TclError:
+            pass
+        # The Steam user widget floats over the strip between title bar
+        # and the notebook's tab row (notebook.pack pady top). At higher
+        # font scales the widget grows taller and starts overlapping the
+        # tabs unless we also grow that strip — scale the top pady together
+        # with everything else. Guard with hasattr because _apply_font_scale
+        # is also called once from __init__ BEFORE _build_ui creates the
+        # notebook (so the very first paint already has the right size).
+        if hasattr(self, "notebook"):
+            try:
+                self.notebook.pack_configure(
+                    pady=(max(0, int(round(25 * mult))), 0)
+                )
+            except tk.TclError:
+                pass
+        # Force a full redraw — Entry / Spinbox widgets keep stale
+        # rendering of the old font size otherwise (visible as clipped
+        # text artefacts on the Settings tab). And every ScrolledFrame
+        # has a Canvas inside; its scrollregion is sized off the inner
+        # frame's reqsize at <Configure> time, which font changes don't
+        # always trigger. Re-tag inner frames so the scrollregion catches up.
+        self.update_idletasks()
+        for child in self.winfo_children():
+            self._refresh_scrolled_frames(child)
+            self._force_redraw_inputs(child)
+
+    def _force_redraw_inputs(self, widget) -> None:
+        """Kick Entry / Spinbox / Combobox out of stale pixel caches.
+
+        After a font *shrink* Tk's text-entry widgets keep drawing the
+        characters in the bounding box computed for the previous (larger)
+        font. The widgets allocate space for the new font correctly, but
+        the inner text-render keeps old metrics — visible as ghost chars
+        / clipped digits / "extra column" artefacts especially on the
+        Settings tab. Toggling `width` by ±1 forces Tk to recompute
+        geometry from scratch, which clears the cached metrics.
+        """
+        try:
+            cls = widget.winfo_class()
+        except tk.TclError:
+            cls = ""
+        if cls in ("TEntry", "TSpinbox", "TCombobox", "Entry", "Spinbox"):
+            try:
+                w = int(widget.cget("width"))
+                widget.configure(width=w + 1)
+                widget.configure(width=w)
+            except (tk.TclError, ValueError):
+                pass
+        for grand in widget.winfo_children():
+            self._force_redraw_inputs(grand)
+
+    def _refresh_scrolled_frames(self, widget) -> None:
+        """Walk the widget tree, kick every ScrolledFrame's geometry.
+
+        After a font change the inner frame's reqsize shifts but the
+        ScrolledFrame's internal `_measures()` only reruns on yview() or
+        a real <Configure> event. We:
+          1. update_idletasks so reqsize reflects the new font,
+          2. call yview() — this re-snaps content_place to a valid
+             offset (e.g. after font shrink it pulls content back to 0
+             so we're not still scrolled past the now-shorter content),
+          3. check `_measures()` and force-hide the scrollbar when the
+             thumb covers the whole range — base autohide is mouse-based
+             (Enter/Leave) and otherwise leaves a stale scrollbar visible
+             after content shrinks.
+        """
+        try:
+            from ttkbootstrap.widgets.scrolled import ScrolledFrame
+        except ImportError:
+            return
+        if isinstance(widget, ScrolledFrame):
+            try:
+                widget.update_idletasks()
+                # yview_moveto(0) — not yview() — because plain yview()
+                # reads the previous `first` fraction from the scrollbar
+                # and tries to preserve it. After a font shrink that
+                # leaves content_place at a negative rely (content
+                # scrolled OFF the top), even though the new shorter
+                # content now fits in view. Snapping back to top is the
+                # right "reset to baseline" behaviour for a font change.
+                widget.yview_moveto(0)
+                _, thumb = widget._measures()
+                # Use < 0.999 not < 1.0 — floating-point rounding can
+                # leave thumb = 0.9998 when content just barely fits.
+                if thumb >= 0.999:
+                    widget.hide_scrollbars()
+            except (tk.TclError, AttributeError, ZeroDivisionError):
+                pass
+        for grand in widget.winfo_children():
+            self._refresh_scrolled_frames(grand)
 
     def _configure_styles(self):
         """Tune ttk.Style — rowheight, alternating row colours, header borders.
@@ -562,12 +852,81 @@ class App(tb.Window):
         # New tab order: Придбання | Продаж | Історія | Планувальник |
         # Журнал | Налаштування. Index 0 = buy list, 1 = sell list — used by
         # _active_kind() to figure out which file an action targets.
-        self.tab_purchase  = ttk.Frame(self.notebook)
-        self.tab_sales     = ttk.Frame(self.notebook)
-        self.tab_history   = ttk.Frame(self.notebook)
+        # Tabs that are tall by nature (full table + two rows of buttons +
+        # action strip below) get a ScrolledFrame inside — at higher
+        # font scales their content overflows the window vertically and
+        # the buttons drift off-screen. autohide=True keeps the scrollbar
+        # invisible when content fits.
+        # Notebook can only host plain ttk.Frame children, so each
+        # scrollable tab is a small holder Frame with a ScrolledFrame
+        # packed inside, and we expose the ScrolledFrame as `self.tab_*`.
+        from ttkbootstrap.widgets.scrolled import ScrolledFrame
+
+        def _scrollable_tab() -> ScrolledFrame:
+            holder = ttk.Frame(self.notebook)
+            # Don't pass bootstyle to ScrolledFrame — it forwards it to
+            # the INNER content frame too (see scrolled.py: super().__init__
+            # gets `bootstyle=bootstyle.replace('round', '')`), which makes
+            # ttkbootstrap paint a tinted border around every scrollable
+            # tab. We only want the scrollbar coloured; we set its bootstyle
+            # directly below.
+            sf = ScrolledFrame(holder, autohide=True)
+            sf.pack(fill=BOTH, expand=YES)
+            # Stash the holder on the ScrolledFrame so the notebook.add
+            # loop below can find it without us juggling two refs everywhere.
+            sf._holder = holder
+            # Tint ONLY the vertical scrollbar (matches Treeview's green
+            # accent). Leaves the content frame styled like a plain Frame.
+            try:
+                sf.vscroll.configure(bootstyle="success")
+            except tk.TclError:
+                pass
+            # ttkbootstrap's autohide is mouse-based — entering the frame
+            # always pop the scrollbar, even when the content fits and
+            # there's nothing to scroll. Wrap show_scrollbars so it only
+            # actually shows when the thumb is shorter than the viewport
+            # (i.e. content overflows).
+            _orig_show = sf.show_scrollbars
+            def _smart_show(_orig=_orig_show, _sf=sf):
+                try:
+                    _, thumb = _sf._measures()
+                except (AttributeError, tk.TclError, ZeroDivisionError):
+                    thumb = 0.0
+                if thumb < 0.999:
+                    _orig()
+                else:
+                    _sf.hide_scrollbars()
+            sf.show_scrollbars = _smart_show
+            # Stretch the inner content frame so it fills the container's
+            # vertical extent when content is SHORTER than the container.
+            # Default ScrolledFrame places its content at `height=reqheight`
+            # (sum of children's natural sizes) — so a `pack(expand=YES)`
+            # child inside has no extra space to expand into when the tab
+            # area is taller than the content's reqheight. Visible bug:
+            # a table whose data rows don't fill the treeview leaves the
+            # bottom buttons floating in the middle of the tab instead of
+            # near the table's bottom edge.
+            def _stretch(_e=None, _sf=sf):
+                try:
+                    c_h = _sf.container.winfo_height()
+                    req_h = _sf.winfo_reqheight()
+                    target_h = max(req_h, c_h)
+                    # Skip when nothing changes — content_place would
+                    # re-fire Configure and loop.
+                    if abs(_sf.winfo_height() - target_h) > 1:
+                        _sf.content_place(rely=0.0, relwidth=1.0,
+                                          height=target_h)
+                except (tk.TclError, AttributeError):
+                    pass
+            sf.container.bind("<Configure>", _stretch, add="+")
+            return sf
+
+        self.tab_purchase  = _scrollable_tab()
+        self.tab_sales     = _scrollable_tab()
+        self.tab_history   = _scrollable_tab()
         self.tab_scheduler = ttk.Frame(self.notebook)
         self.tab_log       = ttk.Frame(self.notebook)
-        self.tab_settings  = ttk.Frame(self.notebook)
+        self.tab_settings  = _scrollable_tab()
 
         for tab, key in [
             (self.tab_purchase,  "tab.purchase"),
@@ -577,7 +936,11 @@ class App(tb.Window):
             (self.tab_log,       "tab.log"),
             (self.tab_settings,  "tab.settings"),
         ]:
-            self.notebook.add(tab, text=t(key))
+            # If `tab` is a ScrolledFrame, give the notebook its holder
+            # frame (notebook only accepts plain ttk.Frame children).
+            # For regular ttk.Frame tabs, add directly.
+            real_tab = getattr(tab, "_holder", tab)
+            self.notebook.add(real_tab, text=t(key))
 
         # When the user switches tabs, re-read the underlying JSON so any
         # change made by an out-of-process watch.py run is reflected
@@ -596,6 +959,15 @@ class App(tb.Window):
         self._build_scheduler_tab()
         self._build_history_tab()
         self._build_log_tab()
+
+        # Cap the minimum window size so the user can't crush it into
+        # something that hides the last tab behind the user widget, or
+        # collapses the table to fewer than five visible rows.
+        # `update()` (not just update_idletasks) forces Tk to actually
+        # render the notebook tab strip, so bbox(i) returns real coords
+        # instead of zeros on the first measurement.
+        self.update()
+        self._apply_min_size()
 
     # ------------------------------------------------------------------
     # Steam user widget (top-right)
@@ -621,7 +993,10 @@ class App(tb.Window):
         """
         # x=-14 keeps a margin from the right edge; y=5 nudges down a
         # touch so the cluster doesn't crash into the title bar above.
+        # Stored as `self.user_cluster` so _apply_min_size can ask for
+        # its width when computing the window's minsize.
         cluster = ttk.Frame(self)
+        self.user_cluster = cluster
         cluster.place(relx=1.0, x=-14, y=5, anchor="ne")
 
         # Two-line text column (username on top, balance below). Right-aligned
@@ -629,9 +1004,10 @@ class App(tb.Window):
         text_col = ttk.Frame(cluster)
         text_col.pack(side=LEFT, padx=(0, 8))
 
-        self.lbl_username = ttk.Label(
-            text_col, text="Username", anchor=E, font=("", 10, "bold"),
-        )
+        self.lbl_username = ttk.Label(text_col, text="Username", anchor=E)
+        # Registered for font scaling — non-default size so we can't rely
+        # on the named-font path picking it up automatically.
+        self._scaled_font(self.lbl_username, 10, "bold")
         self.lbl_username.pack(side=TOP, anchor=E)
 
         # Wallet balance — same currency symbol the rest of the app uses
@@ -698,6 +1074,107 @@ class App(tb.Window):
             c.create_text(size / 2, size / 2,
                           text="S", fill="#FFFFFF",
                           font=("Segoe UI", int(size * 0.55), "bold"))
+
+    def _measure_last_tab_right(self, nb: ttk.Notebook, n_tabs: int) -> int:
+        """Right pixel coordinate of the last tab in the strip.
+
+        Tries `notebook.bbox(i)` first — that's authoritative once Tk has
+        rendered the strip. If bbox returns zeros (window not realised
+        yet on this platform / first paint hasn't completed) we estimate
+        from the tab labels' rendered text width: sum every tab's text
+        width + 2× horizontal tab-padding + 2 px of border-ish slop per
+        tab. Slightly over-counts, which is fine — under-counting would
+        let the user widget creep onto the last tab.
+        """
+        last_tab_right = 0
+        for i in range(n_tabs):
+            try:
+                x, _y, w, _h = nb.bbox(i)
+                last_tab_right = max(last_tab_right, x + w)
+            except (tk.TclError, TypeError, ValueError):
+                pass
+        if last_tab_right > 0:
+            return last_tab_right
+
+        # Fallback — measure text width of each tab label using the
+        # current TkDefaultFont (named-font scaling already applied).
+        import tkinter.font as tkfont
+        try:
+            f = tkfont.nametofont("TkDefaultFont")
+        except tk.TclError:
+            return 0
+        # padding=(10, 4) → 10 px on each side = 20 horizontal.
+        tab_h_padding = 20
+        # +2 px slop per tab for the border / separator.
+        slop = 2
+        total = 0
+        for i in range(n_tabs):
+            try:
+                text = nb.tab(i, "text") or ""
+            except tk.TclError:
+                text = ""
+            total += f.measure(text) + tab_h_padding + slop
+        return total
+
+    def _apply_min_size(self) -> None:
+        """Lock a sensible floor for window resize.
+
+        Two visual contracts to preserve when the user shrinks the window:
+
+        - **Width**: the last notebook tab must remain fully visible,
+          NOT covered by the user widget (which floats via place() and
+          would otherwise overlap on a narrow window).
+        - **Height**: at least 5 rows of the table must be visible.
+
+        We measure live geometry (tab right-edges via `notebook.bbox(i)`,
+        user widget width via `winfo_reqwidth`, treeview row height from
+        the active style) instead of hard-coding pixel constants — that
+        way changing language / font / themes doesn't break the floor.
+        """
+        self.update_idletasks()
+
+        # --- Width ---
+        nb = self.notebook
+        n_tabs = nb.index("end")
+        last_tab_right = self._measure_last_tab_right(nb, n_tabs)
+
+        # `winfo_reqwidth` on a freshly placed widget can return tiny
+        # values before Tk has rendered the avatar + text — fall back to
+        # a realistic minimum (~160 px is what the cluster needs for the
+        # Steam icon + a longer username at x1).
+        widget_w = max(self.user_cluster.winfo_reqwidth(), 160)
+        # Scale-aware extra breathing — at higher font_scale even
+        # winfo_reqwidth lags reality by a few characters worth.
+        scale_mult = self._FONT_SCALE_FACTORS.get(self._font_scale, 1.0)
+        widget_w = int(max(widget_w, 160 * scale_mult))
+
+        # 12 px of breathing room between the last tab and the widget,
+        # plus the notebook's own 8 px padx on each side, plus 14 px the
+        # widget keeps from the right edge (see _build_user_widget x=-14).
+        min_w = last_tab_right + 12 + widget_w + 14 + 16
+
+        # --- Height ---
+        # ttk.Style stores the row height for Treeview under
+        # "Treeview" rowheight; fall back to 25 px if it's unset.
+        try:
+            row_h = int(self.style.lookup("Treeview", "rowheight") or 25)
+        except (ValueError, tk.TclError):
+            row_h = 25
+        # Five data rows + table header + tab strip + button rows + status
+        # bar + top gap. Rough but reliable numbers that match what we
+        # actually pack/place above and below the treeview.
+        chrome_h = (
+            25   # title-bar gap (notebook.pack pady top)
+            + 28 # notebook tab strip
+            + 28 # treeview header row
+            + 36 # row1 of buttons
+            + 36 # row2 of buttons
+            + 22 # status bar
+            + 24 # frame paddings / borders
+        )
+        min_h = 5 * row_h + chrome_h
+
+        self.minsize(min_w, min_h)
 
     def _update_user_widget(self, *, username: str | None = None,
                             balance: str | None = None,
@@ -2204,17 +2681,40 @@ class App(tb.Window):
         cb_lang.grid(row=7, column=1, sticky=W)
         cb_lang.bind("<<ComboboxSelected>>", self._on_language_change)
 
-        row("lbl.antispam_hours", 8)
+        # Font scale dropdown — own row directly under Language. Values
+        # stored as int (1..5) but displayed as "x1".."x5" so the meaning
+        # is obvious. Layout polish can come later; for now we just stack
+        # under the language picker.
+        row("lbl.font_scale", 8)
+        current_scale = int(ui.get("font_scale", 1) or 1)
+        # First slot reads "За замовчуванням" (= x1, the unscaled
+        # baseline). The next four are x2..x5, each ramping the factor
+        # by 0.5 up to 3.0× the original. Centralised in _font_scale_*
+        # helpers below so save/load goes through the same vocabulary.
+        font_scale_values = self._font_scale_combo_values()
+        self.var_font_scale = tk.StringVar(value=self._font_scale_to_label(current_scale))
+        cb_font = ttk.Combobox(
+            f, values=font_scale_values,
+            textvariable=self.var_font_scale, state="readonly", width=20,
+        )
+        cb_font.grid(row=8, column=1, sticky=W)
+
+        row("lbl.antispam_hours", 9)
         self.var_remind_hours = tk.IntVar(value=spam.get("remind_after_hours", 24))
-        ttk.Spinbox(f, from_=1, to=168, textvariable=self.var_remind_hours, width=8).grid(row=8, column=1, sticky=W)
+        ttk.Spinbox(f, from_=1, to=168, textvariable=self.var_remind_hours, width=8).grid(row=9, column=1, sticky=W)
 
-        row("lbl.repeat_if_lower", 9)
+        row("lbl.repeat_if_lower", 10)
         self.var_repeat_lower = tk.BooleanVar(value=spam.get("repeat_if_lower", True))
-        ttk.Checkbutton(f, variable=self.var_repeat_lower).grid(row=9, column=1, sticky=W)
+        # Custom glyph-based check — see _make_scalable_check docstring for
+        # why ttk.Checkbutton was a bad fit (the indicator box doesn't
+        # scale with font on the ttkbootstrap themes we use).
+        self._make_scalable_check(f, self.var_repeat_lower).grid(
+            row=10, column=1, sticky=W
+        )
 
-        row("lbl.template", 10)
+        row("lbl.template", 11)
         template_holder = ttk.Frame(f)
-        template_holder.grid(row=10, column=1, sticky=W, pady=4)
+        template_holder.grid(row=11, column=1, sticky=W, pady=4)
         # tk.Text isn't a ttk widget so it doesn't pick up the style-level
         # selection colours we configured for ttk.Entry. Apply explicitly so
         # selected text reads against the input background.
@@ -2243,14 +2743,23 @@ class App(tb.Window):
         # Text widget — looks much tidier than floating in the middle.
         self.btn_edit_template.pack(side=LEFT, padx=(4, 0), anchor=N)
         ttk.Label(f, text=t("lbl.template_vars"),
-                  foreground="gray").grid(row=11, column=1, sticky=W)
+                  foreground="gray").grid(row=12, column=1, sticky=W)
 
-        row("lbl.steam_login", 12)
-        ttk.Button(f, text=t("btn.in_development"), state=DISABLED).grid(row=12, column=1, sticky=W)
+        row("lbl.steam_login", 13)
+        ttk.Button(f, text=t("btn.in_development"), state=DISABLED).grid(row=13, column=1, sticky=W)
 
-        ttk.Button(f, text=t("btn.save"),
+        # Save + Reset live on the same row. Reset is bootstyle="danger"
+        # so it's visually weighted as "destructive" — the confirmation
+        # dialog catches the second-thought case before anything is wiped.
+        save_row = ttk.Frame(f)
+        save_row.grid(row=14, column=1, sticky=W, pady=(16, 0))
+        ttk.Button(save_row, text=t("btn.save"),
                    command=self._save_settings, bootstyle="success"
-                   ).grid(row=13, column=1, sticky=W, pady=(16, 0))
+                   ).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(save_row, text=t("btn.reset"),
+                   command=self._reset_settings_to_defaults,
+                   bootstyle="danger"
+                   ).pack(side=LEFT)
 
     def _toggle_edit(self, widget, button: ttk.Button, lock_state: str = "readonly") -> None:
         """Flip a locked input widget between edit and locked modes.
@@ -2353,6 +2862,15 @@ class App(tb.Window):
             "ui": {
                 "theme": self.var_theme.get(),
                 "language": lang_code,
+                # Combobox value → 1..5 (handles both "За замовчуванням"
+                # and "x2"..."x5"). _apply_font_scale clamps the result
+                # so hand-edited configs can't push out of range either.
+                "font_scale": self._font_scale_from_label(self.var_font_scale.get()),
+                # Snapshot of the current window size+position. Restored
+                # on next launch (see __init__). Reset writes "1100x620"
+                # here via self.geometry() right before calling us, so
+                # reset naturally wipes the saved value back to default.
+                "window_geometry": self.geometry(),
             },
             "antispam": {
                 "repeat_if_lower": self.var_repeat_lower.get(),
@@ -2366,7 +2884,115 @@ class App(tb.Window):
             cfg["message_template"] = template_override
         save_json(CONFIG_PATH, cfg)
         self.config_data = cfg
+        # Apply font scale live so the change is visible without a restart.
+        # Re-cap min size after — bigger fonts need a bigger floor.
+        self._apply_font_scale(cfg["ui"]["font_scale"])
+        self.after(50, self._apply_min_size)
         self._set_status(t("status.settings_saved"))
+
+    def _reset_settings_to_defaults(self):
+        """Wipe all settings back to config.example.json defaults.
+
+        Telegram credentials (bot_token, chat_id) are deliberately preserved —
+        the user pastes those in once and losing them silently would be
+        cruel. The confirmation dialog says so up front.
+
+        After the reset we:
+          * mutate every settings-tab Var so the form reflects the new state,
+          * re-apply theme + font_scale + DWM title-bar tint live,
+          * shrink the window back to the launch size (1100×620) and re-cap
+            the minsize floor for the now-baseline font,
+          * persist by reusing _save_settings — single source of truth for
+            on-disk schema and post-save bookkeeping.
+        """
+        if not messagebox.askyesno(t("dlg.reset.title"), t("dlg.reset.body")):
+            return
+
+        # Capture current language so we can decide whether to prompt for
+        # restart at the end — i18n only swaps on app launch (every tab,
+        # heading, button text is already realised), so a language reset
+        # would otherwise leave the dropdown saying "English" while the
+        # UI keeps speaking Ukrainian until the next start.
+        current_lang_code = i18n.get_language()
+
+        # Mirror of config.example.json — single place to bump when
+        # defaults change. Telegram creds intentionally NOT here.
+        defaults = {
+            "currency":          18,
+            "country":           "UA",
+            "poll_delay_sec":    1.5,
+            "interval_minutes":  5,
+            "theme":             "superhero",
+            "language":          "en",
+            "font_scale":        1,
+            "repeat_if_lower":   True,
+            "remind_after_hours": 24,
+        }
+
+        # ---- Reset all the StringVars / IntVars the form reads from ----
+        self.var_currency.set(defaults["currency"])
+        # Combobox display value uses "UAH (18)" labels — look up via the
+        # reverse map we cached when building the form.
+        reverse_currency = {v: k for k, v in self._currency_map.items()}
+        self._cb_currency.set(reverse_currency.get(defaults["currency"], "UAH (18)"))
+
+        self.var_country.set(defaults["country"])
+        self.var_poll_delay.set(defaults["poll_delay_sec"])
+        self.var_interval.set(defaults["interval_minutes"])
+        self.var_theme.set(defaults["theme"])
+
+        # Language: var stores display name, not ISO code.
+        default_lang_name = next(
+            (opt["name"] for opt in self._lang_options
+             if opt["code"] == defaults["language"]),
+            defaults["language"],
+        )
+        self.var_language.set(default_lang_name)
+
+        self.var_font_scale.set(self._font_scale_to_label(defaults["font_scale"]))
+        self.var_remind_hours.set(defaults["remind_after_hours"])
+        # Triggers the trace_add → glyph redraws to ☑/☐ automatically.
+        self.var_repeat_lower.set(defaults["repeat_if_lower"])
+
+        # Template field is a tk.Text in disabled state — unlock briefly
+        # to replace its contents with the language default, then relock.
+        # Whatever edit-button state was in play gets reset alongside.
+        self.txt_template.configure(state="normal")
+        self.txt_template.delete("1.0", "end")
+        self.txt_template.insert("1.0", t("tg.message.default"))
+        self.txt_template.configure(state="disabled")
+        self.btn_edit_template.configure(text="✏", bootstyle="link")
+
+        # ---- Apply live: theme + titlebar + treeview colours ----
+        try:
+            self.style.theme_use(defaults["theme"])
+        except Exception:
+            pass
+        self._configure_styles()
+        for tree in self.list_trees.values():
+            self._apply_row_tags(tree)
+        if hasattr(self, "hist_tree"):
+            self._apply_row_tags(self.hist_tree)
+        self._refresh_watchlist()
+        self._refresh_history()
+        self._apply_native_titlebar_theme()
+
+        # Shrink window back to the launch geometry. minsize re-caps after
+        # the font scale change so it doesn't refuse the smaller size.
+        self.geometry("1100x620")
+
+        # Persist via _save_settings so the schema written to disk matches
+        # what a normal Save would produce — and font-scale / minsize live
+        # update happens for free (it's already in _save_settings).
+        self._save_settings()
+
+        # If the language actually changed, prompt for restart — same
+        # contract as the language picker's own on-change handler. Done
+        # at the very end so the user sees the visual reset complete
+        # before the modal pops up.
+        if current_lang_code != defaults["language"]:
+            messagebox.showinfo(t("dlg.lang_changed.title"),
+                                t("dlg.lang_changed.body"))
 
     # ---- Scheduler -------------------------------------------------------
 
@@ -2374,7 +3000,10 @@ class App(tb.Window):
         f = ttk.Frame(self.tab_scheduler, padding=16)
         f.pack(fill=BOTH, expand=YES)
 
-        self.lbl_task_status = ttk.Label(f, text="…", font=("", 12))
+        self.lbl_task_status = ttk.Label(f, text="…")
+        # Slightly bigger than default so the line stands out. Registered
+        # so it follows the Settings font-scale knob.
+        self._scaled_font(self.lbl_task_status, 12)
         self.lbl_task_status.pack(pady=(0, 12))
 
         btn_row = ttk.Frame(f)
@@ -2528,13 +3157,21 @@ class App(tb.Window):
         # plain "Ціна" (no "покупки", since it now covers sales too).
         cols = ("num", "date", "name", "game", "operation", "price", "link")
 
-        # Single bottom strip: action buttons on the left, totals panel on
-        # the right. Keeps the bottom area the same height as before the
-        # stats panel was added (one row of buttons high).
+        # Bottom strip: action buttons on the left, totals panel on the
+        # right. Uses grid so the totals can be re-flowed underneath the
+        # buttons when the window is too narrow to fit both on one row
+        # (otherwise the stats get clipped off the right edge). The
+        # reflow is wired via _reflow_history_bottom below.
         bottom = ttk.Frame(self.tab_history)
         bottom.pack(side=BOTTOM, fill=X, padx=8, pady=(0, 8))
+        bottom.columnconfigure(0, weight=1)
         btn_f = ttk.Frame(bottom)
-        btn_f.pack(side=LEFT)
+        # sticky="nw" so buttons stay at the TOP-LEFT of the cell — without
+        # the "n" they'd center vertically when the row's height grows to
+        # fit a multi-row stats panel, drifting away from the table edge.
+        btn_f.grid(row=0, column=0, sticky="nw")
+        self._hist_bottom = bottom
+        self._hist_btn_f = btn_f
 
         hist_frame = ttk.Frame(self.tab_history, borderwidth=1, relief="solid")
         hist_frame.pack(side=TOP, fill=BOTH, expand=YES, padx=8, pady=8)
@@ -2587,28 +3224,236 @@ class App(tb.Window):
         ]:
             ttk.Button(btn_f, text=t(key), command=cmd).pack(side=LEFT, padx=2)
 
-        # Totals panel — purchases / sales / spent — laid out inline in
-        # one row so the whole bottom strip stays the height of a single
-        # button. Lives on the right of the bottom strip; the action
-        # buttons cling to the left. Value labels auto-size to their text
-        # (no fixed `width=`) so there's no dead space between the colon
-        # and the number. A subtle "│" separator splits the groups.
+        # Totals panel — purchases / sales / spent — laid out adaptively
+        # by _reflow_history_bottom (three modes: inline / vertical /
+        # stacked). Each "cell" is its own little Frame holding `label +
+        # value` so we can re-pack the whole group between horizontal
+        # and vertical orientations without recreating widgets. The "│"
+        # separators only render in inline mode.
         stats = ttk.Frame(bottom)
-        stats.pack(side=RIGHT)
-        cells = [
+        stats.grid(row=0, column=1, sticky="ne")
+        self._hist_stats = stats
+        # Persistent definitions of which cells exist — used by
+        # _apply_stats_layout to recreate cells on every relayout.
+        # We recreate (rather than reparent) because Tk's pack-with-in_
+        # works geometrically but doesn't propagate reqsize back to the
+        # cell's master — so an `in_=inner` cell renders correctly inside
+        # `inner`, but `stats` thinks it's still empty (0 reqwidth) and
+        # the grid column collapses, leaving the whole panel invisible.
+        # Destroy-and-recreate avoids the issue at the cost of churning
+        # widgets on every reflow (cheap — three Labels per cell).
+        self._hist_cells_def = [
             ("hist.total_buy",  "lbl_total_buy"),
             ("hist.total_sell", "lbl_total_sell"),
             ("hist.spent",      "lbl_spent"),
         ]
-        for idx, (key, attr) in enumerate(cells):
-            if idx > 0:
-                sep = ttk.Label(stats, text="│")
-                sep.configure(foreground="#666666")
-                sep.pack(side=LEFT, padx=10)
-            ttk.Label(stats, text=t(key)).pack(side=LEFT, padx=(0, 4))
-            value_label = ttk.Label(stats, text="0.00")
-            value_label.pack(side=LEFT)
-            setattr(self, attr, value_label)
+        self._hist_stats_rows = []   # row Frames (children of stats)
+        self._hist_stats_cells = []  # cell Frames (children of an inner frame inside a row)
+        # Signature of last-applied layout for idempotency — prevents
+        # Configure-event flap during drag resizes.
+        self._hist_stats_signature = None
+        # Approximate width of "│" separator + 2×padx(10) — used in
+        # _reflow's width math. Refined to a real measurement on the
+        # first reflow that renders a sep (sep widgets are short-lived,
+        # so a constant estimate is good enough until then).
+        self._hist_sep_width = 30
+
+        # Build the initial inline layout so the cells appear right away.
+        # _reflow_history_bottom will swap to wrap / below mode on first
+        # Configure event if the measured width prefers them.
+        self._apply_stats_layout(
+            [list(range(len(self._hist_cells_def)))], "e", True
+        )
+
+        # Re-flow on every resize: pick the widest layout that still
+        # fits in the available space. Without this the stats either
+        # get clipped off the right edge (when packed) or always
+        # consume an extra row even when there's plenty of room.
+        bottom.bind("<Configure>", self._reflow_history_bottom)
+        # Initial layout — schedule after current event loop tick so all
+        # children have their reqsize computed by the time we measure.
+        self.after_idle(self._reflow_history_bottom)
+
+    def _apply_stats_layout(self, rows_spec, anchor, use_seps) -> None:
+        """Rebuild the stats panel for the given multi-row spec.
+
+        rows_spec: list of lists of cell indices. e.g. [[0, 1], [2]] →
+            two rows; row 0 holds cells 0+1, row 1 holds cell 2.
+        anchor: "e" (right-aligned inside each row, used when stats lives
+            to the right of buttons) or "w" (left-aligned, for below mode).
+        use_seps: True → render "│" between cells on the same row
+            (inline / below-inline modes). False → no separator, just
+            horizontal padding (wrap mode — the line break itself does
+            the visual grouping).
+
+        Implementation: full destroy + recreate. Row Frames, cells, and
+        value Labels are all freshly built each call. Cells must be
+        direct children of `inner` (not `stats` with `in_=inner`) so Tk
+        propagates their reqsize through to `stats` and the grid column
+        sizes correctly — see the note where these widgets are first
+        introduced for the full story. Callers must invoke
+        _refresh_history_stats() after this to repopulate the new
+        value-label texts.
+        """
+        for row in self._hist_stats_rows:
+            try:
+                row.destroy()
+            except tk.TclError:
+                pass
+        self._hist_stats_rows = []
+        # `cells` need to be indexed by cell_def position (0..n-1) so the
+        # reflow function can find them in original order regardless of
+        # how rows_spec scrambled them — build a temp dict, then assemble
+        # the ordered list at the end.
+        new_cells_by_idx = {}
+
+        stats = self._hist_stats
+        cells_def = self._hist_cells_def
+        for indices in rows_spec:
+            row_frame = ttk.Frame(stats)
+            row_frame.pack(side=TOP, fill=X, pady=1)
+            self._hist_stats_rows.append(row_frame)
+            # Inner sub-frame so cells can be right-aligned or left-aligned
+            # cleanly — pack(side=RIGHT) on `inner` makes it hug the right
+            # edge of the row, then cells pack(side=LEFT) inside `inner`
+            # render in natural reading order. Same trick mirrored for "w".
+            inner = ttk.Frame(row_frame)
+            inner.pack(side=RIGHT if anchor == "e" else LEFT)
+            for i, cell_idx in enumerate(indices):
+                if i > 0 and use_seps:
+                    sep = ttk.Label(inner, text="│",
+                                    foreground="#666666")
+                    sep.pack(side=LEFT, padx=10)
+                    # First sep we render this session — refine our
+                    # constant estimate so future reflow decisions are
+                    # accurate to within a couple of pixels.
+                    if self._hist_sep_width == 30:
+                        try:
+                            sep.update_idletasks()
+                            measured = sep.winfo_reqwidth() + 20
+                            if measured > 0:
+                                self._hist_sep_width = measured
+                        except tk.TclError:
+                            pass
+
+                key, attr = cells_def[cell_idx]
+                cell = ttk.Frame(inner)
+                ttk.Label(cell, text=t(key)).pack(side=LEFT, padx=(0, 4))
+                value_label = ttk.Label(cell, text="0.00")
+                value_label.pack(side=LEFT)
+                setattr(self, attr, value_label)
+                new_cells_by_idx[cell_idx] = cell
+
+                # Padding between cells: separator already gives breathing
+                # room; without one we add an explicit 12px on the left.
+                pad = 0 if (i == 0 or use_seps) else (12, 0)
+                cell.pack(side=LEFT, padx=pad)
+
+        self._hist_stats_cells = [
+            new_cells_by_idx[i] for i in range(len(cells_def))
+        ]
+
+    @staticmethod
+    def _wrap_cells_greedy(widths, sep_w, avail):
+        """Greedy left-to-right wrap into rows that each fit `avail`.
+
+        Multi-cell rows include `sep_w` of horizontal spacing between
+        adjacent cells. A row is allowed to contain a single cell even
+        if its width slightly exceeds `avail` — better than infinite
+        loop / no rows at all. (Caller should fall back to stacked
+        below-mode when even the widest single cell can't fit, see
+        _reflow_history_bottom's decision tree.)
+        """
+        rows, current, current_w = [], [], 0
+        for i, w in enumerate(widths):
+            addition = w if not current else (sep_w + w)
+            if current and current_w + addition > avail:
+                rows.append(current)
+                current, current_w = [i], w
+            else:
+                current.append(i)
+                current_w += addition
+        if current:
+            rows.append(current)
+        return rows
+
+    def _reflow_history_bottom(self, _event=None) -> None:
+        """Pick the best stats layout for the current bottom-strip width.
+
+        Three tiers (matches the user's spec):
+          1. `right_avail` ≥ inline_w → all cells in one row right of
+             buttons, with "│" separators between them.
+          2. else, `right_avail` ≥ widest cell width → wrap cells into
+             multiple right-aligned rows (still right of buttons), each
+             row holding as many cells as fit; no separators (the line
+             break itself groups them).
+          3. else → drop the whole group below the buttons in a single
+             left-aligned row with separators. Last resort — only when
+             even one full cell can't fit to the right of the buttons.
+
+        Idempotent: a layout signature is cached and a no-op runs when
+        the target matches it — protects against Configure-flap during
+        drag resizes.
+        """
+        bottom = getattr(self, "_hist_bottom", None)
+        btn_f = getattr(self, "_hist_btn_f", None)
+        stats = getattr(self, "_hist_stats", None)
+        cells = getattr(self, "_hist_stats_cells", None)
+        if not bottom or not btn_f or not stats or not cells:
+            return
+        try:
+            avail = bottom.winfo_width()
+            if avail <= 1:
+                return
+            cell_widths = [c.winfo_reqwidth() for c in cells]
+            sep_w = self._hist_sep_width
+            btn_w = btn_f.winfo_reqwidth()
+            # 24 = breathing room between buttons block and stats group
+            # so they don't visually kiss when layout is "just barely fits".
+            right_avail = avail - btn_w - 24
+            inline_w = sum(cell_widths) + sep_w * (len(cell_widths) - 1)
+            max_cell_w = max(cell_widths) if cell_widths else 0
+
+            if right_avail >= inline_w:
+                rows_spec = [list(range(len(cell_widths)))]
+                target_grid = {"row": 0, "column": 1,
+                               "sticky": "ne", "pady": 0}
+                anchor = "e"
+                use_seps = True
+            elif right_avail >= max_cell_w:
+                # Wrap mode keeps the "│" separator between cells that
+                # share a row (per user request). sep_w fed into the wrap
+                # algorithm so the row capacity math matches what we'll
+                # actually render.
+                rows_spec = self._wrap_cells_greedy(
+                    cell_widths, sep_w, right_avail
+                )
+                target_grid = {"row": 0, "column": 1,
+                               "sticky": "ne", "pady": 0}
+                anchor = "e"
+                use_seps = True
+            else:
+                rows_spec = [list(range(len(cell_widths)))]
+                target_grid = {"row": 1, "column": 0,
+                               "sticky": "w", "pady": (6, 0)}
+                anchor = "w"
+                use_seps = True
+
+            sig = (target_grid["row"], target_grid["column"],
+                   target_grid["sticky"], anchor, use_seps,
+                   tuple(tuple(r) for r in rows_spec))
+            if sig == self._hist_stats_signature:
+                return
+
+            self._apply_stats_layout(rows_spec, anchor, use_seps)
+            stats.grid_configure(**target_grid)
+            self._hist_stats_signature = sig
+            # _apply_stats_layout recreates the value labels — repopulate
+            # them with current totals so they don't read "0.00" until
+            # the next data refresh. Cheap (just reads purchases.json).
+            self._refresh_history_stats()
+        except (tk.TclError, KeyError, ValueError):
+            pass
 
     def _refresh_history(self):
         from steam import pretty_name

@@ -13,7 +13,8 @@
   },
   "ui": {
     "theme": "superhero",
-    "language": "en"
+    "language": "en",
+    "font_scale": 1
   },
   "antispam": {
     "repeat_if_lower": true,
