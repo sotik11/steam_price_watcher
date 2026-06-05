@@ -75,7 +75,7 @@
   "lbl.repeat_if_lower": "Repeat if lower:",
   "lbl.template":        "Message template:",
   "lbl.steam_login":     "Steam login:",
-  "lbl.template_vars":   "Variables: {display_name} {game} {price} {target} {volume} {url}. HTML: <b>, <u>, <blockquote>",
+  "lbl.template_vars":   "Variables: {display_name} {game} {price} {target} {volume} {url} {operation}. HTML: <b>, <u>, <blockquote>",
 
   "btn.test_message":   "Test message",
   "btn.in_development": "(in development)",
@@ -224,5 +224,7 @@
   "tg.btn.open_market":     "🌐 Open on the market",
   "tg.test_message":        "✅ Steam Card Price Watch — connection test",
   "tg.message.default":     "<b><u>{display_name}</u></b>\nCurrent price — <b>{price}</b>",
+  "tg.operation.buy":       "buy",
+  "tg.operation.sell":      "sell",
   "log.tg_error":           "Telegram error: {desc}"
 }

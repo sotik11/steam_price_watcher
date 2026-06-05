@@ -53,6 +53,16 @@ def send_alert(token: str, chat_id: str, item: dict, template: str) -> None:
     price = item.get("lowest_price_raw") or str(item.get("lowest_price", "?"))
     target = item.get("target_price", "?")
     volume = item.get("volume") or "—"
+    # `operation` comes from alerts.py — "buy" or "sell". Telegram has its
+    # own i18n keys (tg.operation.*) — separate from History's operation.*
+    # because the alert wants short, punchy nouns ("покупка" / "продаж")
+    # while History uses the verbal form ("придбання"). UPPER-case so it
+    # visually pops on a phone notification.
+    op_key = item.get("operation") or "buy"
+    operation_label = t(f"tg.operation.{op_key}")
+    if operation_label == f"tg.operation.{op_key}":  # i18n miss
+        operation_label = op_key
+    operation_label = operation_label.upper()
 
     safe = {
         # `{name}` is kept for backwards compat with older user templates,
@@ -66,6 +76,7 @@ def send_alert(token: str, chat_id: str, item: dict, template: str) -> None:
         "target":       html.escape(str(target)),
         "volume":       html.escape(str(volume)),
         "url":          html.escape(browser_url),
+        "operation":    html.escape(str(operation_label)),
     }
 
     try:

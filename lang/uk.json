@@ -75,7 +75,7 @@
   "lbl.repeat_if_lower": "Повторити, якщо нижче:",
   "lbl.template":        "Шаблон повідомлення:",
   "lbl.steam_login":     "Вхід у Steam:",
-  "lbl.template_vars":   "Змінні: {display_name} {game} {price} {target} {volume} {url}. HTML: <b>, <u>, <blockquote>",
+  "lbl.template_vars":   "Змінні: {display_name} {game} {price} {target} {volume} {url} {operation}. HTML: <b>, <u>, <blockquote>",
 
   "btn.test_message":   "Тестове повідомлення",
   "btn.in_development": "(у розробці)",
@@ -224,5 +224,7 @@
   "tg.btn.open_market":     "🌐 Відкрити на маркеті",
   "tg.test_message":        "✅ Steam Card Price Watch — тест зв'язку",
   "tg.message.default":     "<b><u>{display_name}</u></b>\nПоточна ціна — <b>{price}</b>",
+  "tg.operation.buy":       "покупка",
+  "tg.operation.sell":      "продаж",
   "log.tg_error":           "Помилка Telegram: {desc}"
 }

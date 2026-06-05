@@ -108,8 +108,11 @@ def evaluate_and_alert(*, kind: str, info: dict, state: dict,
     # Lazy import — telegram.py loads requests + i18n, which is fine in
     # watch.py but in gui.pyw we want to keep the startup path lean.
     from telegram import send_alert
+    # Hand the kind down to send_alert so the {operation} template variable
+    # can resolve to "придбання" / "продаж". Don't mutate caller's dict.
+    info_for_tg = {**info, "operation": kind}
     try:
-        send_alert(token, chat_id, info, template)
+        send_alert(token, chat_id, info_for_tg, template)
     except Exception as exc:
         log.error(t("log.alert_failed", name=pretty, err=str(exc)))
         return False, False, False, f"send failed: {exc}"
