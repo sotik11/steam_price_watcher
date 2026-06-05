@@ -136,8 +136,9 @@ def _process_list(kind: str, list_path: Path, *,
         # Same condition the alert rule uses below.
         still_qualifies = (last_price <= target) if kind == "buy" else (last_price < target)
         if not still_qualifies:
+            from steam import pretty_name
             log.info(
-                f"clearing stale 'alerted' on {w.get('name')!r}: "
+                f"clearing stale 'alerted' on {pretty_name(w)!r}: "
                 f"last_alerted_price={last_price} no longer hits target={target}"
             )
             w["status"] = ""
@@ -182,15 +183,20 @@ def _process_list(kind: str, list_path: Path, *,
         return [w for w in items
                 if w.get("appid") == appid_ and w.get("name") == name_]
 
+    from steam import pretty_name
     for item in results:
         name = item.get("name", "?")
         appid = item.get("appid", "?")
+        # `name` stays the raw market_hash_name for state-key plumbing.
+        # `pretty` is the user-facing display name for log lines so the
+        # Журнал tab reads "Merrin" rather than "1774580-Merrin".
+        pretty = pretty_name(item)
         # kind-prefix keeps buy- and sell-side antispam independent for the
         # same card sitting in both lists.
         key = f"{kind}:{appid}:{name}"
 
         if item.get("error"):
-            log.warning(t("log.fetch_error", name=name, err=item["error"]))
+            log.warning(t("log.fetch_error", name=pretty, err=item["error"]))
             # Surface rate-limit visually in the GUI: tag every matching
             # row with status="rate_limited" (blue background) so the user
             # sees which cards weren't polled this round. We only overwrite
@@ -207,7 +213,7 @@ def _process_list(kind: str, list_path: Path, *,
         target = item.get("target_price")
 
         if lowest is None or target is None:
-            log.warning(t("log.missing_target", name=name, lowest=lowest, target=target))
+            log.warning(t("log.missing_target", name=pretty, lowest=lowest, target=target))
             continue
 
         # Successful fetch — auto-clear a stale "rate_limited" badge so the
@@ -218,7 +224,7 @@ def _process_list(kind: str, list_path: Path, *,
                 list_dirty = True
 
         log.info(t("log.card_status",
-                   name=name[:40], lowest=lowest, target=target,
+                   name=pretty[:40], lowest=lowest, target=target,
                    volume=item.get("volume")))
 
         # Update last_seen on EVERY row matching this card (duplicates
@@ -239,7 +245,7 @@ def _process_list(kind: str, list_path: Path, *,
         # manual "Оновити зараз" path can call the SAME logic — single
         # source of truth means antispam state stays consistent regardless
         # of who triggered the poll.
-        sd, did_alert, _reason = evaluate_and_alert(
+        sd, did_alert, did_reset, _reason = evaluate_and_alert(
             kind=kind, info=item, state=state,
             token=token, chat_id=chat_id, template=template,
             repeat_if_lower=repeat_if_lower,
@@ -253,6 +259,14 @@ def _process_list(kind: str, list_path: Path, *,
             for w in matching:
                 if w.get("status") != "alerted":
                     w["status"] = "alerted"
+                    list_dirty = True
+        elif did_reset:
+            # Price bounced back above target — drop the green "сповіщено"
+            # tag on all matching rows so the user sees we're back to
+            # waiting, and a subsequent drop fires a fresh first_alert.
+            for w in matching:
+                if w.get("status") == "alerted":
+                    w["status"] = ""
                     list_dirty = True
 
     if list_dirty:

@@ -22,7 +22,7 @@ log = logging.getLogger("alerts")
 def evaluate_and_alert(*, kind: str, info: dict, state: dict,
                       token: str, chat_id: str, template: str,
                       repeat_if_lower: bool, remind_after_hours: int,
-                      now: datetime) -> tuple[bool, bool, str]:
+                      now: datetime) -> tuple[bool, bool, bool, str]:
     """Decide whether to fire a Telegram alert for one polled card, and send it.
 
     Parameters:
@@ -32,7 +32,7 @@ def evaluate_and_alert(*, kind: str, info: dict, state: dict,
         info: a dict carrying at minimum: name, appid, market_hash_name,
             lowest_price (float), target_price (float), display_name,
             image_url, game_name. Same shape send_alert expects.
-        state: the in-memory antispam state dict (mutated on send).
+        state: the in-memory antispam state dict (mutated on send / reset).
         token, chat_id, template: Telegram config.
         repeat_if_lower: if True, re-alert when lowest dropped further than
             the last alerted price.
@@ -40,25 +40,42 @@ def evaluate_and_alert(*, kind: str, info: dict, state: dict,
         now: naive UTC datetime — single source of "current time" so callers
             in the same loop iteration get consistent timestamps.
 
-    Returns (state_dirty, did_alert, reason):
+    Returns (state_dirty, did_alert, did_reset, reason):
         state_dirty: True if `state` was modified.
         did_alert: True if a Telegram message was actually sent (and state
             updated). False on skip OR send failure.
+        did_reset: True if the antispam state was CLEARED because price
+            climbed back above target. Caller should also wipe the matching
+            cards' `status="alerted"` so they go back to plain zebra and
+            the next dip triggers a fresh first_alert.
         reason: human-readable why we did/didn't alert (for logging).
     """
+    # Internal id stays as raw market_hash_name (state-key needs it).
+    # User-facing log lines go through pretty_name so the user sees
+    # "Merrin" instead of "1774580-Merrin".
+    from steam import pretty_name
     name = info.get("name", "?")
+    pretty = pretty_name(info)
     appid = info.get("appid", "?")
     lowest = info.get("lowest_price")
     target = info.get("target_price")
 
     if lowest is None or target is None:
-        return False, False, "no price or target"
-
-    hit_target = (lowest <= target) if kind == "buy" else (lowest < target)
-    if not hit_target:
-        return False, False, "above target"
+        return False, False, False, "no price or target"
 
     key = f"{kind}:{appid}:{name}"
+    hit_target = (lowest <= target) if kind == "buy" else (lowest < target)
+    if not hit_target:
+        # Price rebounded above target. If we were holding an antispam
+        # entry from a previous alert, wipe it now — next drop should
+        # fire a fresh "first_alert" instead of being silently blocked by
+        # repeat_if_lower's strict-less comparison.
+        if state.pop(key, None) is not None:
+            log.info(f"clearing antispam for {pretty!r}: lowest={lowest} "
+                     f"climbed back above target={target}")
+            return True, False, True, "rebounded above target → reset"
+        return False, False, False, "above target"
+
     entry = state.get(key, {})
     last_alerted_price = entry.get("last_alerted_price")
     last_alert_time_str = entry.get("last_alert_time")
@@ -85,21 +102,21 @@ def evaluate_and_alert(*, kind: str, info: dict, state: dict,
             pass
 
     if not should_alert:
-        return False, False, "antispam"
+        return False, False, False, "antispam"
 
-    log.info(t("log.sending_alert", name=name, reason=reason))
+    log.info(t("log.sending_alert", name=pretty, reason=reason))
     # Lazy import — telegram.py loads requests + i18n, which is fine in
     # watch.py but in gui.pyw we want to keep the startup path lean.
     from telegram import send_alert
     try:
         send_alert(token, chat_id, info, template)
     except Exception as exc:
-        log.error(t("log.alert_failed", name=name, err=str(exc)))
-        return False, False, f"send failed: {exc}"
+        log.error(t("log.alert_failed", name=pretty, err=str(exc)))
+        return False, False, False, f"send failed: {exc}"
 
     state[key] = {
         "last_alerted_price": lowest,
         "last_alert_time": now.isoformat(),
     }
-    log.info(t("log.alert_sent", name=name))
-    return True, True, reason
+    log.info(t("log.alert_sent", name=pretty))
+    return True, True, False, reason

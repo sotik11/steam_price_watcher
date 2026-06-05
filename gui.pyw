@@ -1529,7 +1529,7 @@ class App(tb.Window):
                 # (from poll) plus all the metadata send_alert wants.
                 if token and chat_id:
                     alert_info = {**w, **info}
-                    sd, did_alert, _reason = evaluate_and_alert(
+                    sd, did_alert, did_reset, _reason = evaluate_and_alert(
                         kind=kind, info=alert_info, state=state,
                         token=token, chat_id=chat_id, template=template,
                         repeat_if_lower=repeat_if_lower,
@@ -1538,15 +1538,24 @@ class App(tb.Window):
                     )
                     if sd:
                         state_dirty = True
+                    ident = (w.get("appid"), w.get("name"))
                     if did_alert:
                         alerted_count += 1
                         # Mark every duplicate of this card alerted, not
                         # just the one we walked — matches watch.py.
-                        ident = (w.get("appid"), w.get("name"))
                         for x in items:
                             if (x.get("appid"), x.get("name")) == ident:
                                 if x.get("status") != "alerted":
                                     x["status"] = "alerted"
+                    elif did_reset:
+                        # Price rebounded above target — clear the stale
+                        # "alerted" badge on every duplicate so the row
+                        # goes back to plain zebra; next drop will fire
+                        # a fresh notification.
+                        for x in items:
+                            if (x.get("appid"), x.get("name")) == ident:
+                                if x.get("status") == "alerted":
+                                    x["status"] = ""
 
             save_json(path, items)
             if state_dirty:

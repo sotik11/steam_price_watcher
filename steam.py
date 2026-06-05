@@ -189,7 +189,10 @@ def get_price_via_orderbook(appid: str | int, market_hash_name: str,
     24h sales volume that priceoverview gave — we trade that for not
     getting banned.
     """
-    short_name = market_hash_name[:40]
+    # User-facing log lines: strip the "{appid}-" prefix so we log
+    # "Merrin" rather than "1774580-Merrin". The raw market_hash_name
+    # still goes on the wire — Steam expects that exact form.
+    short_name = clean_card_name(market_hash_name)[:40]
     # qp parameter is a JSON array stringified: [appid, "market_hash_name"]
     # We hand-build it instead of using json.dumps to keep the format
     # byte-identical to what Steam's own SPA sends (no extra spaces).
@@ -298,7 +301,7 @@ def get_price_via_priceoverview(appid: str | int, market_hash_name: str,
         "appid": str(appid),
         "market_hash_name": market_hash_name,
     }
-    short_name = market_hash_name[:40]
+    short_name = clean_card_name(market_hash_name)[:40]
     session = _get_session()
     # The Referer MUST be the actual listing page for THIS card. Steam now
     # validates this — sending a random URL or no Referer gets you banned
@@ -545,7 +548,7 @@ def fetch_prices_batch(items: list[dict], currency: int = 18, country: str = "UA
             results.append({**item, **info, "error": None})
         except RateLimitedError as exc:
             log.error(t("log.batch_abort_rate_limited",
-                        name=item.get("market_hash_name", "?"),
+                        name=pretty_name(item),
                         remaining=len(items) - i))
             rate_limited_retry_after = exc.retry_after
             results.append({**item, "lowest_price": None, "volume": None,
@@ -554,7 +557,7 @@ def fetch_prices_batch(items: list[dict], currency: int = 18, country: str = "UA
             break
         except Exception as exc:
             log.warning(t("log.get_price_failed",
-                          name=item.get("market_hash_name", "?"),
+                          name=pretty_name(item),
                           kind=type(exc).__name__, err=exc))
             results.append({**item, "lowest_price": None, "volume": None, "error": str(exc)})
     # If we aborted mid-batch, synthesise "rate-limited" rows for the rest
