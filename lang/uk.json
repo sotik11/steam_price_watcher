@@ -226,7 +226,7 @@
 
   "tg.btn.open_market":     "🌐 Відкрити на маркеті",
   "tg.test_message":        "✅ Steam Card Price Watch — тест зв'язку",
-  "tg.message.default":     "<b><u>{display_name}</u></b>\nПоточна ціна — <b>{price}</b>",
+  "tg.message.default":     "<b>{operation} • <u>{display_name}</u></b>\nПоточна ціна — <b>{price}</b>",
   "tg.operation.buy":       "покупка",
   "tg.operation.sell":      "продаж",
   "log.tg_error":           "Помилка Telegram: {desc}"

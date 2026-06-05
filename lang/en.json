@@ -226,7 +226,7 @@
 
   "tg.btn.open_market":     "🌐 Open on the market",
   "tg.test_message":        "✅ Steam Card Price Watch — connection test",
-  "tg.message.default":     "<b><u>{display_name}</u></b>\nCurrent price — <b>{price}</b>",
+  "tg.message.default":     "<b>{operation} • <u>{display_name}</u></b>\nCurrent price — <b>{price}</b>",
   "tg.operation.buy":       "buy",
   "tg.operation.sell":      "sell",
   "log.tg_error":           "Telegram error: {desc}"
