@@ -158,11 +158,11 @@
   "scheduler.state_active":  "✅ активна",
   "scheduler.state_paused":  "⏸ вимкнена",
 
-  "btn.history_open":   "Відкрити в браузері",
-  "btn.history_export": "Експорт CSV",
-  "btn.history_edit":   "Редагувати ціну",
-  "btn.history_readd":  "Знов до списку",
-  "btn.history_delete": "Видалити запис",
+  "btn.history_market_log": "Історія придбань 🔗",
+  "btn.history_export":     "Експорт CSV",
+  "btn.history_edit":       "Редагувати ціну",
+  "btn.history_readd":      "Знов до списку",
+  "btn.history_delete":     "Видалити запис",
 
   "hist.total_buy":  "Сума покупок:",
   "hist.total_sell": "Сума продажів:",
@@ -241,6 +241,7 @@
 
   "dlg.export.title":           "Експорт",
   "dlg.export.saved":           "Збережено: {path}",
+  "dlg.export.filename_default":"Історія придбань",
 
   "dlg.readd.title":            "Знов додати",
   "dlg.readd.body":             "Цільова ціна для «{name}»:",

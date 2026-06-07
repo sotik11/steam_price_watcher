@@ -4234,12 +4234,18 @@ class App(tb.Window):
         vsb2.grid(row=0, column=1, sticky="ns")
         hist_frame.grid_rowconfigure(0, weight=1)
         hist_frame.grid_columnconfigure(0, weight=1)
+        # Button order is intentional. "Історія придбань" first as the
+        # broad "where did my money go?" link (selection-independent —
+        # opens Steam's full market-transactions log). "Знов до списку"
+        # is placed before "Редагувати ціну" because re-adding is the
+        # more common follow-up to looking at a past purchase; price
+        # editing is a niche cleanup action and lives next to Delete.
         for key, cmd in [
-            ("btn.history_open",   self._hist_open_browser),
-            ("btn.history_export", self._hist_export_csv),
-            ("btn.history_edit",   self._hist_edit),
-            ("btn.history_readd",  self._hist_readd),
-            ("btn.history_delete", self._hist_delete),
+            ("btn.history_market_log", self._open_market_history),
+            ("btn.history_export",     self._hist_export_csv),
+            ("btn.history_readd",      self._hist_readd),
+            ("btn.history_edit",       self._hist_edit),
+            ("btn.history_delete",     self._hist_delete),
         ]:
             ttk.Button(btn_f, text=t(key), command=cmd).pack(side=LEFT, padx=2)
 
@@ -4649,31 +4655,19 @@ class App(tb.Window):
         )
         self.hist_tree.configure(cursor="hand2" if in_link else "")
 
-    def _hist_open_browser(self):
-        from steam import market_url
+    def _open_market_history(self):
+        """Open Steam's market transactions log in the user's browser.
 
-        selected = self._require_hist_selection()
-        if not selected:
-            return
-        # Dedup by (appid, mhn) — picking 5 rows for the same card
-        # shouldn't open 5 identical tabs.
-        unique_urls: list[str] = []
-        seen: set[tuple] = set()
-        for p in selected:
-            key = (p.get("appid"), p.get("market_hash_name") or p.get("name"))
-            if key in seen:
-                continue
-            seen.add(key)
-            unique_urls.append(market_url(key[0], key[1]))
-        if len(unique_urls) > 3:
-            if not messagebox.askyesno(
-                t("dlg.open_many.title"),
-                t("dlg.open_many.body", count=len(unique_urls)),
-                parent=self,
-            ):
-                return
-        for url in unique_urls:
-            webbrowser.open(url)
+        Selection-independent — this is the broad "show me everything
+        I bought/sold on Steam Market" link, separate from the per-card
+        market URL the table's «🔗» link column still gives.
+
+        Steam routes `/market/#myhistory` to the user's actual purchase
+        history once they're logged in; for not-logged-in browsers it
+        bounces to the login flow, which is the right behaviour either
+        way (browsing → see what's there, not logged in → log in).
+        """
+        webbrowser.open("https://steamcommunity.com/market/#myhistory")
 
     def _hist_edit(self):
         """Edit the price on selected History record(s).
@@ -4726,15 +4720,69 @@ class App(tb.Window):
             self._refresh_history()  # also recalculates the totals panel
 
     def _hist_export_csv(self):
+        """Save the History tab to a CSV — only the columns the user sees.
+
+        Output mirrors the visible History Treeview exactly: Дата /
+        Картка / Назва гри / Операція / Ціна / Посилання (URL).
+        We intentionally drop appid, market_hash_name and target since
+        those aren't on screen — the export is for humans browsing
+        their own history in Excel, not for re-importing into the app.
+
+        Localised headers (via the same col.* i18n keys the Treeview
+        uses) so the CSV reads the same as the tab when opened in a
+        spreadsheet.
+
+        The old export wrote `fieldnames=["timestamp","name","appid",
+        "price","target"]` with the default `extrasaction="raise"` and
+        crashed on the very first row because the on-disk records grew
+        more fields (display_name, game_name, operation, …) over time
+        — leaving the file with just the header line. Building each
+        row explicitly keeps the column set stable regardless of what
+        extra keys live on the source dict.
+        """
         from tkinter.filedialog import asksaveasfilename
-        path = asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        from steam import market_url, pretty_name
+
+        # Default to the user's localised "Purchase history" — Tkinter
+        # appends `.csv` itself thanks to `defaultextension`.
+        path = asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            initialfile=t("dlg.export.filename_default"),
+        )
         if not path:
             return
-        purchases = load_json(PURCHASES_PATH, [])
+        purchases = load_json(PURCHASES_PATH, []) or []
+        # (csv-column-key, header-text) pairs — keys are internal and
+        # never user-visible; headers come from the same i18n keys the
+        # tab uses for its column captions so the CSV header line reads
+        # the same as the table the user just looked at.
+        columns = [
+            ("date",      t("col.date")),
+            ("card",      t("col.card")),
+            ("game",      t("col.game")),
+            ("operation", t("col.operation")),
+            ("price",     t("col.price")),
+            ("link",      t("col.link")),
+        ]
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=["timestamp", "name", "appid", "price", "target"])
-            writer.writeheader()
-            writer.writerows(purchases)
+            writer = csv.writer(f)
+            writer.writerow([header for _, header in columns])
+            for p in purchases:
+                appid = p.get("appid")
+                mhn = p.get("market_hash_name") or p.get("name") or ""
+                op_key = p.get("operation", "buy")
+                # Translate the raw "buy"/"sell" into the localised
+                # word the History column shows ("придбання"/"продаж").
+                op_label = t(f"operation.{op_key}")
+                writer.writerow([
+                    p.get("timestamp", ""),
+                    pretty_name(p),
+                    p.get("game_name", ""),
+                    op_label,
+                    p.get("price", ""),
+                    market_url(appid, mhn) if appid and mhn else "",
+                ])
         messagebox.showinfo(t("dlg.export.title"), t("dlg.export.saved", path=path))
 
     def _hist_readd(self):

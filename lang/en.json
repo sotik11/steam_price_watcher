@@ -158,11 +158,11 @@
   "scheduler.state_active":  "✅ active",
   "scheduler.state_paused":  "⏸ disabled",
 
-  "btn.history_open":   "Open in browser",
-  "btn.history_export": "Export CSV",
-  "btn.history_edit":   "Edit price",
-  "btn.history_readd":  "Re-add to watchlist",
-  "btn.history_delete": "Delete record",
+  "btn.history_market_log": "Purchase history 🔗",
+  "btn.history_export":     "Export CSV",
+  "btn.history_edit":       "Edit price",
+  "btn.history_readd":      "Re-add to watchlist",
+  "btn.history_delete":     "Delete record",
 
   "hist.total_buy":  "Total purchases:",
   "hist.total_sell": "Total sales:",
@@ -241,6 +241,7 @@
 
   "dlg.export.title":           "Export",
   "dlg.export.saved":           "Saved: {path}",
+  "dlg.export.filename_default":"Purchase history",
 
   "dlg.readd.title":            "Re-add",
   "dlg.readd.body":             "Target price for «{name}»:",
