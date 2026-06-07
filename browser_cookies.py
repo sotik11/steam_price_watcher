@@ -314,10 +314,15 @@ def wait_until_gone(exe_names: list[str], timeout_sec: float = 5.0,
 # Cookie extraction
 # ----------------------------------------------------------------------
 
-# Domains the browser stored Steam cookies under. steam_login_secure is
-# scoped to steamcommunity.com; community/store share session cookies
-# via the broader domain. browser_cookie3 wants the host, not the path.
-_STEAM_DOMAIN = "steamcommunity.com"
+# Steam runs two separate apex domains (`steamcommunity.com` and
+# `store.steampowered.com`) and each one sets its own `sessionid` +
+# `steamLoginSecure` cookies — they're NOT SSO'd automatically by the
+# browser. Community cookies authenticate market/listings endpoints;
+# store cookies authenticate wallet balance / purchase history.
+# We grab both so every authenticated call site has the cookies it needs.
+_STEAM_COMMUNITY = "steamcommunity.com"
+_STEAM_STORE = "store.steampowered.com"
+_STEAM_DOMAINS = (_STEAM_COMMUNITY, _STEAM_STORE)
 
 
 def _is_current_process_admin() -> bool:
@@ -335,7 +340,7 @@ def _is_current_process_admin() -> bool:
         return False
 
 
-def _extract_via_rookiepy(spec: BrowserSpec) -> dict[str, str]:
+def _extract_via_rookiepy(spec: BrowserSpec) -> dict[str, dict[str, str]]:
     """ABE-aware extraction via the `rookiepy` Rust library.
 
     rookiepy uses a different decryption path that knows how to unwrap
@@ -345,12 +350,12 @@ def _extract_via_rookiepy(spec: BrowserSpec) -> dict[str, str]:
     context); from a non-admin process it raises the same kind of
     "needs admin" RuntimeError that browser_cookie3 produces.
 
-    Returns the same `{sessionid, steamLoginSecure}` dict shape as the
-    main extract path, so callers don't need to branch on which library
-    won the day.
+    Returns the per-domain shape `{community: {...}, store: {...}}` —
+    same as `extract_steam_cookies`, so callers don't branch on which
+    library won.
 
     Raises BrowserCookiesError on failure (no_session if the call
-    succeeded but the cookie wasn't there).
+    succeeded but the community-side cookie wasn't there).
     """
     if not _HAS_ROOKIEPY:
         raise BrowserCookiesError("rookiepy_unavailable")
@@ -358,20 +363,21 @@ def _extract_via_rookiepy(spec: BrowserSpec) -> dict[str, str]:
     if fn is None:
         raise BrowserCookiesError(f"rookiepy_no_browser:{spec.code}")
     try:
-        cookies_list = fn([_STEAM_DOMAIN])
+        cookies_list = fn(list(_STEAM_DOMAINS))
     except Exception as e:
         # rookiepy uses Rust panics that bubble up as RuntimeError.
         raise BrowserCookiesError(f"rookiepy:{e}") from e
-    out: dict[str, str] = {}
+    out: dict[str, dict[str, str]] = {d: {} for d in _STEAM_DOMAINS}
     for c in cookies_list:
-        # rookiepy returns dicts. Filter to steamcommunity.com and our
-        # two cookies of interest.
-        if "steamcommunity.com" not in (c.get("domain") or ""):
-            continue
         name = c.get("name")
-        if name in ("sessionid", "steamLoginSecure"):
-            out[name] = c.get("value") or ""
-    if "steamLoginSecure" not in out:
+        if name not in ("sessionid", "steamLoginSecure"):
+            continue
+        host = (c.get("domain") or "").lstrip(".")
+        for target in _STEAM_DOMAINS:
+            if host == target or host.endswith("." + target):
+                out[target][name] = c.get("value") or ""
+                break
+    if "steamLoginSecure" not in out[_STEAM_COMMUNITY]:
         raise BrowserCookiesError("no_session")
     return out
 
@@ -413,28 +419,49 @@ def _list_chromium_profile_cookies(profiles_dir: str) -> list[Path]:
     return matches
 
 
-def _jar_to_cookies(jar) -> dict[str, str]:
-    """Extract our two Steam cookies from a `http.cookiejar.CookieJar`.
+def _jar_to_cookies(jar) -> dict[str, dict[str, str]]:
+    """Pull `{sessionid, steamLoginSecure}` for both Steam domains out of a jar.
 
-    Pulled into a helper because both the single-profile and
-    multi-profile extraction paths need to do the same filtering.
+    Returned shape:
+        {
+            "steamcommunity.com":     {"sessionid": "...", "steamLoginSecure": "..."},
+            "store.steampowered.com": {"sessionid": "...", "steamLoginSecure": "..."},
+        }
+
+    Both buckets are always present (possibly empty). Domain matching is
+    suffix-based against `c.domain.lstrip(".")` so cookies set with a
+    leading-dot scope (`.steamcommunity.com`) land in the right bucket.
+    Other cookies in the jar (Google Analytics, etc.) are dropped — they
+    just bloat the saved state for no benefit.
     """
-    cookies: dict[str, str] = {}
+    out: dict[str, dict[str, str]] = {d: {} for d in _STEAM_DOMAINS}
     for c in jar:
-        # Only keep cookies scoped to steamcommunity / its subdomains —
-        # extra cookies (Google Analytics, etc.) would muddy the saved
-        # state for no benefit.
-        if c.domain and "steamcommunity.com" not in c.domain:
+        if c.name not in ("sessionid", "steamLoginSecure"):
             continue
-        if c.name in ("sessionid", "steamLoginSecure"):
-            cookies[c.name] = c.value
-    return cookies
+        host = (c.domain or "").lstrip(".")
+        for target in _STEAM_DOMAINS:
+            # endswith catches both the apex and any subdomain
+            # (e.g. cookies set on .store.steampowered.com).
+            if host == target or host.endswith("." + target):
+                out[target][c.name] = c.value
+                break
+    return out
 
 
 def extract_steam_cookies(spec: BrowserSpec,
                           retries: int = 3,
-                          retry_delay: float = 1.0) -> dict[str, str]:
-    """Return `{sessionid, steamLoginSecure}` from `spec`'s cookie DB.
+                          retry_delay: float = 1.0) -> dict[str, dict[str, str]]:
+    """Return per-domain Steam cookies from `spec`'s cookie DB.
+
+    Returned shape (see `_jar_to_cookies` for details):
+        {
+            "steamcommunity.com":     {"sessionid": "...", "steamLoginSecure": "..."},
+            "store.steampowered.com": {"sessionid": "...", "steamLoginSecure": "..."},
+        }
+
+    `store.steampowered.com` may be empty if the user logged into the
+    community side but not the store — community is the primary signal
+    we treat as "logged in".
 
     For Chromium-family browsers with `profiles_dir` set we sweep every
     profile and return the first one whose jar contains a Steam session
@@ -442,8 +469,10 @@ def extract_steam_cookies(spec: BrowserSpec,
     is almost never in the `Default` profile that browser_cookie3 reads
     by default.
 
-    For single-profile or self-enumerating browsers (Firefox, Opera) we
-    call `cookies_fn(domain_name=...)` directly and let it pick.
+    For single-profile or self-enumerating browsers (Firefox) we let
+    browser_cookie3 pick its default cookie store. We call without a
+    `domain_name=` filter and bucket the cookies ourselves — that's one
+    DB read per profile attempt instead of two.
 
     Retries because Windows file-handle release after the browser exits
     isn't instant — first read after kill can still hit a sharing
@@ -453,9 +482,9 @@ def extract_steam_cookies(spec: BrowserSpec,
       BrowserCookiesError —
         * `db_locked: <details>`  → SQLite couldn't read any candidate
           even after retries.
+        * `needs_admin: <details>` → ABE; caller flips to UAC path.
         * `no_session`            → at least one cookie DB was readable
-          but none contained a `steamLoginSecure` cookie scoped to
-          steamcommunity.com.
+          but no profile had a `steamLoginSecure` on the community side.
     """
     candidates: list[Path | None]
     if spec.profiles_dir:
@@ -478,17 +507,19 @@ def extract_steam_cookies(spec: BrowserSpec,
         for attempt in range(retries):
             try:
                 if candidate is None:
-                    jar = spec.cookies_fn(domain_name=_STEAM_DOMAIN)
+                    jar = spec.cookies_fn()
                 else:
-                    jar = spec.cookies_fn(
-                        cookie_file=str(candidate),
-                        domain_name=_STEAM_DOMAIN,
-                    )
+                    jar = spec.cookies_fn(cookie_file=str(candidate))
                 found_readable = True
                 cookies = _jar_to_cookies(jar)
-                if "steamLoginSecure" in cookies:
-                    log.info("steam cookies found in %s",
-                             candidate if candidate else "default profile")
+                community = cookies.get(_STEAM_COMMUNITY, {})
+                if "steamLoginSecure" in community:
+                    log.info(
+                        "steam cookies found in %s — community=%s store=%s",
+                        candidate if candidate else "default profile",
+                        list(community.keys()),
+                        list(cookies.get(_STEAM_STORE, {}).keys()),
+                    )
                     return cookies
                 # Readable but no Steam session in this profile — move on.
                 log.debug("no steam session in %s",
@@ -565,7 +596,7 @@ def parse_steamid_from_cookie(steam_login_secure: str) -> str:
     return sid
 
 
-def verify_session(cookies: dict[str, str]) -> bool:
+def verify_session(cookies: dict[str, dict[str, str]]) -> bool:
     """Ping an authenticated endpoint to confirm cookies are alive.
 
     Uses `mylistings/render?count=1` — fast, cheap, requires auth.
@@ -573,13 +604,19 @@ def verify_session(cookies: dict[str, str]) -> bool:
     expired / wrong cookies get a redirect or 401. We treat anything
     other than "200 + valid JSON + success: true" as a dead session.
 
+    Accepts the per-domain cookies dict and uses the community subset
+    (mylistings is on steamcommunity.com).
+
     Network failures count as "dead" too — there's no point saving
     cookies we can't actually use right now.
     """
+    community = (cookies or {}).get(_STEAM_COMMUNITY) or {}
+    if "steamLoginSecure" not in community:
+        return False
     url = "https://steamcommunity.com/market/mylistings/render/?query=&start=0&count=1"
     try:
         resp = requests.get(
-            url, cookies=cookies, headers=_HEADERS,
+            url, cookies=community, headers=_HEADERS,
             timeout=_TIMEOUT, allow_redirects=False,
         )
     except requests.RequestException as e:

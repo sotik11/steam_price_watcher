@@ -572,3 +572,85 @@ def fetch_prices_batch(items: list[dict], currency: int = 18, country: str = "UA
     # _BatchResults supports attribute assignment (plain list doesn't).
     results.rate_limited_retry_after = rate_limited_retry_after
     return results
+
+
+# ---------------------------------------------------------------------------
+# Authenticated endpoints — require session cookies from Tier 1/2 login.
+# ---------------------------------------------------------------------------
+
+# Steam doesn't ship a clean JSON wallet-balance endpoint that can be hit
+# without store-side fingerprinting; the JSON paths (`getfundedwallet`,
+# `transactionhistory/getmoredata`) get blocked from third-party callers
+# pretty quickly. The account page itself is straightforward HTML and
+# carries the balance as a localised string in a known element.
+_ACCOUNT_PAGE_URL = "https://store.steampowered.com/account/"
+_WALLET_BALANCE_RE = re.compile(
+    r'<a[^>]*id=["\']header_wallet_balance["\'][^>]*>([^<]+)</a>',
+    re.IGNORECASE,
+)
+
+
+def fetch_wallet_balance(cookies: dict | None) -> str | None:
+    """Scrape the user's wallet balance from `store.steampowered.com/account/`.
+
+    Returns the balance verbatim as Steam renders it ("5,46₴", "$3.21",
+    "1 234,56 ₽"), so the caller doesn't need to know currency-specific
+    formatting rules — Steam's already done that for the user's locale.
+
+    `cookies` is the per-domain dict from `browser_cookies.extract_steam_cookies`:
+    `{"steamcommunity.com": {...}, "store.steampowered.com": {...}}`.
+    We need the store-domain subset because steamcommunity / steampowered
+    are two separate apex domains with independent cookies — community-
+    only cookies get a redirect to the login page on the store.
+
+    Returns None on:
+      * no cookies passed (Tier 3 manual-ID path has no session)
+      * no store cookies (user logged into community only, e.g. cookies
+        captured from a browser that hadn't visited the store)
+      * network failure / non-200 response
+      * page didn't include the balance element (session expired
+        server-side, layout change, etc.)
+
+    Logs at debug for the success path and warning for the failure
+    paths so a missing balance is traceable in watch.log without
+    spamming the user.
+    """
+    store_cookies = (cookies or {}).get("store.steampowered.com") or {}
+    if "steamLoginSecure" not in store_cookies:
+        log.debug("wallet balance skipped — no store.steampowered.com cookie")
+        return None
+    try:
+        resp = requests.get(
+            _ACCOUNT_PAGE_URL,
+            cookies=store_cookies,
+            headers={
+                "User-Agent": _UA,
+                # Ask for the user's actual locale so the wallet string
+                # uses their currency formatting (otherwise Steam might
+                # serve English/USD).
+                "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.7,en;q=0.5",
+                "Accept": ("text/html,application/xhtml+xml,application/xml;"
+                           "q=0.9,*/*;q=0.8"),
+            },
+            timeout=_TIMEOUT,
+            allow_redirects=True,
+        )
+    except requests.RequestException as e:
+        log.warning("wallet balance fetch failed: %s", e)
+        return None
+    if resp.status_code != 200:
+        log.warning("wallet balance HTTP %s", resp.status_code)
+        return None
+    # If the cookie was rejected, Steam serves the login page instead —
+    # the regex just won't match and we return None.
+    m = _WALLET_BALANCE_RE.search(resp.text)
+    if not m:
+        log.warning("wallet balance element not found "
+                    "(session expired or layout changed)")
+        return None
+    # Steam wraps the balance in extra whitespace and sometimes an
+    # `&nbsp;` between number and currency symbol. Normalise both so
+    # the GUI doesn't have to.
+    raw = m.group(1).replace(" ", " ").strip()
+    log.debug("wallet balance: %r", raw)
+    return raw

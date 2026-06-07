@@ -1016,6 +1016,14 @@ class App(tb.Window):
         # on the named-font path picking it up automatically.
         self._scaled_font(self.lbl_username, 10, "bold")
         self.lbl_username.pack(side=TOP, anchor=E)
+        # Click → open the user's Steam Community profile. URL uses the
+        # numeric steamID (works whether the account has a vanity URL or
+        # not — Steam redirects /profiles/{id} → /id/{vanity} when one
+        # exists). Set up here once so we don't have to re-bind every
+        # time `_update_user_widget` runs.
+        self._make_widget_clickable(
+            self.lbl_username, self._open_profile_link,
+        )
 
         # Wallet balance — same currency symbol the rest of the app uses
         # so it stays consistent if the user later switches currency.
@@ -1023,10 +1031,19 @@ class App(tb.Window):
         # Muted foreground — match Steam's secondary-text colour.
         muted_fg = "#888888"
         self.lbl_balance = ttk.Label(
-            text_col, text=f"0.00 {sym}", anchor=E,
+            text_col, text=f"0.00 {sym}", anchor=E,
             foreground=muted_fg,
         )
         self.lbl_balance.pack(side=TOP, anchor=E)
+        # Click → Steam's store-transactions history page. This is where
+        # the wallet balance actually breaks down (purchases, top-ups,
+        # market sales credited as wallet funds).
+        self._make_widget_clickable(
+            self.lbl_balance,
+            lambda: webbrowser.open(
+                "https://store.steampowered.com/account/store_transactions/"
+            ),
+        )
 
         # Round avatar canvas. By default carries the Steam logo from
         # assets/steam_icon.png (circular-masked); when login lands, the
@@ -1183,6 +1200,68 @@ class App(tb.Window):
 
         self.minsize(min_w, min_h)
 
+    def _make_widget_clickable(self, widget, callback) -> None:
+        """Wire `widget` to call `callback()` on click + hand cursor on hover.
+
+        Used for the floating Steam-widget labels (username → profile,
+        balance → store transactions). We do the cursor switch + click
+        bind once at widget-create time so the link "feel" is there
+        even before there's a real session — clicking the placeholder
+        username still opens whatever profile is currently saved, or
+        no-ops if nothing is saved.
+        """
+        widget.configure(cursor="hand2")
+        widget.bind("<Button-1>", lambda e: callback())
+
+    def _open_profile_link(self) -> None:
+        """Open the current user's Steam Community profile in a browser.
+
+        Uses `/profiles/{steamID64}` rather than `/id/{vanity}` because
+        the numeric form always works (Steam auto-redirects to the
+        vanity URL if one exists). No-op when no Steam ID is saved —
+        the floating widget exists in placeholder mode for users who
+        haven't logged in yet, and we don't want the click to lead
+        nowhere noisy.
+        """
+        sid = ((self.config_data.get("steam") or {}).get("id") or "").strip()
+        if not sid:
+            return
+        webbrowser.open(f"https://steamcommunity.com/profiles/{sid}/")
+
+    @staticmethod
+    def _humanise_balance(raw: str) -> str:
+        """Insert a thin space between the number and the currency symbol.
+
+        Steam's wallet string varies by locale: "5,46₴" / "$1.23" /
+        "1 234,56 ₽". Some include a space already, some don't. We
+        normalise to "<number>\\u2009<symbol>" (THIN SPACE — visually
+        a dot-width gap) so the widget reads cleanly regardless of
+        which currency the user is on.
+
+        Conservative: if the string doesn't contain any of the known
+        currency glyphs, return it unchanged so we don't accidentally
+        mangle something Steam decided to format differently in the
+        future.
+        """
+        if not raw:
+            return raw
+        # Strip whatever whitespace Steam already put between digits and
+        # symbol, then put back our own narrow gap. NARROW NO-BREAK
+        # SPACE ( ) is preferred over THIN SPACE ( ) because
+        # it doesn't wrap — important since the widget is narrow.
+        symbols = "₴$€₽£¥"
+        # Find the symbol position (last char that's a symbol).
+        for i, ch in enumerate(raw):
+            if ch in symbols:
+                # Split into number + symbol; trim trailing whitespace
+                # from number side.
+                number = raw[:i].rstrip()
+                # Take the symbol + anything after it (currency codes
+                # sometimes follow, e.g. "1,23 €EUR").
+                tail = raw[i:].lstrip()
+                return f"{number} {tail}"
+        return raw
+
     def _update_user_widget(self, *, username: str | None = None,
                             balance: str | None = None,
                             avatar_image: tk.PhotoImage | None = None) -> None:
@@ -1195,7 +1274,12 @@ class App(tb.Window):
         if username is not None:
             self.lbl_username.configure(text=username)
         if balance is not None:
-            self.lbl_balance.configure(text=balance)
+            # Normalise the gap between the number and currency symbol
+            # — Steam's wallet string is inconsistent across locales
+            # ("5,46₴" vs "$1.23"), and the placeholder we synthesise
+            # at startup uses a regular space. _humanise_balance gives
+            # us a single canonical look.
+            self.lbl_balance.configure(text=self._humanise_balance(balance))
         if avatar_image is not None:
             # Keep a reference — Tk's image GC will collect it otherwise.
             self._user_avatar_ref = avatar_image
@@ -1232,6 +1316,10 @@ class App(tb.Window):
             self._update_user_widget(username=persona)
         if avatar_url:
             self._fetch_avatar_async(avatar_url)
+        # Pull wallet balance only if Tier 2 (browser cookies) ran —
+        # _refresh_wallet_balance bails early when there are no cookies,
+        # so this is safe to call unconditionally.
+        self._refresh_wallet_balance()
 
     def _fetch_avatar_async(self, url: str) -> None:
         """Download `url`, circular-crop to _AVATAR_SIZE, push to the widget.
@@ -1253,6 +1341,41 @@ class App(tb.Window):
             # *must* do on the main thread is the canvas update. Schedule
             # both the assignment and the redraw via after(0, ...).
             self.after(0, lambda p=photo: self._update_user_widget(avatar_image=p))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _refresh_wallet_balance(self) -> None:
+        """Pull the wallet balance from store.steampowered.com in a thread.
+
+        Tier 2 (browser cookies) is the only login flow that gets us a
+        real session; Tier 3 (manual ID) leaves `steam.cookies` empty
+        and we just leave the widget showing the placeholder. The same
+        applies after a Disconnect — `_disconnect_steam` wipes cookies
+        AND resets the balance label to the placeholder.
+
+        `steam.fetch_wallet_balance` returns the formatted string Steam
+        served (handles locale and currency itself), so we pass it
+        straight through to `_update_user_widget`. None means either
+        no cookies or session expired — leave the existing label alone
+        and log a warning (the wallet fetch is best-effort polish, not
+        a critical path).
+        """
+        import steam
+
+        steam_cfg = self.config_data.get("steam") or {}
+        cookies = steam_cfg.get("cookies")
+        if not cookies:
+            return
+
+        def worker() -> None:
+            try:
+                balance = steam.fetch_wallet_balance(cookies)
+            except Exception as e:
+                log.warning("wallet refresh raised: %s", e)
+                return
+            if balance is None:
+                return
+            self.after(0, lambda b=balance: self._update_user_widget(balance=b))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1528,6 +1651,12 @@ class App(tb.Window):
         self._update_user_widget(username=steam_cfg["persona"])
         if steam_cfg["avatar_url"]:
             self._fetch_avatar_async(steam_cfg["avatar_url"])
+        # If this save came from the cookies tier we now have a live
+        # session — pull the wallet balance straight away so the user
+        # sees the visible "yes the login actually worked" payoff
+        # without waiting for the next app restart.
+        if cookies:
+            self._refresh_wallet_balance()
         # If the manual-tier entry exists (login dialog open), mirror the
         # new ID there so users see "yes this is the connected account".
         # Browser tier specifically wants this for the "I know who you are
@@ -1562,8 +1691,13 @@ class App(tb.Window):
         self.config_data["steam"] = empty
 
         # Wipe the floating widget back to the bundled Steam logo + the
-        # placeholder "Username" / "0.00 ₴" labels.
-        self._update_user_widget(username="Username")
+        # placeholder "Username" / "0.00 ₴" labels. Balance defaults
+        # to the currency symbol from market.currency so the placeholder
+        # matches what the widget showed at first paint.
+        sym = self._CURRENCY_SYMBOLS.get(
+            (self.config_data.get("market") or {}).get("currency", 18), "₴",
+        )
+        self._update_user_widget(username="Username", balance=f"0.00 {sym}")
         self._draw_placeholder_avatar()
         self._user_avatar_ref = None
 
@@ -2000,7 +2134,17 @@ class App(tb.Window):
             #    public-profile fetch as the manual-ID tier — same widget
             #    payload either way (persona / avatar / inventory check).
             try:
-                sid = bc.parse_steamid_from_cookie(cookies["steamLoginSecure"])
+                # cookies is now {community: {...}, store: {...}}; the
+                # steamID is embedded in either side's steamLoginSecure
+                # (same JWT value cross-domain). Prefer the community
+                # one because it's the more reliably-present of the two
+                # — store cookies are missing for users who logged in
+                # via community only.
+                community = cookies.get("steamcommunity.com") or {}
+                store = cookies.get("store.steampowered.com") or {}
+                login_token = (community.get("steamLoginSecure")
+                               or store.get("steamLoginSecure") or "")
+                sid = bc.parse_steamid_from_cookie(login_token)
             except bc.BrowserCookiesError:
                 status(t("dlg.steam_browser.bad_cookie"), kind="danger")
                 reenable_with_retry()
