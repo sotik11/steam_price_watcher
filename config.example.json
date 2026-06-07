@@ -19,5 +19,11 @@
   "antispam": {
     "repeat_if_lower": true,
     "remind_after_hours": 24
+  },
+  "steam": {
+    "id": "",
+    "persona": "",
+    "avatar_url": "",
+    "inventory_public": null
   }
 }

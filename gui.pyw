@@ -269,6 +269,11 @@ class App(tb.Window):
         # were saved before the metadata fields existed. Runs once on a
         # background thread so the GUI doesn't block on Steam Store.
         threading.Thread(target=self._backfill_metadata, daemon=True).start()
+        # Pull the saved Steam identity (if any) into the floating user
+        # widget — persona/balance labels straight from config, avatar
+        # downloaded on a background thread so we don't block the first
+        # paint while Steam's CDN responds.
+        self._load_steam_user_widget()
 
     def _on_close(self) -> None:
         """Persist window geometry then destroy.
@@ -1197,6 +1202,375 @@ class App(tb.Window):
                 self._AVATAR_SIZE / 2, self._AVATAR_SIZE / 2,
                 image=avatar_image,
             )
+
+    # ------------------------------------------------------------------
+    # Steam login (Phase 1 — Stage 1: manual ID only)
+    #
+    # The dialog is wired up below in _open_steam_login_dialog. This block
+    # is the glue between the floating user-widget and `config.json.steam`
+    # — load on startup, refresh after a successful manual save, wipe on
+    # disconnect. QR + browser-cookie tiers will plug into the same widget
+    # API in later stages.
+    # ------------------------------------------------------------------
+
+    def _load_steam_user_widget(self) -> None:
+        """Apply saved `steam.{persona, avatar_url}` to the floating widget.
+
+        No-op when the steam section is empty (fresh install / disconnect).
+        The avatar download is offloaded to a daemon thread so a slow CDN
+        response can't block the first paint; the persona label updates
+        synchronously since it's already in memory.
+        """
+        steam_cfg = (self.config_data.get("steam") or {})
+        persona = (steam_cfg.get("persona") or "").strip()
+        avatar_url = (steam_cfg.get("avatar_url") or "").strip()
+        if not persona and not avatar_url:
+            return
+        if persona:
+            self._update_user_widget(username=persona)
+        if avatar_url:
+            self._fetch_avatar_async(avatar_url)
+
+    def _fetch_avatar_async(self, url: str) -> None:
+        """Download `url`, circular-crop to _AVATAR_SIZE, push to the widget.
+
+        Wraps `steam_login.download_avatar` in a daemon thread + after()
+        bounce back onto the Tk main thread. Failures leave the existing
+        avatar in place (placeholder or whatever was there before).
+        """
+        import steam_login
+
+        size = self._AVATAR_SIZE
+
+        def worker() -> None:
+            photo = steam_login.download_avatar(url, size)
+            if photo is None:
+                return
+            # PhotoImage must be created on the Tk thread to be safe — but
+            # in practice CPython lets us build it off-thread; what we
+            # *must* do on the main thread is the canvas update. Schedule
+            # both the assignment and the redraw via after(0, ...).
+            self.after(0, lambda p=photo: self._update_user_widget(avatar_image=p))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_steam_login_dialog(self) -> None:
+        """Three-tier login dialog. Tier 3 (manual ID) is fully wired.
+
+        Layout (top → bottom):
+          * Tier 1 — QR section (stub label + "I don't have Steam Mobile"
+            button that just jumps focus to the Tier 3 entry).
+          * Tier 2 — browser section (stub label + disabled "Extract from
+            browser" button).
+          * Tier 3 — manual entry: Entry + "Save", live status line below,
+            "Disconnect" button visible only when already connected.
+
+        Saves to `config.json.steam` on success, refreshes the floating
+        user-widget, and updates the dialog's own "connected as" line so
+        the user gets immediate visual confirmation.
+        """
+        # Refuse to open twice — the dialog itself isn't reentrant-safe
+        # (status labels and entry refs live on `self`).
+        existing = getattr(self, "_steam_login_dlg", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        dlg = tk.Toplevel(self)
+        self._steam_login_dlg = dlg
+        dlg.title(t("dlg.steam_login.title"))
+        dlg.transient(self)
+        # Keep it modal-ish — easier to reason about state than a window
+        # that survives application close or stale config_data.
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        outer = ttk.Frame(dlg, padding=14)
+        outer.pack(fill=BOTH, expand=YES)
+
+        muted_fg = self.style.colors.secondary
+
+        # ---- Tier 1: QR (stub) -----------------------------------------
+        qr_frame = ttk.LabelFrame(outer, text=t("dlg.steam_login.qr_title"), padding=10)
+        qr_frame.pack(fill=X, pady=(0, 8))
+        ttk.Label(
+            qr_frame, text=t("dlg.steam_login.qr_body"),
+            foreground=muted_fg, wraplength=480, justify=LEFT,
+        ).pack(anchor=W)
+        qr_row = ttk.Frame(qr_frame)
+        qr_row.pack(anchor=W, pady=(6, 0))
+        ttk.Label(qr_row, text=t("btn.in_development"),
+                  foreground=muted_fg).pack(side=LEFT, padx=(0, 10))
+        # "I don't have Steam Mobile" — courtesy shortcut: nudges focus
+        # to the manual-entry field instead of having the user scroll.
+        ttk.Button(
+            qr_row, text=t("dlg.steam_login.qr_no_mobile"),
+            bootstyle="link",
+            command=lambda: self._steam_dlg_manual_entry.focus_set(),
+        ).pack(side=LEFT)
+
+        # ---- Tier 2: browser cookies (stub) ----------------------------
+        br_frame = ttk.LabelFrame(outer, text=t("dlg.steam_login.browser_title"), padding=10)
+        br_frame.pack(fill=X, pady=(0, 8))
+        ttk.Label(
+            br_frame, text=t("dlg.steam_login.browser_body"),
+            foreground=muted_fg, wraplength=480, justify=LEFT,
+        ).pack(anchor=W)
+        br_row = ttk.Frame(br_frame)
+        br_row.pack(anchor=W, pady=(6, 0))
+        ttk.Button(
+            br_row, text=t("dlg.steam_login.browser_btn"),
+            state=DISABLED,
+        ).pack(side=LEFT, padx=(0, 10))
+        ttk.Label(br_row, text=t("btn.in_development"),
+                  foreground=muted_fg).pack(side=LEFT)
+
+        # ---- Tier 3: manual ID (live) ----------------------------------
+        man_frame = ttk.LabelFrame(outer, text=t("dlg.steam_login.manual_title"), padding=10)
+        man_frame.pack(fill=X, pady=(0, 8))
+        ttk.Label(
+            man_frame, text=t("dlg.steam_login.manual_body"),
+            wraplength=480, justify=LEFT,
+        ).pack(anchor=W)
+
+        ent_row = ttk.Frame(man_frame)
+        ent_row.pack(fill=X, pady=(8, 0))
+        self._steam_dlg_manual_entry = ttk.Entry(ent_row, width=46)
+        self._steam_dlg_manual_entry.pack(side=LEFT, fill=X, expand=YES)
+        # Prefill with whatever's saved — makes it obvious what's currently
+        # set and easy to overwrite. Empty if nothing saved yet.
+        prev_id = ((self.config_data.get("steam") or {}).get("id") or "").strip()
+        if prev_id:
+            self._steam_dlg_manual_entry.insert(0, prev_id)
+        ttk.Button(
+            ent_row, text=t("dlg.steam_login.manual_btn"),
+            bootstyle="success",
+            command=self._steam_dlg_save_manual,
+        ).pack(side=LEFT, padx=(8, 0))
+
+        ttk.Label(
+            man_frame, text=t("dlg.steam_login.manual_hint"),
+            foreground=muted_fg,
+        ).pack(anchor=W, pady=(4, 0))
+
+        # Status line — also doubles as the "connected as" summary when
+        # a profile is already saved. Initialised below right after the
+        # button row so disconnect can target it too.
+        self._steam_dlg_status = ttk.Label(man_frame, text="", wraplength=480, justify=LEFT)
+        self._steam_dlg_status.pack(anchor=W, pady=(8, 0))
+
+        # ---- Bottom row: Disconnect (if connected) + Close --------------
+        bottom = ttk.Frame(outer)
+        bottom.pack(fill=X, pady=(8, 0))
+        self._steam_dlg_disconnect_btn = ttk.Button(
+            bottom, text=t("dlg.steam_login.disconnect_btn"),
+            bootstyle="danger-outline",
+            command=self._steam_dlg_disconnect,
+        )
+        # Visibility toggled by _steam_dlg_refresh_connected_state below.
+        ttk.Button(
+            bottom, text=t("dlg.steam_login.close"),
+            command=dlg.destroy,
+        ).pack(side=RIGHT)
+
+        # Cleanup on close — drop the dialog ref + window grab.
+        def _on_dialog_close() -> None:
+            try:
+                dlg.grab_release()
+            except tk.TclError:
+                pass
+            self._steam_login_dlg = None
+            dlg.destroy()
+        dlg.protocol("WM_DELETE_WINDOW", _on_dialog_close)
+
+        # Initial state — show "connected as" line if a profile was already
+        # saved earlier, else leave the status blank.
+        self._steam_dlg_refresh_connected_state()
+
+        # Centre over the main window so the dialog isn't hiding off-screen
+        # on a multi-monitor setup. update_idletasks first so reqsize is real.
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_reqheight()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self._steam_dlg_manual_entry.focus_set()
+
+    def _steam_dlg_refresh_connected_state(self) -> None:
+        """Pin the dialog's status line + Disconnect button to current config.
+
+        Called on dialog open and after every successful save/disconnect.
+        Keeps the visual state honest with what's actually persisted on disk.
+        """
+        steam_cfg = (self.config_data.get("steam") or {})
+        persona = (steam_cfg.get("persona") or "").strip()
+        inv = steam_cfg.get("inventory_public")
+        if persona:
+            inv_text = ""
+            if inv is True:
+                inv_text = f"  •  {t('dlg.steam_login.inventory_public')}"
+            elif inv is False:
+                inv_text = f"  •  {t('dlg.steam_login.inventory_private')}"
+            line = t("dlg.steam_login.connected_as", persona=persona) + inv_text
+            self._steam_dlg_status.configure(
+                text=line, foreground=self.style.colors.success,
+            )
+            self._steam_dlg_disconnect_btn.pack(side=LEFT)
+        else:
+            self._steam_dlg_status.configure(text="", foreground="")
+            self._steam_dlg_disconnect_btn.pack_forget()
+
+    def _steam_dlg_save_manual(self) -> None:
+        """Parse the manual-entry field, resolve it, persist, refresh widget.
+
+        Runs the network calls in a background thread so the GUI stays
+        responsive during the XML round-trip. Status label updates flow
+        through `after(0, ...)` from the worker.
+        """
+        import steam_login
+
+        raw = self._steam_dlg_manual_entry.get().strip()
+        if not raw:
+            self._steam_dlg_set_status(
+                t("dlg.steam_login.status_empty"), kind="warning",
+            )
+            return
+
+        self._steam_dlg_set_status(
+            t("dlg.steam_login.status_resolving"), kind="muted",
+        )
+
+        def worker() -> None:
+            try:
+                kind, value = steam_login.parse_steam_id(raw)
+            except steam_login.SteamLoginError:
+                self.after(0, lambda: self._steam_dlg_set_status(
+                    t("dlg.steam_login.status_bad_format"), kind="warning",
+                ))
+                return
+            try:
+                if kind == "vanity":
+                    sid = steam_login.resolve_vanity(value)
+                else:
+                    sid = value
+                profile = steam_login.fetch_public_profile(sid)
+            except steam_login.SteamLoginError as e:
+                msg = str(e)
+                if "not_found" in msg or "profile_error" in msg:
+                    self.after(0, lambda: self._steam_dlg_set_status(
+                        t("dlg.steam_login.status_not_found"), kind="danger",
+                    ))
+                else:
+                    self.after(0, lambda m=msg: self._steam_dlg_set_status(
+                        t("dlg.steam_login.status_network", err=m), kind="danger",
+                    ))
+                return
+
+            # Inventory check is best-effort — failure here just means we
+            # store None and the dialog won't show the inventory line.
+            inv_public = steam_login.check_inventory_public(sid)
+
+            # Persist + refresh widget on the Tk thread.
+            self.after(0, lambda: self._steam_apply_profile(profile, inv_public))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _steam_apply_profile(self, profile: dict, inv_public: bool) -> None:
+        """Write profile into config + refresh widget + dialog status.
+
+        Runs on the Tk main thread (scheduled via after() from the worker).
+        Mutates `self.config_data` in place AND rewrites config.json — the
+        in-memory copy is the source of truth for the rest of the GUI
+        session, the disk copy is what other processes (watch.py) see.
+        """
+        steam_cfg = {
+            "id":               profile.get("steamid", ""),
+            "persona":          profile.get("persona", ""),
+            "avatar_url":       profile.get("avatar_url", ""),
+            "inventory_public": inv_public,
+        }
+        # load-merge instead of overwriting the whole file — same pattern
+        # as _on_close for window geometry. Keeps unrelated config keys
+        # (e.g. message_template override) intact.
+        try:
+            on_disk = load_json(CONFIG_PATH) or {}
+        except Exception:
+            on_disk = {}
+        on_disk["steam"] = steam_cfg
+        try:
+            save_json(CONFIG_PATH, on_disk)
+        except Exception as e:
+            log.warning("could not persist steam config: %s", e)
+        self.config_data["steam"] = steam_cfg
+
+        # Refresh floating widget + dialog status.
+        self._update_user_widget(username=steam_cfg["persona"])
+        if steam_cfg["avatar_url"]:
+            self._fetch_avatar_async(steam_cfg["avatar_url"])
+        self._steam_dlg_refresh_connected_state()
+
+    def _steam_dlg_disconnect(self) -> None:
+        """Clear `config.json.steam`, reset widget to the placeholder.
+
+        Used both from the dialog's Disconnect button and (in future) any
+        "session expired" handler that wants to wipe state and prompt for
+        a fresh login.
+        """
+        try:
+            on_disk = load_json(CONFIG_PATH) or {}
+        except Exception:
+            on_disk = {}
+        empty = {"id": "", "persona": "", "avatar_url": "", "inventory_public": None}
+        on_disk["steam"] = empty
+        try:
+            save_json(CONFIG_PATH, on_disk)
+        except Exception as e:
+            log.warning("could not persist steam disconnect: %s", e)
+        self.config_data["steam"] = empty
+
+        # Wipe the floating widget back to the bundled Steam logo + the
+        # placeholder "Username" / "0.00 ₴" labels.
+        self._update_user_widget(username="Username")
+        self._draw_placeholder_avatar()
+        self._user_avatar_ref = None
+
+        # Also wipe the dialog's entry + status, so the next manual attempt
+        # starts on a clean slate.
+        self._steam_dlg_manual_entry.delete(0, END)
+        self._steam_dlg_set_status(
+            t("dlg.steam_login.status_disconnected"), kind="muted",
+        )
+        # _refresh_connected_state will hide the Disconnect button now
+        # that persona is empty.
+        self._steam_dlg_refresh_connected_state()
+        # Override the cleared status line so the user sees confirmation
+        # of the disconnect (refresh_connected_state would have left it blank).
+        self._steam_dlg_set_status(
+            t("dlg.steam_login.status_disconnected"), kind="muted",
+        )
+
+    def _steam_dlg_set_status(self, text: str, kind: str = "muted") -> None:
+        """Recolour + retext the dialog's status line.
+
+        `kind` maps to a theme palette colour so messages read consistently
+        with the rest of the GUI:
+          * muted   → secondary  (neutral progress)
+          * warning → warning    (user input issue)
+          * danger  → danger     (network / not-found)
+          * success → success    (handled by refresh_connected_state)
+        """
+        colours = self.style.colors
+        fg = {
+            "muted":   colours.secondary,
+            "warning": colours.warning,
+            "danger":  colours.danger,
+            "success": colours.success,
+        }.get(kind, colours.secondary)
+        try:
+            self._steam_dlg_status.configure(text=text, foreground=fg)
+        except tk.TclError:
+            # Dialog was closed mid-fetch — just drop the update.
+            pass
 
     # ------------------------------------------------------------------
     # Active-kind helpers — used by action callbacks to figure out which
@@ -2746,7 +3120,14 @@ class App(tb.Window):
                   foreground="gray").grid(row=12, column=1, sticky=W)
 
         row("lbl.steam_login", 13)
-        ttk.Button(f, text=t("btn.in_development"), state=DISABLED).grid(row=13, column=1, sticky=W)
+        # "Set up…" launches the 3-tier login dialog (QR / browser / manual).
+        # Only the manual tier is wired up end-to-end in Stage 1; the other
+        # two render as labelled stubs inside the dialog (see DESIGN.md →
+        # Phase 1 staging plan).
+        ttk.Button(
+            f, text=t("btn.steam_login_setup"),
+            command=self._open_steam_login_dialog,
+        ).grid(row=13, column=1, sticky=W)
 
         # Save + Reset live on the same row. Reset is bootstyle="danger"
         # so it's visually weighted as "destructive" — the confirmation
@@ -2882,6 +3263,14 @@ class App(tb.Window):
         # when the user switches language.
         if template_override and template_override != t("tg.message.default"):
             cfg["message_template"] = template_override
+        # Preserve the Steam-login section as-is. It's owned by a different
+        # subsystem (steam_login.py + the login dialog) and the Settings
+        # form has no fields for it, so a Settings "Save" must NOT wipe it.
+        # Pulls from self.config_data because the login dialog mutates that
+        # dict in place after every successful manual save / disconnect.
+        steam_section = self.config_data.get("steam")
+        if steam_section is not None:
+            cfg["steam"] = steam_section
         save_json(CONFIG_PATH, cfg)
         self.config_data = cfg
         # Apply font scale live so the change is visible without a restart.
