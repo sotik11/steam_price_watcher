@@ -24,6 +24,7 @@
     "id": "",
     "persona": "",
     "avatar_url": "",
-    "inventory_public": null
+    "inventory_public": null,
+    "cookies": null
   }
 }

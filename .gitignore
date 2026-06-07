@@ -9,6 +9,7 @@ config.json
 state.json
 watch.log
 watch.log.*
+cookie_helper.log
 
 # Шаблоны конфигов — коммитим
 !config.example.json

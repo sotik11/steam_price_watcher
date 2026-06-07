@@ -5,7 +5,9 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import threading
+import time
 import tkinter as tk
 import uuid
 import webbrowser
@@ -1310,7 +1312,7 @@ class App(tb.Window):
             command=lambda: self._steam_dlg_manual_entry.focus_set(),
         ).pack(side=LEFT)
 
-        # ---- Tier 2: browser cookies (stub) ----------------------------
+        # ---- Tier 2: browser cookies (live) ----------------------------
         br_frame = ttk.LabelFrame(outer, text=t("dlg.steam_login.browser_title"), padding=10)
         br_frame.pack(fill=X, pady=(0, 8))
         ttk.Label(
@@ -1319,12 +1321,17 @@ class App(tb.Window):
         ).pack(anchor=W)
         br_row = ttk.Frame(br_frame)
         br_row.pack(anchor=W, pady=(6, 0))
-        ttk.Button(
+        # Stash the button reference so `_steam_dlg_refresh_connected_state`
+        # can disable it while a Steam session is already saved — re-running
+        # the cookie import while connected would just overwrite the saved
+        # data with potentially-different cookies. The "Від'єднати" button
+        # is the canonical way to clear state before re-importing.
+        self._steam_dlg_browser_btn = ttk.Button(
             br_row, text=t("dlg.steam_login.browser_btn"),
-            state=DISABLED,
-        ).pack(side=LEFT, padx=(0, 10))
-        ttk.Label(br_row, text=t("btn.in_development"),
-                  foreground=muted_fg).pack(side=LEFT)
+            bootstyle="info",
+            command=self._open_browser_cookies_dialog,
+        )
+        self._steam_dlg_browser_btn.pack(side=LEFT, padx=(0, 10))
 
         # ---- Tier 3: manual ID (live) ----------------------------------
         man_frame = ttk.LabelFrame(outer, text=t("dlg.steam_login.manual_title"), padding=10)
@@ -1416,9 +1423,16 @@ class App(tb.Window):
                 text=line, foreground=self.style.colors.success,
             )
             self._steam_dlg_disconnect_btn.pack(side=LEFT)
+            # Lock the Tier 2 import button while a session is saved —
+            # re-import without explicit Disconnect would clobber the
+            # current state.
+            if hasattr(self, "_steam_dlg_browser_btn"):
+                self._steam_dlg_browser_btn.configure(state=DISABLED)
         else:
             self._steam_dlg_status.configure(text="", foreground="")
             self._steam_dlg_disconnect_btn.pack_forget()
+            if hasattr(self, "_steam_dlg_browser_btn"):
+                self._steam_dlg_browser_btn.configure(state=NORMAL)
 
     def _steam_dlg_save_manual(self) -> None:
         """Parse the manual-entry field, resolve it, persist, refresh widget.
@@ -1475,19 +1489,26 @@ class App(tb.Window):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _steam_apply_profile(self, profile: dict, inv_public: bool) -> None:
+    def _steam_apply_profile(self, profile: dict, inv_public: bool,
+                             cookies: dict | None = None) -> None:
         """Write profile into config + refresh widget + dialog status.
 
         Runs on the Tk main thread (scheduled via after() from the worker).
         Mutates `self.config_data` in place AND rewrites config.json — the
         in-memory copy is the source of truth for the rest of the GUI
         session, the disk copy is what other processes (watch.py) see.
+
+        `cookies` is an optional dict like `{"sessionid": ..., "steamLoginSecure": ...}`
+        from the browser-cookies tier. Manual-ID tier passes None (no auth).
+        When None, any previously-saved cookies are dropped — switching tiers
+        shouldn't leave stale auth lying around.
         """
         steam_cfg = {
             "id":               profile.get("steamid", ""),
             "persona":          profile.get("persona", ""),
             "avatar_url":       profile.get("avatar_url", ""),
             "inventory_public": inv_public,
+            "cookies":          cookies,  # null for manual-ID tier
         }
         # load-merge instead of overwriting the whole file — same pattern
         # as _on_close for window geometry. Keeps unrelated config keys
@@ -1507,6 +1528,17 @@ class App(tb.Window):
         self._update_user_widget(username=steam_cfg["persona"])
         if steam_cfg["avatar_url"]:
             self._fetch_avatar_async(steam_cfg["avatar_url"])
+        # If the manual-tier entry exists (login dialog open), mirror the
+        # new ID there so users see "yes this is the connected account".
+        # Browser tier specifically wants this for the "I know who you are
+        # now" affordance even though the user didn't type anything.
+        entry = getattr(self, "_steam_dlg_manual_entry", None)
+        if entry is not None:
+            try:
+                entry.delete(0, END)
+                entry.insert(0, steam_cfg["id"])
+            except tk.TclError:
+                pass
         self._steam_dlg_refresh_connected_state()
 
     def _steam_dlg_disconnect(self) -> None:
@@ -1520,7 +1552,8 @@ class App(tb.Window):
             on_disk = load_json(CONFIG_PATH) or {}
         except Exception:
             on_disk = {}
-        empty = {"id": "", "persona": "", "avatar_url": "", "inventory_public": None}
+        empty = {"id": "", "persona": "", "avatar_url": "",
+                 "inventory_public": None, "cookies": None}
         on_disk["steam"] = empty
         try:
             save_json(CONFIG_PATH, on_disk)
@@ -1571,6 +1604,459 @@ class App(tb.Window):
         except tk.TclError:
             # Dialog was closed mid-fetch — just drop the update.
             pass
+
+    # ------------------------------------------------------------------
+    # Steam login Tier 2 — extract session cookies from a browser.
+    #
+    # User flow: pick browser → kill it → read cookies → fetch profile →
+    # save → relaunch browser. Everything that talks to subprocess or
+    # the network runs in a worker thread; only Tk updates are posted
+    # back via self.after(0, ...).
+    # ------------------------------------------------------------------
+
+    def _open_browser_cookies_dialog(self) -> None:
+        """Sub-dialog that drives the Tier 2 (browser cookies) flow.
+
+        Modal child of the login dialog. Detects installed browsers up
+        front; if zero → shows a status line and a Close button; if ≥1 →
+        radio selector (hidden when only one) + the "close & import"
+        button + a live status area.
+        """
+        import browser_cookies as bc
+
+        # Don't stack two at once — the worker thread state lives on
+        # self so reentry would tangle status updates.
+        existing = getattr(self, "_steam_browser_dlg", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        installed = bc.detect_installed_browsers()
+
+        # Build the sub-Toplevel. Parent is the login dialog so window
+        # management (focus, transient) chains correctly.
+        parent = getattr(self, "_steam_login_dlg", None) or self
+        dlg = tk.Toplevel(parent)
+        self._steam_browser_dlg = dlg
+        dlg.title(t("dlg.steam_browser.title"))
+        dlg.transient(parent)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        outer = ttk.Frame(dlg, padding=14)
+        outer.pack(fill=BOTH, expand=YES)
+
+        muted_fg = self.style.colors.secondary
+
+        # ---- Empty path: no supported browsers installed --------------
+        if not installed:
+            ttk.Label(
+                outer, text=t("dlg.steam_browser.none_found"),
+                foreground=self.style.colors.warning,
+                wraplength=420, justify=LEFT,
+            ).pack(anchor=W, pady=(0, 10))
+            ttk.Button(
+                outer, text=t("dlg.steam_browser.cancel_btn"),
+                command=lambda: self._close_browser_dialog(),
+            ).pack(anchor=E)
+            self._steam_browser_specs = []
+            self._position_browser_dialog(dlg)
+            dlg.protocol("WM_DELETE_WINDOW", self._close_browser_dialog)
+            return
+
+        self._steam_browser_specs = installed
+        # Pre-select the first installed browser. StringVar holds the
+        # `code` so we can look up the spec by code in the worker.
+        self._steam_browser_var = tk.StringVar(value=installed[0].code)
+        # Track every browser we've force-closed during this dialog
+        # session so the close handler can put them all back. Keyed by
+        # spec.code; cleared once the spec is actually relaunched.
+        self._killed_browsers: dict[str, "browser_cookies.BrowserSpec"] = {}
+        # Remembers the last browser that errored out — its radio button
+        # gets the "Try again" label until the user switches to a
+        # different browser (which resets back to the default).
+        self._steam_browser_retry_code: str | None = None
+
+        # ---- Browser selector (only shown when more than one) ---------
+        if len(installed) > 1:
+            ttk.Label(outer, text=t("dlg.steam_browser.choose")
+                      ).pack(anchor=W, pady=(0, 4))
+            for spec in installed:
+                ttk.Radiobutton(
+                    outer, text=spec.display_name,
+                    variable=self._steam_browser_var, value=spec.code,
+                    command=self._refresh_browser_dialog_labels,
+                ).pack(anchor=W, padx=(8, 0))
+
+        # ---- Warning: data loss ---------------------------------------
+        self._steam_browser_warn = ttk.Label(
+            outer, text="", foreground=self.style.colors.warning,
+            wraplength=420, justify=LEFT,
+        )
+        self._steam_browser_warn.pack(anchor=W, pady=(10, 0))
+
+        # ---- Status line ----------------------------------------------
+        self._steam_browser_status = ttk.Label(
+            outer, text="", wraplength=420, justify=LEFT,
+        )
+        self._steam_browser_status.pack(anchor=W, pady=(8, 0))
+
+        # ---- Bottom buttons -------------------------------------------
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill=X, pady=(12, 0))
+        ttk.Button(
+            btn_row, text=t("dlg.steam_browser.cancel_btn"),
+            command=self._close_browser_dialog,
+        ).pack(side=LEFT)
+        self._steam_browser_action_btn = ttk.Button(
+            btn_row, text="",  # filled in by _refresh_browser_dialog_labels
+            bootstyle="success",
+            command=self._start_browser_cookie_extraction,
+        )
+        self._steam_browser_action_btn.pack(side=RIGHT)
+
+        # Initial label fill — keeps the {browser} substitution in one
+        # place so radio-toggle and first-paint both go through the same
+        # path.
+        self._refresh_browser_dialog_labels()
+
+        dlg.protocol("WM_DELETE_WINDOW", self._close_browser_dialog)
+        self._position_browser_dialog(dlg)
+
+    def _position_browser_dialog(self, dlg: tk.Toplevel) -> None:
+        """Centre the sub-dialog over its parent."""
+        dlg.update_idletasks()
+        parent = dlg.master
+        try:
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+        except tk.TclError:
+            return
+        x = px + (pw - dlg.winfo_reqwidth()) // 2
+        y = py + (ph - dlg.winfo_reqheight()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _refresh_browser_dialog_labels(self) -> None:
+        """Re-render warning + action-button labels for the chosen browser.
+
+        Called both on first paint, whenever the user clicks a different
+        radio button, and after the worker reports a terminal status. Two
+        button-label modes:
+
+          * default: "Close {browser} and import" — first attempt or after
+                     switching to a browser we haven't tried yet.
+          * retry:   "Try again" — the currently selected browser was the
+                     last one to error out and the user is presumably going
+                     to retry it without closing it again (the browser is
+                     already dead — no need to ask "close it" twice).
+
+        Picking a different radio resets retry mode: the new browser is
+        still alive, so the "close it first" warning text is honest again.
+        """
+        spec = self._current_browser_spec()
+        if spec is None:
+            return
+        self._steam_browser_warn.configure(
+            text=t("dlg.steam_browser.warn_unsaved", browser=spec.display_name),
+        )
+        if self._steam_browser_retry_code == spec.code:
+            # Same browser as the last error → retry, no close-and-extract.
+            self._steam_browser_action_btn.configure(
+                text=t("dlg.steam_browser.retry_btn"),
+            )
+        else:
+            # Different browser (or first attempt) → drop any stale retry
+            # state and show the standard close+extract label.
+            self._steam_browser_retry_code = None
+            self._steam_browser_action_btn.configure(
+                text=t("dlg.steam_browser.close_and_extract", browser=spec.display_name),
+            )
+
+    def _current_browser_spec(self):
+        """Return the BrowserSpec matching the currently-selected radio."""
+        code = self._steam_browser_var.get()
+        for spec in self._steam_browser_specs:
+            if spec.code == code:
+                return spec
+        return None
+
+    def _close_browser_dialog(self) -> None:
+        """Drop the sub-dialog cleanly + relaunch any still-closed browsers.
+
+        Anything we force-closed during this dialog session that we
+        haven't put back yet (i.e. its entry is still in `_killed_browsers`)
+        gets relaunched now. The success path inside the worker already
+        pops its own spec after a successful relaunch, so what's left here
+        is exactly the set of browsers the user closed via "Try import"
+        but never got back — typically failed attempts on browsers they
+        didn't end up using.
+        """
+        import browser_cookies as bc
+
+        dlg = getattr(self, "_steam_browser_dlg", None)
+        if dlg is None:
+            return
+        # Relaunch leftovers BEFORE destroying the window so any failures
+        # are at least logged before the dialog state is gone.
+        for spec in list(getattr(self, "_killed_browsers", {}).values()):
+            try:
+                bc.relaunch_browser(spec.exe_path or "")
+            except Exception as e:
+                log.warning("dialog-close relaunch failed for %s: %s",
+                            spec.display_name, e)
+        self._killed_browsers = {}
+        try:
+            dlg.grab_release()
+        except tk.TclError:
+            pass
+        self._steam_browser_dlg = None
+        try:
+            dlg.destroy()
+        except tk.TclError:
+            pass
+
+    def _set_browser_status(self, text: str, kind: str = "muted") -> None:
+        """Status line update — same palette mapping as the login dialog."""
+        colours = self.style.colors
+        fg = {
+            "muted":   colours.secondary,
+            "warning": colours.warning,
+            "danger":  colours.danger,
+            "success": colours.success,
+        }.get(kind, colours.secondary)
+        try:
+            self._steam_browser_status.configure(text=text, foreground=fg)
+        except tk.TclError:
+            pass
+
+    def _start_browser_cookie_extraction(self) -> None:
+        """Kick off the kill → wait → extract → fetch → relaunch worker.
+
+        Disables the action button while the worker runs so an impatient
+        user can't queue up a second pass mid-flight. Re-enabled on every
+        terminal status (success, retryable error, or fatal).
+        """
+        spec = self._current_browser_spec()
+        if spec is None:
+            return
+        self._steam_browser_action_btn.configure(state=DISABLED)
+
+        def worker() -> None:
+            self._browser_cookie_pipeline(spec)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _browser_cookie_pipeline(self, spec) -> None:
+        """The actual kill→extract→verify→save flow. Runs off the Tk thread.
+
+        Posts every user-visible state change back via self.after(0, ...).
+        Re-enables the action button on every exit so a retry is always
+        one click away.
+        """
+        import browser_cookies as bc
+        import steam_login as sl
+
+        name = spec.display_name
+
+        def status(text: str, kind: str = "muted") -> None:
+            self.after(0, lambda: self._set_browser_status(text, kind))
+
+        def reenable_with_retry() -> None:
+            """Re-enable the action button and flip its label to 'Try again'
+            for the browser that just failed. Called from every error
+            terminal path. Radio-switch handler resets retry state when
+            the user picks a different browser.
+            """
+            def apply() -> None:
+                self._steam_browser_retry_code = spec.code
+                self._refresh_browser_dialog_labels()
+                self._steam_browser_action_btn.configure(state=NORMAL)
+            self.after(0, apply)
+
+        def reenable_normal() -> None:
+            """Re-enable the action button without the retry-label flip.
+            Used after success so dialog auto-close can take over.
+            """
+            self.after(0, lambda: self._steam_browser_action_btn.configure(state=NORMAL))
+
+        try:
+            # 1. Kill any running instance — Chrome holds the cookie DB
+            #    locked while any process owns it. taskkill swallows
+            #    "process not found" so always-closed browsers are fine.
+            status(t("dlg.steam_browser.status_killing", browser=name))
+            bc.kill_browser(spec.exe_names)
+
+            # 2. Wait for processes to actually disappear (1-2 sec on
+            #    Windows after taskkill returns). If they don't, abort
+            #    with a "close it manually" message.
+            if not bc.wait_until_gone(spec.exe_names, timeout_sec=5.0):
+                status(t("dlg.steam_browser.kill_timeout", browser=name), kind="danger")
+                reenable_with_retry()
+                return
+
+            # The browser is now confirmed dead — register it as "owed
+            # back" so dialog close (Cancel / X / success) can relaunch
+            # it. Idempotent: re-trying the same browser is fine.
+            self._killed_browsers[spec.code] = spec
+
+            # 3. Extract cookies. Built-in retries (3×1s) absorb the file-
+            #    handle-release latency that lingers after the last
+            #    process exits.
+            #
+            # On failure we deliberately leave the browser closed — the
+            # user is going to want to retry, and another extraction
+            # attempt against a freshly-relaunched browser would hit the
+            # exact same locked-DB problem. They can launch it manually
+            # if they need to fix something (log in to Steam, etc.).
+            status(t("dlg.steam_browser.status_extracting"))
+            cookies = None
+            try:
+                cookies = bc.extract_steam_cookies(spec)
+            except bc.BrowserCookiesError as e:
+                msg = str(e)
+                log.warning("cookie extract failed for %s: %s", name, msg)
+                if msg.startswith("needs_admin"):
+                    # Modern Chrome/Edge/Opera ABE — only way through is
+                    # an elevated helper process. Show a short heads-up
+                    # before the UAC prompt steals focus so the pop-up
+                    # doesn't look like it came out of nowhere; 0.4 sec
+                    # is enough to register without feeling laggy.
+                    status(t("dlg.steam_browser.needs_admin"), kind="warning")
+                    time.sleep(0.4)
+                    status(t("dlg.steam_browser.status_admin"))
+                    try:
+                        cookies = bc.extract_steam_cookies_admin(
+                            spec,
+                            python_exe=str(Path(sys.executable).parent / "pythonw.exe"),
+                            helper_script=str(BASE / "cookie_extract_helper.py"),
+                        )
+                    except bc.BrowserCookiesError as e2:
+                        msg2 = str(e2)
+                        if msg2 == "admin_denied":
+                            status(t("dlg.steam_browser.admin_denied", browser=name),
+                                   kind="warning")
+                        elif msg2 == "admin_timeout":
+                            status(t("dlg.steam_browser.admin_timeout"),
+                                   kind="danger")
+                        elif msg2 == "not_elevated":
+                            # Helper ran but Windows didn't elevate it —
+                            # user needs to relaunch the GUI as admin.
+                            status(t("dlg.steam_browser.not_elevated"),
+                                   kind="danger")
+                        elif "decrypt_encrypted_value failed" in msg2:
+                            # rookiepy got past the admin check and the
+                            # key-derivation step but the actual cookie
+                            # decryption failed — happens on Chrome v131+
+                            # where ABE v2 added an extra binding layer
+                            # that no third-party library knows how to
+                            # reverse. Be honest with the user: this path
+                            # is a dead end until rookiepy (or Google)
+                            # changes something. Steer them to Opera /
+                            # manual ID.
+                            status(t("dlg.steam_browser.abe_blocked", browser=name),
+                                   kind="danger")
+                        elif msg2 == "no_session":
+                            status(t("dlg.steam_browser.no_session", browser=name),
+                                   kind="warning")
+                        else:
+                            # Helper-relayed error — keep it compact for the
+                            # status line; full traceback already in watch.log.
+                            short = msg2.splitlines()[0] if msg2 else "unknown"
+                            status(t("dlg.steam_browser.network", err=short),
+                                   kind="danger")
+                        reenable_with_retry()
+                        return
+                elif msg.startswith("db_locked"):
+                    cause = msg.split(":", 1)[1].strip() if ":" in msg else ""
+                    line = t("dlg.steam_browser.db_locked", browser=name)
+                    if cause:
+                        line += f"\n[{cause}]"
+                    status(line, kind="danger")
+                    reenable_with_retry()
+                    return
+                elif msg == "no_session":
+                    status(t("dlg.steam_browser.no_session", browser=name), kind="warning")
+                    reenable_with_retry()
+                    return
+                else:
+                    status(t("dlg.steam_browser.network", err=msg), kind="danger")
+                    reenable_with_retry()
+                    return
+
+            # 4. Confirm the cookies actually authenticate. They might
+            #    have been freshly logged out (cookie present but token
+            #    expired server-side) — Steam doesn't always clear the
+            #    cookie when the session dies.
+            status(t("dlg.steam_browser.status_verifying"))
+            if not bc.verify_session(cookies):
+                status(t("dlg.steam_browser.session_invalid"), kind="warning")
+                reenable_with_retry()
+                return
+
+            # 5. Pull steamID64 out of the cookie value, then run the same
+            #    public-profile fetch as the manual-ID tier — same widget
+            #    payload either way (persona / avatar / inventory check).
+            try:
+                sid = bc.parse_steamid_from_cookie(cookies["steamLoginSecure"])
+            except bc.BrowserCookiesError:
+                status(t("dlg.steam_browser.bad_cookie"), kind="danger")
+                reenable_with_retry()
+                return
+
+            status(t("dlg.steam_browser.status_loading"))
+            try:
+                profile = sl.fetch_public_profile(sid)
+            except sl.SteamLoginError as e:
+                status(t("dlg.steam_browser.network", err=str(e)), kind="danger")
+                reenable_with_retry()
+                return
+            # Inventory check is best-effort — same as manual tier.
+            inv_public = sl.check_inventory_public(sid)
+
+            # 6. Persist (with cookies this time) + refresh widget +
+            #    auto-fill Tier 3 entry — handled inside _steam_apply_profile.
+            self.after(0, lambda p=profile, i=inv_public, c=cookies:
+                       self._steam_apply_profile(p, i, cookies=c))
+
+            # 7. Relaunch — separate concern from "save was OK", so we
+            #    report success either way but vary the trailing line.
+            #    On successful relaunch we pop the spec from _killed_browsers
+            #    so the dialog-close handler doesn't try to relaunch it a
+            #    second time (which would either open a duplicate window
+            #    or fail noisily).
+            status(t("dlg.steam_browser.status_relaunching", browser=name))
+            relaunched = bc.relaunch_browser(spec.exe_path or "")
+            persona = profile.get("persona") or ""
+            if relaunched:
+                self.after(0, lambda: self._killed_browsers.pop(spec.code, None))
+                # Plain success — single line is plenty.
+                status(t("dlg.steam_browser.success", persona=persona), kind="success")
+            else:
+                # Save succeeded but we couldn't put the browser back —
+                # the user still needs the win-state, just with a manual
+                # follow-up nudge.
+                status(
+                    t("dlg.steam_browser.success", persona=persona) + " " +
+                    t("dlg.steam_browser.relaunch_failed", browser=name),
+                    kind="warning",
+                )
+            # Auto-close after a short delay so the user reads the
+            # success message but isn't stuck having to dismiss the
+            # sub-dialog manually. Any other browsers still in
+            # _killed_browsers (failed attempts on different browsers)
+            # get relaunched by _close_browser_dialog.
+            reenable_normal()
+            self.after(2000, self._close_browser_dialog)
+        except Exception as e:
+            # Any unforeseen error path — log it for postmortem, surface
+            # a generic-network message to the user, and re-enable the
+            # button so they can retry.
+            log.exception("browser cookie pipeline failed")
+            status(t("dlg.steam_browser.network", err=str(e)), kind="danger")
+            reenable_with_retry()
 
     # ------------------------------------------------------------------
     # Active-kind helpers — used by action callbacks to figure out which
