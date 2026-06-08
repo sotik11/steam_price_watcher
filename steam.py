@@ -243,7 +243,13 @@ def get_price_via_orderbook(appid: str | int, market_hash_name: str,
         ) from exc
 
     if not data.get("success"):
-        raise ValueError(t("log.api_failure", name=market_hash_name))
+        # Surface the friendly card name (no "<appid>-" prefix) — this
+        # exception bubbles into user-visible dialogs (_add_by_url warning,
+        # "Оновити зараз" status), where the raw market_hash_name reads
+        # like gibberish ("1774580-Merrin"). clean_card_name strips the
+        # prefix in one place so every call site stays consistent.
+        raise ValueError(t("log.api_failure",
+                           name=clean_card_name(market_hash_name)))
 
     body = data.get("data", {}) or {}
     amt_sell = body.get("amtMinSellOrder")
@@ -352,7 +358,10 @@ def get_price_via_priceoverview(appid: str | int, market_hash_name: str,
         ) from exc
 
     if not data.get("success"):
-        raise ValueError(t("log.api_failure", name=market_hash_name))
+        # Same friendly-name treatment as the orderbook path — see the
+        # comment there for why we strip the "<appid>-" prefix.
+        raise ValueError(t("log.api_failure",
+                           name=clean_card_name(market_hash_name)))
 
     lowest = parse_price(data.get("lowest_price", ""))
     volume_str = data.get("volume", "").replace(",", "")
@@ -474,21 +483,75 @@ def fetch_card_image_url(appid: str | int, market_hash_name: str) -> str | None:
     return m.group(1) if m else None
 
 
+# Steam re-skinned the market listing page in 2024-25 — the old
+# `<span class="market_listing_game_name">…</span>` block is gone; the
+# game + item-type string now sits in a description-coloured span with
+# an obfuscated class name. The CSS variable on the inline style is the
+# only stable hook we have. The page actually puts the same span twice:
+# the FIRST one is "<Game name> <item type>" (e.g. "STAR WARS Jedi:
+# Survivor™ Trading Card"), the second is the "this is a commodity"
+# explanation. We grab the first match.
+_LISTING_GAME_NAME_RE = re.compile(
+    r'<span[^>]*--text-color:var\(--color-text-body-description\)[^>]*>'
+    r'([^<]+)</span>',
+    re.IGNORECASE,
+)
+_LISTING_OG_IMAGE_RE = re.compile(
+    r'<meta\s+property="og:image"\s+content="([^"]+)"',
+    re.IGNORECASE,
+)
+
+
 def fetch_card_metadata(appid: str | int, market_hash_name: str) -> dict:
     """Resolve a card's pretty name, its game's display name, and a poster
     image URL we can send as a Telegram photo.
 
     Returns dict with keys: display_name, game_name, image_url.
 
-    For Steam Community Items (appid=753) the hash name embeds the game's
-    appid as a prefix; we strip it for display_name and hit appdetails for
-    the game name. For game-native market items we fall back to using the
-    market `appid` itself.
+    Strategy — one HTTP request, not two:
+      We fetch the card's Steam Market listing page (the same page that
+      `fetch_card_image_url` was hitting separately) and pull *both*
+      `og:image` and the `market_listing_game_name` tag from the same
+      HTML. That tag is the canonical "game name — item type" string
+      Steam itself renders next to the card, so we get it without
+      another network call.
+
+      The Steam Store `appdetails` API (what `fetch_game_name` uses)
+      has been throttling third-party callers with 403 increasingly
+      often — this approach sidesteps that entirely for community
+      cards, where the market listing page is always available.
+
+    Falls back to `fetch_game_name(game_appid)` only if the listing
+    page fails or doesn't carry the tag (rare — non-card community
+    items, or Steam serving a redirect/error). Worst-case we still
+    end up with "—" same as before.
     """
     display_name = clean_card_name(market_hash_name)
-    game_appid = extract_game_appid(market_hash_name) or str(appid)
-    game_name = fetch_game_name(game_appid)
-    image_url = fetch_card_image_url(appid, market_hash_name)
+
+    image_url = None
+    game_name = ""
+    url = market_url(appid, market_hash_name)
+    try:
+        resp = requests.get(url, headers=_DEFAULT_HEADERS, timeout=_TIMEOUT)
+        resp.raise_for_status()
+        html = resp.text
+        m_img = _LISTING_OG_IMAGE_RE.search(html)
+        if m_img:
+            image_url = m_img.group(1)
+        m_game = _LISTING_GAME_NAME_RE.search(html)
+        if m_game:
+            game_name = m_game.group(1).strip()
+    except Exception as exc:
+        log.warning("fetch_card_metadata listing fetch failed (%s): %s",
+                    market_hash_name, exc)
+
+    # Fallback: hit Steam Store API only when the listing page didn't
+    # give us a usable game name. Cached, so a 403 there only costs us
+    # once per process.
+    if not game_name:
+        game_appid = extract_game_appid(market_hash_name) or str(appid)
+        game_name = fetch_game_name(game_appid)
+
     return {
         "display_name": display_name,
         "game_name": game_name,
@@ -556,9 +619,14 @@ def fetch_prices_batch(items: list[dict], currency: int = 18, country: str = "UA
             aborted_at = i + 1
             break
         except Exception as exc:
-            log.warning(t("log.get_price_failed",
-                          name=pretty_name(item),
-                          kind=type(exc).__name__, err=exc))
+            # Surfacing a failed price fetch as ERROR (was WARNING):
+            # this is a real loss for the user — the card just won't
+            # have a "current price" this round — and the Журнал tab
+            # tints ERROR rows red so it stands out among the routine
+            # INFO chatter.
+            log.error(t("log.get_price_failed",
+                        name=pretty_name(item),
+                        kind=type(exc).__name__, err=exc))
             results.append({**item, "lowest_price": None, "volume": None, "error": str(exc)})
     # If we aborted mid-batch, synthesise "rate-limited" rows for the rest
     # so the caller's bookkeeping (last_seen update, etc.) sees the whole
@@ -654,3 +722,359 @@ def fetch_wallet_balance(cookies: dict | None) -> str | None:
     raw = m.group(1).replace(" ", " ").strip()
     log.debug("wallet balance: %r", raw)
     return raw
+
+
+# ---------------------------------------------------------------------------
+# Active listings + buy orders — for the Phase 3 "Import from Steam" flow.
+# ---------------------------------------------------------------------------
+
+# Steam's `mylistings/render/` endpoint returns a JSON envelope where the
+# heavy data lives in three pieces:
+#   * `assets` — keyed by appid → context → assetid, has the canonical
+#                `market_hash_name`, `name`, and `market_fee_app` (the
+#                real game appid for community items, which live under
+#                Steam's own appid 753 / context 6).
+#   * `hovers` — a blob of JS `CreateItemHoverFromContainer(...)` calls
+#                that wire listingid → assetid; this is how we connect
+#                a row to its asset metadata.
+#   * `results_html` — rendered listing rows that carry the actual sell
+#                      price as Steam-formatted text plus the game-name
+#                      tag we'd otherwise have to fetch via Store API.
+# Pagination is `start` + `count` (max 100 per page). 500-row safety cap
+# because a user with thousands of active listings is plausible but
+# absurd, and we'd rather stop early than rate-limit ourselves.
+_MYLISTINGS_URL = "https://steamcommunity.com/market/mylistings/render/"
+_MYLISTINGS_PAGE = 100
+_MYLISTINGS_MAX = 500
+
+# CreateItemHoverFromContainer( g_rgAssets, 'mylisting_<lid>_name', <community_appid>, '<context>', '<assetid>', 1 );
+_HOVER_RE = re.compile(
+    r"CreateItemHoverFromContainer\(\s*g_rgAssets,\s*"
+    r"'mylisting_(\d+)_name',\s*(\d+),\s*'(\d+)',\s*'(\d+)'"
+)
+# Per-listing HTML block — listingid → buyer-pays price + game-name tag.
+# `re.DOTALL` because the row spans many lines of pretty-printed HTML.
+_LISTING_BLOCK_RE = re.compile(
+    r'id="mylisting_(?P<lid>\d+)"'
+    r'.*?title="This is the price the buyer pays\.">\s*'
+    r'(?P<price>[^<]+?)\s*</span>'
+    r'.*?<span class="market_listing_game_name">'
+    r'(?P<game>[^<]*)</span>',
+    re.DOTALL,
+)
+
+
+def fetch_market_listings(cookies: dict | None) -> list[dict]:
+    """Fetch the user's currently-active Steam Market sale listings.
+
+    Returns a list of dicts in the same shape our salelist.json entries
+    use:
+        {
+            "listingid":         "<steam listing id>",
+            "appid":             <int — real game appid, not 753>,
+            "market_hash_name":  "<appid>-<card name>",
+            "display_name":      "<card name without the appid prefix>",
+            "game_name":         "<Steam Market subtitle, e.g. 'X Foil Trading Card'>",
+            "price":             <float — what the buyer pays>,
+            "price_raw":         "<formatted string Steam served>",
+        }
+
+    Pagination is handled internally (Steam caps at 100 per page); we
+    stop at `_MYLISTINGS_MAX` or sooner if `total_count` is reached.
+
+    `cookies` is the per-domain dict from `browser_cookies.extract_steam_cookies`;
+    we use the community subset (listings live under steamcommunity.com).
+    Returns an empty list — never raises — on:
+      * no cookies / no community cookies (Tier 3 manual ID),
+      * network failure / non-JSON / `success=false`.
+
+    Failure modes are logged at warning level for diagnostic visibility
+    but never propagate, because import is a polish feature on top of
+    the normal app and a flaky network shouldn't tank the GUI.
+    """
+    community = (cookies or {}).get("steamcommunity.com") or {}
+    if "steamLoginSecure" not in community:
+        log.debug("mylistings skipped — no community cookies")
+        return []
+
+    out: list[dict] = []
+    start = 0
+    while start < _MYLISTINGS_MAX:
+        try:
+            resp = requests.get(
+                _MYLISTINGS_URL,
+                params={"query": "", "start": start, "count": _MYLISTINGS_PAGE},
+                cookies=community,
+                headers={
+                    "User-Agent": _UA,
+                    "Accept": "application/json, */*",
+                    "Referer": "https://steamcommunity.com/market/",
+                },
+                timeout=_TIMEOUT,
+                allow_redirects=False,
+            )
+        except requests.RequestException as e:
+            log.warning("mylistings network error at start=%d: %s", start, e)
+            break
+        if resp.status_code != 200:
+            log.warning("mylistings HTTP %s at start=%d", resp.status_code, start)
+            break
+        try:
+            data = resp.json()
+        except ValueError:
+            log.warning("mylistings non-JSON at start=%d", start)
+            break
+        if not data.get("success"):
+            log.warning("mylistings success=false at start=%d", start)
+            break
+
+        # listingid → assetid map for this page.
+        lid_to_aid: dict[str, str] = {}
+        for m in _HOVER_RE.finditer(data.get("hovers", "") or ""):
+            lid_to_aid[m.group(1)] = m.group(4)
+
+        # Asset metadata lives under appid 753 (Steam) / context 6
+        # (Community items) for trading cards. The bigger nested form
+        # `data["assets"][appid][context][assetid]` keeps us safe if
+        # Steam later starts mixing in other appids/contexts here.
+        assets_753 = (data.get("assets") or {}).get("753", {}).get("6", {})
+
+        html = data.get("results_html", "") or ""
+        for block in _LISTING_BLOCK_RE.finditer(html):
+            listingid = block.group("lid")
+            price_raw = block.group("price").strip()
+            game_name = block.group("game").strip()
+
+            assetid = lid_to_aid.get(listingid)
+            asset = assets_753.get(assetid or "")
+            if not asset:
+                # No metadata for this listing — skip it. Happens if the
+                # listing is for a non-community item or if hovers/assets
+                # somehow disagree; either way we can't enrich it.
+                log.debug("mylistings: no asset for listing %s", listingid)
+                continue
+
+            mhn = asset.get("market_hash_name") or ""
+            display_name = asset.get("name") or asset.get("market_name") or ""
+
+            # IMPORTANT: `appid` here is what goes into the Steam Market
+            # URL (and every subsequent get_price call), NOT the game's
+            # own appid. For trading cards that's always 753 — Steam
+            # Community Items — and the *game* appid is encoded as the
+            # "<game_appid>-" prefix on `market_hash_name`. Storing 753
+            # is what `_add_by_url` does for manually-added cards too,
+            # so imported and manual rows stay shape-compatible.
+            # Using `market_fee_app` (the game appid) here used to break
+            # subsequent get_price calls for every imported card — Steam
+            # returns success=false because the orderbook expects the
+            # 753+prefixed-mhn pair, not the game-appid+bare-name pair.
+            out.append({
+                "listingid":        listingid,
+                "appid":            753,
+                "market_hash_name": mhn,
+                "display_name":     display_name,
+                "game_name":        game_name,
+                "price":            parse_price(price_raw),
+                "price_raw":        price_raw,
+            })
+
+        total = int(data.get("total_count") or 0)
+        start += _MYLISTINGS_PAGE
+        if start >= total:
+            break
+
+    log.info("fetched %d active listings", len(out))
+    return out
+
+
+# Buy orders live on the Market home page (no separate JSON endpoint —
+# Valve never built one). The HTML uses the same `market_listing_row`
+# scaffolding as mylistings; rows have `id="mybuyorder_<id>"` and the
+# linked listing URL carries `/<appid>/<mhn>` in the path so we don't
+# need a second cross-reference to assets.
+_MARKET_HOME_URL = "https://steamcommunity.com/market/"
+# Buy-order row layout uses *two* `market_listing_price` spans:
+#   1) Inside `market_listing_my_price` — has the inline "<qty> @" hint
+#      followed by the per-unit price (`4₴` in the wild). This is what
+#      we actually want.
+#   2) Inside `market_listing_buyorder_qty` — bare quantity ("1").
+# A naive `.*?market_listing_price.*?` grabs the first span's *first*
+# text node, which is the inline-qty hint, then a bare `[^<]+?` captures
+# its content instead of the real price. Anchor on `market_listing_my_price`
+# and consume the inline-qty span explicitly to land on the unit price.
+_BUYORDER_BLOCK_RE = re.compile(
+    r'id="mybuyorder_(?P<oid>\d+)"'
+    r'.*?<div class="market_listing_right_cell market_listing_my_price">'
+    r'.*?<span class="market_listing_inline_buyorder_qty">[^<]*</span>'
+    r'\s*(?P<price>[^<]+?)\s*</span>'
+    r'.*?href="https://steamcommunity\.com/market/listings/'
+    r'(?P<appid>\d+)/(?P<mhn_enc>[^"]+)"[^>]*>(?P<display>[^<]+)</a>'
+    r'.*?<span class="market_listing_game_name">'
+    r'(?P<game>[^<]*)</span>',
+    re.DOTALL,
+)
+
+
+def fetch_buy_orders(cookies: dict | None) -> list[dict]:
+    """Fetch the user's active buy orders from the Steam Market home page.
+
+    Returns a list of dicts mirroring the sale-listings shape so the
+    import dialog can treat both the same way downstream:
+        {
+            "buy_orderid":       "<id>",
+            "appid":             <int>,
+            "market_hash_name":  "<mhn>",
+            "display_name":      "<card name>",
+            "game_name":         "<game-name tag>",
+            "price":             <float>,
+            "price_raw":         "<formatted string>",
+        }
+
+    No JSON endpoint exists — Steam scaffolds buy orders into the same
+    market home page that lists active sales. We scrape the HTML; the
+    `mybuyorder_<id>` block layout has been stable for years but if
+    Steam changes it the regex will silently return an empty list and
+    we log a warning.
+
+    Same fail-quiet contract as `fetch_market_listings`.
+    """
+    community = (cookies or {}).get("steamcommunity.com") or {}
+    if "steamLoginSecure" not in community:
+        return []
+
+    try:
+        resp = requests.get(
+            _MARKET_HOME_URL,
+            cookies=community,
+            headers={
+                "User-Agent": _UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                # Force a content-language hint so Steam doesn't redirect
+                # us into a geo-flavoured variant we'd then have to follow.
+                "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.7,en;q=0.5",
+            },
+            timeout=_TIMEOUT,
+            # Steam routinely 302s the market home page (region/currency
+            # negotiation, trailing-slash normalisation). Follow them —
+            # the final page on each redirect chain is the real market
+            # home with the buy-orders section the way we expect.
+            allow_redirects=True,
+        )
+    except requests.RequestException as e:
+        log.warning("buy orders network error: %s", e)
+        return []
+    if resp.status_code != 200:
+        log.warning("buy orders HTTP %s", resp.status_code)
+        return []
+
+    html = resp.text
+    if "mybuyorder_" not in html:
+        # Empty buy-orders list — Steam doesn't render the section at all
+        # when there's nothing in it. Different from "regex failed".
+        log.info("no active buy orders")
+        return []
+
+    out: list[dict] = []
+    for m in _BUYORDER_BLOCK_RE.finditer(html):
+        mhn = urllib.parse.unquote(m.group("mhn_enc"))
+        # `appid` is the URL-side appid — for trading cards that's 753
+        # (Steam Community Items), for game-native items it'd be the
+        # game's own appid. Steam's orderbook / priceoverview need this
+        # exact (appid, mhn) pair to look up the card. Previously we
+        # overrode it with `extract_game_appid(mhn)` (the prefix from
+        # the mhn), which made every imported buy order fail to refresh
+        # because the orderbook returns success=false for that pair.
+        try:
+            appid = int(m.group("appid"))
+        except ValueError:
+            continue
+        out.append({
+            "buy_orderid":      m.group("oid"),
+            "appid":            appid,
+            "market_hash_name": mhn,
+            "display_name":     m.group("display").strip(),
+            "game_name":        m.group("game").strip(),
+            "price":            parse_price(m.group("price")),
+            "price_raw":        m.group("price").strip(),
+        })
+
+    if not out:
+        # The token check above said there ARE orders but our regex
+        # found none — likely a layout change. Worth a louder warning.
+        log.warning("buy_order rows present but regex matched 0 — Steam layout changed?")
+
+    log.info("fetched %d active buy orders", len(out))
+    return out
+
+
+# Steam's `market_listing_game_name` tag is really "game name + item
+# type" smushed together — sometimes with an em-dash separator
+# ("Path of Exile — Тло профілю"), sometimes plain concatenation
+# ("METAL SLUG X Foil Trading Card"). We split it so the GUI can show
+# the game and the item type as separate columns.
+#
+# Suffix list covers the trading-card universe in the languages the app
+# actually supports plus English (Steam falls back to English for some
+# games regardless of locale). Long suffixes first when matching so
+# "Foil Trading Card" wins over plain "Trading Card".
+_TYPE_SUFFIXES_DASH = [
+    # Ukrainian
+    " — Фольгована картка обміну",
+    " — Картка обміну",
+    " — Тло профілю",
+    " — Емоція",
+    # Russian
+    " — Фольгированная карточка",
+    " — Карточка обмена",
+    " — Фон профиля",
+    " — Смайлик",
+    # English (with em-dash — uncommon but possible)
+    " — Foil Trading Card",
+    " — Trading Card",
+    " — Profile Background",
+    " — Emoticon",
+]
+_TYPE_SUFFIXES_PLAIN = [
+    # English (Steam ships these as plain concatenation on most games)
+    " Foil Trading Card",
+    " Trading Card",
+    " Profile Background",
+    " Emoticon",
+]
+
+
+def split_game_and_type(game_name_raw: str) -> tuple[str, str]:
+    """Split Steam's combined "game — item-type" string into two parts.
+
+    Returns `(game, item_type)`. Either side can be empty:
+      * empty input         → ("", "")
+      * known dashed suffix → strip it, return game without the dash.
+      * known plain suffix  → strip the trailing words.
+      * unrecognised + has " — "  → split on the final em-dash anyway —
+        better to expose a non-empty type even if we don't recognise it.
+      * unrecognised, no dash → the whole thing becomes the game name;
+        type stays "".
+
+    Long suffixes are tried before short ones so "Foil Trading Card"
+    doesn't get truncated to just "Trading Card".
+    """
+    if not game_name_raw:
+        return ("", "")
+    raw = game_name_raw.strip()
+
+    # Sort by length descending — match longest suffix first.
+    for suffix in sorted(_TYPE_SUFFIXES_DASH + _TYPE_SUFFIXES_PLAIN,
+                         key=len, reverse=True):
+        if raw.endswith(suffix):
+            game = raw[: len(raw) - len(suffix)].rstrip(" —")
+            item_type = suffix.lstrip(" —").strip()
+            return (game, item_type)
+
+    # Fallback for locales/games we don't have suffixes for: if the
+    # string contains an em-dash separator at all, split on the last
+    # one.
+    if " — " in raw:
+        game, _, item_type = raw.rpartition(" — ")
+        return (game.strip(), item_type.strip())
+
+    return (raw, "")

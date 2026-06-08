@@ -196,7 +196,11 @@ def _process_list(kind: str, list_path: Path, *,
         key = f"{kind}:{appid}:{name}"
 
         if item.get("error"):
-            log.warning(t("log.fetch_error", name=pretty, err=item["error"]))
+            # ERROR (was WARNING): the price fetch genuinely failed for
+            # this card, so the user loses one round of data. Promoting
+            # the log level makes it pop in the Журнал tab's red ERROR
+            # tint instead of getting buried among routine WARNINGs.
+            log.error(t("log.fetch_error", name=pretty, err=item["error"]))
             # Surface rate-limit visually in the GUI: tag every matching
             # row with status="rate_limited" (blue background) so the user
             # sees which cards weren't polled this round. We only overwrite

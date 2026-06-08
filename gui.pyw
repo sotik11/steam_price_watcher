@@ -715,7 +715,7 @@ class App(tb.Window):
 
     # Columns we never sort by: "num" stays 1..N (re-numbered after sort),
     # "link" is just a clickable icon — sorting it is meaningless.
-    _UNSORTABLE_COLS = {"num", "link"}
+    _UNSORTABLE_COLS = {"num", "link", "imported"}
 
     def _setup_sortable_columns(self, tree: ttk.Treeview,
                                 column_keys: list[str]) -> None:
@@ -975,6 +975,49 @@ class App(tb.Window):
         # instead of zeros on the first measurement.
         self.update()
         self._apply_min_size()
+
+        # Global click handler — clears card-list selection when the user
+        # clicks on "neutral" GUI area (not on a Treeview, not on a button
+        # that needs the selection to do its job). Lets the user dismiss a
+        # selection without having to Ctrl+click each row, which is the
+        # standard expectation from desktop apps. See `_on_global_click`
+        # for the widget-type filter.
+        self.bind_all("<Button-1>", self._on_global_click, add="+")
+
+    def _on_global_click(self, event):
+        """Clear card-list selections when the click is outside actionable widgets.
+
+        Action buttons consume the selection (Видалити, Змінити ціль,
+        etc.) so we never clear when clicking those — the button's
+        command needs the selection to be intact. Treeviews and their
+        scrollbars handle their own selection behaviour. Anything else
+        (Frames, Labels, the empty space between widgets) is "neutral"
+        and clicking there should dismiss the selection.
+
+        Walks `event.widget.master` chain so descendants of an action
+        button or Treeview are caught too (in practice neither has many
+        descendants, but the walk is cheap).
+        """
+        widget = event.widget
+        cur = widget
+        while cur is not None:
+            if isinstance(cur, (ttk.Button, ttk.Treeview,
+                                ttk.Scrollbar, ttk.Entry,
+                                tk.Text, ttk.Combobox, ttk.Spinbox,
+                                ttk.Radiobutton, ttk.Checkbutton)):
+                # Click landed on (or inside) an interactive control —
+                # leave the selection alone so the control's own
+                # behaviour can rely on it.
+                return
+            cur = cur.master
+        # Neutral area click — drop selection on every card-list tree.
+        for tree in self.list_trees.values():
+            try:
+                sel = tree.selection()
+                if sel:
+                    tree.selection_remove(*sel)
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------------------
     # Steam user widget (top-right)
@@ -2403,16 +2446,29 @@ class App(tb.Window):
         rest — columns, click behaviour, action callbacks — is identical
         and dispatches on the currently-active tab.
         """
-        cols = ("num", "name", "game", "target", "last", "spread", "status", "link")
+        # "type" sits between "name" and "game" — Steam's market tag bakes
+        # both into one string and splitting them out as separate columns
+        # gives users a cleaner read for cards from games whose titles are
+        # easily confused with item types (e.g. several "METAL SLUG …"
+        # entries all ending in "Foil Trading Card").
+        # "imported" is a single-glyph column at the end — a 📥 marker for
+        # rows that came from the Steam-import flow, blank otherwise. Lets
+        # the user distinguish manually-added cards from synced ones at a
+        # glance.
+        cols = ("num", "name", "type", "game",
+                "target", "last", "spread", "status",
+                "link", "imported")
         headings = [
-            ("num",    t("col.num"),         40),
-            ("name",   t("col.name"),       200),
-            ("game",   t("col.game"),       170),
-            ("target", t("col.target"),      80),
-            ("last",   t("col.last"),        85),
-            ("spread", t("col.spread"),     100),
-            ("status", t("col.status"),     130),
-            ("link",   t("col.link"),       110),
+            ("num",      t("col.num"),       40),
+            ("name",     t("col.name"),     200),
+            ("type",     t("col.type"),     110),
+            ("game",     t("col.game"),     150),
+            ("target",   t("col.target"),    80),
+            ("last",     t("col.last"),      85),
+            ("spread",   t("col.spread"),   100),
+            ("status",   t("col.status"),   130),
+            ("link",     t("col.link"),     110),
+            ("imported", t("col.imported"),  60),
         ]
 
         btn_frame = ttk.Frame(parent)
@@ -2428,7 +2484,7 @@ class App(tb.Window):
         for col, text, width in headings:
             if col in ("target", "last", "spread"):
                 anchor = E
-            elif col in ("num", "link"):
+            elif col in ("num", "link", "imported"):
                 anchor = CENTER
             else:
                 anchor = W
@@ -2475,15 +2531,26 @@ class App(tb.Window):
         # can enable/disable it together with the other selection-dependent
         # actions.
         move_key = "btn.move_to_sell" if kind == "buy" else "btn.move_to_buy"
+        # The duplicate action is sell-list only: salelist allows multiple
+        # entries per market_hash_name (you might be selling several
+        # copies of the same card at different prices). The buy list
+        # dedupes by mhn, so duplicating there would have nothing useful
+        # to do — the second copy would just collide on insert.
         btn_specs = [
             ("btn.add_by_url",      self._add_by_url),
             ("btn.edit_target",     self._edit_target),
+        ]
+        if kind == "sell":
+            btn_specs.append(("btn.duplicate", self._duplicate_card))
+        btn_specs += [
             (move_key,              self._move_to_other_list),
             ("btn.check_now",       self._check_now),
             ("btn.remove",          self._remove_card),
         ]
         btn_move = None
         btn_check = None
+        btn_remove = None
+        btn_duplicate = None
         for key, cmd in btn_specs:
             btn = ttk.Button(row1, text=t(key), command=cmd)
             btn.pack(side=LEFT, padx=2)
@@ -2491,6 +2558,19 @@ class App(tb.Window):
                 btn_move = btn
             elif key == "btn.check_now":
                 btn_check = btn
+            elif key == "btn.remove":
+                # Start disabled — "Видалити" only makes sense when
+                # something's actually selected; greying it out also
+                # prevents an accidental delete on an empty table.
+                # `_update_action_buttons` flips state + bootstyle when
+                # the selection becomes non-empty.
+                btn.configure(state=DISABLED)
+                btn_remove = btn
+            elif key == "btn.duplicate":
+                # Same disabled-by-default story as "Видалити" — needs
+                # a selection to do anything useful.
+                btn.configure(state=DISABLED)
+                btn_duplicate = btn
 
         row2 = ttk.Frame(btn_frame)
         row2.pack(fill=X)
@@ -2520,6 +2600,8 @@ class App(tb.Window):
             "move": btn_move,
             "check": btn_check,
             "import": btn_import,
+            "remove": btn_remove,
+            "duplicate": btn_duplicate,
         }
         self._update_action_buttons()
 
@@ -2550,7 +2632,63 @@ class App(tb.Window):
             if not r.get("id"):
                 r["id"] = str(uuid.uuid4())
                 dirty = True
+            # One-off migration for the early-import bug (fixed): records
+            # imported from Steam used to store `appid` = the *game's*
+            # appid (e.g. 238960 for Path of Exile) when the mhn already
+            # carried the prefix ("238960-The Sceptre of God"). The right
+            # value for community items is 753 — the URL appid — because
+            # that's the (appid, mhn) pair Steam's orderbook /
+            # priceoverview want. Heuristic: if `appid` isn't 753 *and*
+            # `market_hash_name` looks like "<digits>-<name>" *and* the
+            # prefix matches the stored appid, this is the broken case.
+            # Quietly fix it so refresh starts working again.
+            mhn = (r.get("market_hash_name") or r.get("name") or "")
+            appid = r.get("appid")
+            if (isinstance(appid, int) and appid != 753
+                    and "-" in mhn):
+                prefix = mhn.split("-", 1)[0]
+                if prefix.isdigit() and int(prefix) == appid:
+                    r["appid"] = 753
+                    # Also migrate the matching antispam-state key on
+                    # disk. State keys are `{kind}:{appid}:{name}` —
+                    # changing appid without renaming the key orphans
+                    # the entry, which leaves stale `status="alerted"`
+                    # badges stuck because evaluate_and_alert can't
+                    # find the entry to clear it.
+                    App._rename_state_appid_key(
+                        old_appid=appid, new_appid=753,
+                        name=r.get("name") or mhn,
+                    )
+                    dirty = True
         return dirty
+
+    @staticmethod
+    def _rename_state_appid_key(*, old_appid: int, new_appid: int,
+                                name: str) -> None:
+        """Move antispam-state entries when a card's appid changes.
+
+        Best-effort: silently skips if state.json is missing or
+        malformed. Run from `_ensure_ids` so any record whose appid we
+        migrate also drags its `state.json` entry along (otherwise
+        evaluate_and_alert can't find the antispam slot under the new
+        key and a stale "alerted" badge gets stuck forever).
+        """
+        try:
+            state = load_json(STATE_PATH, {}) or {}
+        except Exception:
+            return
+        dirty = False
+        for kind in ("buy", "sell"):
+            old_key = f"{kind}:{old_appid}:{name}"
+            new_key = f"{kind}:{new_appid}:{name}"
+            if old_key in state and new_key not in state:
+                state[new_key] = state.pop(old_key)
+                dirty = True
+        if dirty:
+            try:
+                save_json(STATE_PATH, state)
+            except Exception:
+                pass
 
     def _refresh_card_list(self, kind: str) -> None:
         from steam import pretty_name
@@ -2561,7 +2699,29 @@ class App(tb.Window):
         path = self._kind_path(kind)
         tree.delete(*tree.get_children())
         items = load_json(path, []) or []
+        list_dirty = False
         if self._ensure_ids(items):
+            list_dirty = True
+        # Synchronous self-heal: clear stale "alerted" badges where the
+        # current last_seen no longer meets the alert rule. Same condition
+        # as evaluate_and_alert (buy: lowest <= target → alert; sell:
+        # lowest < target). Catches rows whose price climbed back to or
+        # past target between price polls — the next watch.py run would
+        # also fix them, but doing it on every refresh keeps the GUI
+        # honest immediately after import / target edits / etc.
+        for w in items:
+            if w.get("status") != "alerted":
+                continue
+            target = w.get("target_price")
+            last_seen_num = _try_parse_money(w.get("last_seen"))
+            if not isinstance(target, (int, float)) or last_seen_num is None:
+                continue
+            still_qualifies = (last_seen_num <= target if kind == "buy"
+                               else last_seen_num < target)
+            if not still_qualifies:
+                w["status"] = ""
+                list_dirty = True
+        if list_dirty:
             save_json(path, items)
         row_index = 0
         for item in items:
@@ -2604,6 +2764,14 @@ class App(tb.Window):
             else:
                 row_tag = zebra
 
+            # `item_type` is filled in by the Steam import path; older
+            # records added manually before the type column existed will
+            # show an empty cell here until something refills the field.
+            # `imported` is the 📥 glyph for rows whose origin was the
+            # Steam-import sync — handy when a list mixes manually
+            # added cards with synced ones.
+            item_type = item.get("item_type") or ""
+            imported_glyph = "📥" if item.get("imported") else ""
             tree.insert(
                 "", END,
                 # iid = record's uuid (uniquely identifies even duplicate
@@ -2611,9 +2779,10 @@ class App(tb.Window):
                 iid=item["id"],
                 values=(
                     row_index + 1,
-                    display_name, game_name,
+                    display_name, item_type, game_name,
                     target_str, last, spread_str, status,
                     t("col.link.open"),
+                    imported_glyph,
                 ),
                 tags=(row_tag,),
             )
@@ -2683,6 +2852,27 @@ class App(tb.Window):
                 buttons["move"].configure(state=move_state)
             if "check" in buttons and buttons["check"] is not None:
                 buttons["check"].configure(state=check_state)
+            # "Видалити" — only enabled when something's selected, and
+            # flips to danger-red as a visual "this is destructive" cue
+            # the moment the click would do real work. Default style
+            # (empty bootstyle) when disabled so a greyed-out button
+            # doesn't look like it's begging to be clicked.
+            if buttons.get("remove") is not None:
+                if sel_items:
+                    buttons["remove"].configure(
+                        state=NORMAL, bootstyle="danger",
+                    )
+                else:
+                    buttons["remove"].configure(
+                        state=DISABLED, bootstyle="",
+                    )
+            # "Здублювати" — sell-tab-only, same enable-when-selected
+            # contract as Видалити. No special colour: it's an additive
+            # action, not destructive.
+            if buttons.get("duplicate") is not None:
+                buttons["duplicate"].configure(
+                    state=NORMAL if sel_items else DISABLED,
+                )
 
     # ------------------------------------------------------------------
     # Metadata backfill
@@ -2728,18 +2918,36 @@ class App(tb.Window):
 
     @staticmethod
     def _backfill_records(records: list, fetch_fn, other: list | None) -> bool:
-        """Top up display_name/game_name/image_url on a list of card records.
+        """Top up display_name/game_name/image_url/item_type on a list of records.
 
         First tries to copy from `other` (a sibling list with the same
         market_hash_name — used to share metadata between watchlist.json
         and purchases.json without an extra HTTP call). Falls back to
         `fetch_fn(appid, mhn)` for anything still missing.
 
+        Also splits Steam's combined "Game — Item type" string into
+        separate `game_name` and `item_type` fields so legacy rows
+        (added before the Type column existed) start showing the type
+        cell after their first backfill pass.
+
         Returns True if at least one record was modified.
         """
+        from steam import split_game_and_type
+
         dirty = False
         for item in records:
             mhn = item.get("market_hash_name", "")
+            # If game_name still contains a known type suffix, treat that
+            # as "type needs extracting" — old rows have things like
+            # "STAR WARS Jedi: Survivor™ Trading Card" sitting in game_name.
+            type_missing = not item.get("item_type")
+            if type_missing and item.get("game_name"):
+                g, ty = split_game_and_type(item["game_name"])
+                if ty:
+                    item["game_name"] = g
+                    item["item_type"] = ty
+                    dirty = True
+                    type_missing = False
             needs = (
                 not item.get("display_name")
                 or item.get("display_name") == mhn
@@ -2769,7 +2977,16 @@ class App(tb.Window):
             if not item.get("display_name") or item["display_name"] == mhn:
                 item["display_name"] = meta.get("display_name") or mhn
             if not item.get("game_name") or item["game_name"] == "—":
-                item["game_name"] = meta.get("game_name") or "—"
+                raw_game = meta.get("game_name") or "—"
+                # Same split for freshly-fetched meta — keeps type out of
+                # the Game column.
+                g, ty = split_game_and_type(raw_game)
+                if ty:
+                    item["game_name"] = g or raw_game
+                    if not item.get("item_type"):
+                        item["item_type"] = ty
+                else:
+                    item["game_name"] = raw_game
             if not item.get("image_url") and meta.get("image_url"):
                 item["image_url"] = meta["image_url"]
             dirty = True
@@ -2780,9 +2997,9 @@ class App(tb.Window):
     # ------------------------------------------------------------------
 
     # Identifier of the "link" column inside the card-list Treeview, as
-    # returned by tree.identify_column(). Columns: (num, name, game, target,
-    # last, spread, status, link) → link sits at position 8.
-    _LINK_COL_ID = "#8"
+    # returned by tree.identify_column(). Columns: (num, name, type, game,
+    # target, last, spread, status, link, imported) → link is position 9.
+    _LINK_COL_ID = "#9"
 
     def _on_card_tree_click(self, event):
         """Open the listing URL when the user clicks the link column."""
@@ -2875,7 +3092,7 @@ class App(tb.Window):
 
     def _add_by_url(self):
         from steam import (parse_market_url, get_price, clean_card_name,
-                           fetch_card_metadata)
+                           fetch_card_metadata, split_game_and_type)
 
         kind = self._active_kind()
         if kind is None:
@@ -2964,13 +3181,24 @@ class App(tb.Window):
                 "image_url": None,
             }
 
+        # Steam's listing page bakes "<Game name> <item type>" into one
+        # string (e.g. "STAR WARS Jedi: Survivor™ Trading Card"). Split
+        # so the card-list shows the type in its own column instead of
+        # leaking into the Game column.
+        clean_game, item_type = split_game_and_type(meta.get("game_name") or "")
+        # `imported` is False here because this row came from a manual
+        # URL paste, not from the Steam-import sync flow. We persist the
+        # field explicitly so the column renders an empty cell rather
+        # than the placeholder for a missing field.
         items.append({
             "id": str(uuid.uuid4()),
             "name": market_hash_name,
             "appid": appid,
             "market_hash_name": market_hash_name,
             "display_name": meta["display_name"],
-            "game_name": meta["game_name"],
+            "game_name": clean_game or (meta.get("game_name") or ""),
+            "item_type": item_type,
+            "imported": False,
             "image_url": meta.get("image_url"),
             "target_price": target,
             "status": "",
@@ -3024,6 +3252,12 @@ class App(tb.Window):
                 continue
             old_target = old_targets.get(w["id"])
             w["target_price"] = target
+            # Manual edit clears the "imported from Steam" marker — the
+            # price the user just typed is theirs, not Steam's anymore,
+            # so the 📥 column should stop claiming otherwise. Re-running
+            # import later will re-stamp it if Steam still agrees.
+            if w.get("imported"):
+                w["imported"] = False
             # Self-heal stale "alerted" status if the new target is stricter.
             # Same rule as watch.py / _check_now: under the new threshold, the
             # previously-alerted price wouldn't qualify anymore.
@@ -3040,6 +3274,165 @@ class App(tb.Window):
         if state_dirty:
             save_json(STATE_PATH, state)
         self._refresh_card_list(kind)
+
+    def _duplicate_card(self):
+        """Duplicate selected sell-list row(s) into salelist.
+
+        Salelist allows multiple entries per market_hash_name (one row
+        per copy you're listing). The duplicate action gives the user a
+        quick way to bulk-grow that: pick one or more existing rows and
+        spawn copies of each with either the same target price or a new
+        one.
+
+        Per-row dialog (`_ask_duplicate_action`) returns one of:
+          * `same`   → append a fresh copy at the source's price.
+          * `new`    → ask for a new price, then append.
+          * `skip`   → leave this row alone, move to the next selection.
+          * `cancel` → abort the whole batch. Already-duplicated rows
+                       stay applied — only the unprocessed ones are
+                       dropped, matching the import dialog's contract.
+
+        Newly-spawned copies always reset `status="" / last_seen="—"`
+        so they read like fresh additions; we don't carry the original's
+        "alerted" / "rate_limited" badges into the duplicate (the new
+        row is its own thing and should earn its own status from the
+        next price poll).
+        """
+        from steam import pretty_name
+
+        kind = self._active_kind()
+        if kind != "sell":
+            # Defensive: the button only exists on the sell tab, but
+            # don't trust the UI to be the only filter.
+            return
+        selected = self._require_selection()
+        if not selected:
+            return
+
+        path = self._kind_path(kind)
+        items = load_json(path, []) or []
+        new_count = 0
+        cancelled = False
+
+        for src in selected:
+            name = pretty_name(src)
+            cur_price = src.get("target_price")
+            choice = self._ask_duplicate_action(name, cur_price)
+            if choice == "cancel":
+                cancelled = True
+                break
+            if choice == "skip":
+                continue
+
+            # "same" → reuse the source's price; "new" → ask, parse, re-prompt
+            # on parse failure (less annoying than a hard error then re-click).
+            new_price = cur_price
+            if choice == "new":
+                initial = (f"{cur_price:.2f}"
+                           if isinstance(cur_price, (int, float)) else "")
+                ans = simpledialog.askstring(
+                    t("dlg.duplicate.title"),
+                    t("dlg.duplicate.ask_price", name=name),
+                    initialvalue=initial, parent=self,
+                )
+                if ans is None or ans == "":
+                    # User cancelled the price prompt — treat as "skip
+                    # this row" rather than aborting the whole batch.
+                    continue
+                try:
+                    new_price = float(ans.replace(",", "."))
+                except ValueError:
+                    messagebox.showerror(
+                        t("dlg.error.title"), t("dlg.bad_number"),
+                        parent=self,
+                    )
+                    continue
+
+            # Spawn the copy. New uuid so the Treeview iid is unique;
+            # status / last_seen reset so the duplicate doesn't inherit
+            # the original's "alerted" / "rate_limited" tag.
+            new_rec = {
+                **src,
+                "id": str(uuid.uuid4()),
+                "target_price": new_price,
+                "status": "",
+                "last_seen": "—",
+            }
+            items.append(new_rec)
+            new_count += 1
+
+        if new_count:
+            save_json(path, items)
+        self._refresh_card_list(kind)
+        if cancelled:
+            log.info("duplicate batch cancelled by user; added %d rows so far",
+                     new_count)
+        if new_count:
+            self._set_status(f"Здубльовано: {new_count}")
+
+    def _ask_duplicate_action(self, name: str, price) -> str:
+        """4-button modal: same / new / skip / cancel.
+
+        Same pattern as `_ask_sell_conflict` but with the per-action
+        labels and intent of the duplicate flow. Blocks via `wait_window`
+        until the user picks one; returns one of the literal strings.
+        """
+        result = {"choice": "cancel"}  # default if window closed via X
+
+        dlg = tk.Toplevel(self)
+        dlg.title(t("dlg.duplicate.title"))
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        outer = ttk.Frame(dlg, padding=14)
+        outer.pack(fill=BOTH, expand=YES)
+        price_fmt = (f"{price:.2f}" if isinstance(price, (int, float))
+                     else str(price))
+        ttk.Label(
+            outer,
+            text=t("dlg.duplicate.body", name=name, price=price_fmt),
+            wraplength=420, justify=LEFT,
+        ).pack(anchor=W, pady=(0, 12))
+
+        def pick(value: str) -> None:
+            result["choice"] = value
+            try:
+                dlg.grab_release()
+            except tk.TclError:
+                pass
+            dlg.destroy()
+
+        # Top row — constructive choices (same / new) in success/info.
+        row1 = ttk.Frame(outer)
+        row1.pack(fill=X)
+        ttk.Button(
+            row1, text=t("dlg.duplicate.same"), bootstyle="success",
+            command=lambda: pick("same"),
+        ).pack(side=LEFT, padx=(0, 6), expand=YES, fill=X)
+        ttk.Button(
+            row1, text=t("dlg.duplicate.new_price"), bootstyle="info",
+            command=lambda: pick("new"),
+        ).pack(side=LEFT, expand=YES, fill=X)
+        # Bottom row — skip / cancel (neutral / destructive).
+        row2 = ttk.Frame(outer)
+        row2.pack(fill=X, pady=(6, 0))
+        ttk.Button(
+            row2, text=t("dlg.duplicate.skip"), bootstyle="secondary",
+            command=lambda: pick("skip"),
+        ).pack(side=LEFT, padx=(0, 6), expand=YES, fill=X)
+        ttk.Button(
+            row2, text=t("dlg.duplicate.cancel"), bootstyle="danger",
+            command=lambda: pick("cancel"),
+        ).pack(side=LEFT, expand=YES, fill=X)
+
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_reqheight()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.protocol("WM_DELETE_WINDOW", lambda: pick("cancel"))
+        dlg.wait_window()
+        return result["choice"]
 
     def _remove_card(self):
         from steam import pretty_name
@@ -3426,18 +3819,652 @@ class App(tb.Window):
         self._refresh_card_list(kind)
 
     def _import_from_steam(self):
-        """Placeholder for the Phase-3 «Import from Steam» feature.
+        """Open the Steam-import dialog scoped to the current tab's list.
 
-        When fully wired, this will fetch the user's active Steam Market
-        listings (sell tab) or buy orders (buy tab) and offer to sync them
-        with the local watchlist/salelist — see DESIGN.md «Phase 3» for
-        the full conflict-resolution flow (new → add, same price → skip,
-        different price → ask). For now the button just announces that
-        the feature is in development, so the UI slot stays visible and
-        the keyboard / mouse focus path is exercised.
+        The list we're looking at decides which side of Steam we ask for:
+
+          * Purchase tab → only buy orders (watchlist sync target).
+          * Sales tab    → only sale listings (salelist sync target).
+
+        Pre-flight: we need cookies. Tier 3 (manual ID) leaves
+        `steam.cookies` empty; without an authenticated session we'd
+        just bounce off Steam's login page, so we point the user at
+        the right Settings button instead.
         """
-        messagebox.showinfo(t("dlg.import.title"),
-                            t("dlg.import.in_development"), parent=self)
+        kind = self._active_kind()
+        if kind not in ("buy", "sell"):
+            # Button only exists on card-list tabs, but be defensive.
+            return
+
+        cookies = (self.config_data.get("steam") or {}).get("cookies")
+        community = (cookies or {}).get("steamcommunity.com") or {}
+        if "steamLoginSecure" not in community:
+            messagebox.showinfo(
+                t("dlg.import.title"),
+                t("dlg.import.no_cookies"),
+                parent=self,
+            )
+            return
+
+        # Refuse double-stack — the dialog mutates instance state
+        # (`_import_*`) that re-entry would tangle.
+        existing = getattr(self, "_import_dlg", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        self._open_import_dialog(cookies, kind)
+
+    def _open_import_dialog(self, cookies: dict, kind: str) -> None:
+        """Build the import Toplevel and start the background fetch.
+
+        `kind` controls which side of Steam we'll surface — "buy" pulls
+        only buy orders, "sell" pulls only sale listings. Modal-ish via
+        `transient` + `grab_set`; the actual fetch runs on a daemon
+        thread so the UI stays responsive while Steam responds (a slow
+        market home page can take 2-3 sec).
+        """
+        self._import_kind = kind
+        dlg = tk.Toplevel(self)
+        self._import_dlg = dlg
+        dlg.title(t("dlg.import.title"))
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.geometry("780x520")
+
+        outer = ttk.Frame(dlg, padding=12)
+        outer.pack(fill=BOTH, expand=YES)
+
+        # Status line at the top — narrow, no expand. Just used during
+        # the loading phase to tell the user we're talking to Steam.
+        self._import_status = ttk.Label(outer, text=t("dlg.import.loading"))
+        self._import_status.pack(side=TOP, anchor=W, pady=(0, 8), fill=X)
+
+        # Button row BEFORE the content area — packing it with side=BOTTOM
+        # reserves its slot first so the expanding section above can't push
+        # it off-screen on a tall payload (18 listings + 1 buy order would
+        # otherwise need a much taller dialog before the buttons came back
+        # into view). Same trick the main UI uses for the status bar vs
+        # notebook.
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(side=BOTTOM, fill=X, pady=(10, 0))
+        # "Cancel" on the left in danger-red — easy to bail out without
+        # confusing it with the success-coloured apply button.
+        ttk.Button(
+            btn_row, text=t("dlg.import.btn_cancel"),
+            bootstyle="danger",
+            command=self._close_import_dialog,
+        ).pack(side=LEFT)
+        # Apply button starts disabled; `_on_import_selection_change`
+        # flips it on as soon as something gets ticked. Success bootstyle
+        # = green, the obvious "go" colour.
+        self._import_apply_btn = ttk.Button(
+            btn_row, text=t("dlg.import.btn_import"),
+            bootstyle="success", state=DISABLED,
+            command=self._apply_import_selection,
+        )
+        self._import_apply_btn.pack(side=RIGHT)
+
+        # Content area fills the remaining space between status and buttons.
+        self._import_content = ttk.Frame(outer)
+        self._import_content.pack(side=TOP, fill=BOTH, expand=YES)
+
+        dlg.protocol("WM_DELETE_WINDOW", self._close_import_dialog)
+
+        # Centre over parent. update_idletasks first so reqsize is real.
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 4
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        # We render exactly one Treeview — the side of Steam matching
+        # the active tab. Stored on self so the apply step can walk it.
+        self._import_tree: ttk.Treeview | None = None
+        # iid → fetched dict, populated when the section is built.
+        self._import_rows: dict[str, dict] = {}
+
+        # Kick off the fetch. Whichever side isn't relevant for `kind`
+        # we skip — saves a network request and keeps the UI focused
+        # on the one operation the user actually clicked.
+        def worker() -> None:
+            import steam
+            err: str | None = None
+            payload: list[dict] = []
+            try:
+                if kind == "sell":
+                    payload = steam.fetch_market_listings(cookies)
+                else:
+                    payload = steam.fetch_buy_orders(cookies)
+            except Exception as e:
+                err = str(e)
+                log.exception("import fetch failed")
+            self.after(0, lambda: self._import_render_section(payload, err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _close_import_dialog(self) -> None:
+        """Tear down the import dialog + clear the instance ref."""
+        dlg = getattr(self, "_import_dlg", None)
+        if dlg is None:
+            return
+        try:
+            dlg.grab_release()
+        except tk.TclError:
+            pass
+        self._import_dlg = None
+        try:
+            dlg.destroy()
+        except tk.TclError:
+            pass
+
+    def _import_render_section(self, rows: list[dict],
+                               err: str | None) -> None:
+        """Populate the dialog with a single CheckListBox-like Treeview.
+
+        Called on the Tk main thread once the fetch worker returns.
+        Three terminal states:
+
+          * error → status line goes red, no section rendered.
+          * empty → status line says "nothing to import".
+          * data  → status line clears; the section appears with rows
+                    pre-selected when importing them would actually do
+                    something. "same" rows stay deselected (no-op).
+
+        Status classification differs slightly for sales vs buys:
+
+          * Buys (watchlist — one entry per mhn): plain match on
+            (appid, mhn). Same target → "same", different → "changed".
+          * Sales (salelist — duplicates allowed): consume one local
+            row per Steam row. Local copy with exact-price match is
+            preferred → "same"; else first remaining local at a
+            different price → "changed"; otherwise → "new". This
+            handles "I have 2 copies at P, Steam has 3 at P": the
+            third Steam row correctly classifies as "new" so the
+            user can pick it up.
+        """
+        if not self._import_dlg or not self._import_dlg.winfo_exists():
+            # User cancelled during fetch.
+            return
+
+        if err:
+            self._import_status.configure(
+                text=t("dlg.import.network_error", err=err),
+                foreground=self.style.colors.danger,
+            )
+            return
+        if not rows:
+            self._import_status.configure(
+                text=t("dlg.import.nothing_found"),
+                foreground=self.style.colors.warning,
+            )
+            return
+
+        # Greyed-out status — done loading; real action is in the section.
+        self._import_status.configure(
+            text="", foreground=self.style.colors.secondary,
+        )
+
+        kind = self._import_kind
+        local_rows = load_json(
+            SALELIST_PATH if kind == "sell" else WATCHLIST_PATH, []
+        ) or []
+
+        if kind == "sell":
+            self._classify_sales(rows, local_rows)
+            title = t("dlg.import.section_sales", count=len(rows))
+        else:
+            self._classify_buys(rows, local_rows)
+            title = t("dlg.import.section_buy", count=len(rows))
+
+        self._import_tree = self._build_import_section(
+            self._import_content,
+            title=title, rows=rows, row_store=self._import_rows,
+        )
+        # Wire the apply button to follow the selection state.
+        self._import_tree.bind("<<TreeviewSelect>>",
+                               self._on_import_selection_change)
+        # Make sure the initial pre-selection enables the button.
+        self._on_import_selection_change()
+
+    @staticmethod
+    def _classify_buys(steam_rows: list[dict],
+                       local_rows: list[dict]) -> None:
+        """Annotate each Steam buy-order with `_import_status` in place.
+
+        Buy orders are unique-per-mhn in the watchlist, so the match
+        rule is simple: any local entry with the same (appid, mhn)
+        wins; price comparison gives us "same" vs "changed:<old>".
+        """
+        for s in steam_rows:
+            appid, mhn = s["appid"], s["market_hash_name"]
+            price = s.get("price")
+            match = next(
+                (r for r in local_rows
+                 if r.get("appid") == appid
+                 and (r.get("market_hash_name") or r.get("name")) == mhn),
+                None,
+            )
+            if match is None:
+                s["_import_status"] = "new"
+                continue
+            old = match.get("target_price")
+            if old is not None and price is not None \
+                    and abs(float(old) - float(price)) < 0.005:
+                s["_import_status"] = "same"
+            else:
+                s["_import_status"] = f"changed:{old}"
+
+    @staticmethod
+    def _classify_sales(steam_rows: list[dict],
+                        local_rows: list[dict]) -> None:
+        """Annotate Steam sale listings with `_import_status` in place.
+
+        Count-aware: salelist allows multiple copies of the same card,
+        so for each Steam listing we try to consume one matching local
+        copy. Exact-price matches consume first, then any remaining
+        local at a different price counts as "changed", then the
+        leftover Steam rows are flagged "new".
+
+        Example: Steam shows 3 copies of card X at price P; local has
+        2 copies at P. Two Steam rows match "same" and consume both
+        locals; the third Steam row finds nothing left → "new".
+        Importing that last row brings local up to 3, mirroring Steam.
+        """
+        # Build a working list per mhn we can pop from as matches consume.
+        # `defaultdict(list)` would be cleaner but introducing the import
+        # for one use site isn't worth the line.
+        avail: dict[tuple, list[dict]] = {}
+        for r in local_rows:
+            key = (r.get("appid"),
+                   r.get("market_hash_name") or r.get("name"))
+            avail.setdefault(key, []).append(r)
+
+        for s in steam_rows:
+            key = (s["appid"], s["market_hash_name"])
+            price = s.get("price")
+            pool = avail.get(key, [])
+            if not pool:
+                s["_import_status"] = "new"
+                continue
+            # Prefer an exact-price match so a "same" doesn't get
+            # consumed by a "changed" that came first in the list.
+            chosen_idx = None
+            for i, r in enumerate(pool):
+                old = r.get("target_price")
+                if old is not None and price is not None \
+                        and abs(float(old) - float(price)) < 0.005:
+                    chosen_idx = i
+                    break
+            if chosen_idx is not None:
+                pool.pop(chosen_idx)
+                s["_import_status"] = "same"
+            else:
+                old = pool.pop(0).get("target_price")
+                s["_import_status"] = f"changed:{old}"
+
+    def _on_import_selection_change(self, _event=None) -> None:
+        """Enable/disable the apply button based on row selection state.
+
+        Apply is meaningful only when the user has at least one row
+        ticked — otherwise the import would be a no-op and the green
+        button would be lying about what it does.
+        """
+        if self._import_tree is None or not self._import_apply_btn:
+            return
+        has_selection = bool(self._import_tree.selection())
+        self._import_apply_btn.configure(
+            state=NORMAL if has_selection else DISABLED,
+        )
+
+    def _build_import_section(self, parent, *, title: str,
+                              rows: list[dict], row_store: dict[str, dict]):
+        """Build the one Treeview section that lives inside the dialog.
+
+        Visual contract:
+          [LabelFrame: <title>]
+            [Toolbar] [Select all] [Clear all]
+            [Treeview: Card | Game | Price | Status] + vertical scrollbar
+
+        Multi-select Treeview (`selectmode="extended"`) — the "checked"
+        rows are simply the selected rows. Rows whose status is "new"
+        or "changed:" get pre-selected because importing them does
+        something; "same" rows stay deselected (they'd be a no-op).
+
+        Ctrl+A → select every row, same convention as the other tabs.
+        """
+        frame = ttk.LabelFrame(parent, text=title, padding=8)
+        frame.pack(fill=BOTH, expand=YES, pady=(0, 8))
+
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill=X, pady=(0, 4))
+
+        cols = ("card", "game", "price", "status")
+        col_headings = (
+            t("dlg.import.col_card"),
+            t("dlg.import.col_game"),
+            t("dlg.import.col_price"),
+            t("dlg.import.col_status"),
+        )
+        tree = ttk.Treeview(
+            frame, columns=cols, show="headings", selectmode="extended",
+            height=min(12, max(3, len(rows))),
+        )
+        for c, h in zip(cols, col_headings):
+            tree.heading(c, text=h)
+        tree.column("card", width=240, anchor=W)
+        tree.column("game", width=180, anchor=W)
+        tree.column("price", width=80, anchor=E)
+        tree.column("status", width=180, anchor=W)
+
+        # Match the green-thumb scrollbars used in the main card-list
+        # tabs. `bootstyle="success"` tints the ttkbootstrap-rendered
+        # thumb image — plain `style.configure` doesn't reach it because
+        # ttkbootstrap paints thumbs from PhotoImage assets.
+        vsb = ttk.Scrollbar(frame, orient=VERTICAL, command=tree.yview,
+                            bootstyle="success")
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side=LEFT, fill=BOTH, expand=YES)
+        vsb.pack(side=RIGHT, fill=Y)
+
+        # "same"-status rows render in the muted secondary colour so the
+        # user can tell at a glance which rows are duplicates (no-op on
+        # import). Configured here once, applied via tags on insert.
+        tree.tag_configure("muted",
+                           foreground=self.style.colors.secondary)
+
+        pre_select: list[str] = []
+        for r in rows:
+            stat = r.get("_import_status", "new")
+            if stat == "new":
+                stat_text = t("dlg.import.status.new")
+            elif stat == "same":
+                stat_text = t("dlg.import.status.same")
+            elif stat.startswith("changed:"):
+                old = stat.split(":", 1)[1]
+                stat_text = t(
+                    "dlg.import.status.changed",
+                    old=f"{float(old):.2f}" if old not in (None, "None") else "—",
+                    new=f"{r['price']:.2f}",
+                )
+            else:
+                stat_text = stat
+            row_tags = ("muted",) if stat == "same" else ()
+            iid = tree.insert("", "end", values=(
+                r.get("display_name") or r.get("market_hash_name") or "?",
+                r.get("game_name") or "",
+                r.get("price_raw") or f"{r.get('price', 0):.2f}",
+                stat_text,
+            ), tags=row_tags)
+            row_store[iid] = r
+            if stat == "new" or stat.startswith("changed:"):
+                pre_select.append(iid)
+
+        if pre_select:
+            tree.selection_set(*pre_select)
+
+        # Ctrl+A — same handler as the main card-list / history trees,
+        # uses event.keycode so it works on Cyrillic layouts too.
+        tree.bind("<Control-KeyPress>", self._on_tree_ctrl_a)
+
+        # Select all / clear all buttons use the same iids we just inserted.
+        ttk.Button(
+            toolbar, text=t("dlg.import.toggle_all"), bootstyle="link",
+            command=lambda tr=tree: tr.selection_set(*tr.get_children()),
+        ).pack(side=LEFT)
+        ttk.Button(
+            toolbar, text=t("dlg.import.toggle_none"), bootstyle="link",
+            command=lambda tr=tree: tr.selection_remove(*tr.get_children()),
+        ).pack(side=LEFT, padx=(8, 0))
+
+        return tree
+
+    def _apply_import_selection(self) -> None:
+        """Walk the tree, persist additions/updates, close the dialog.
+
+        Decision matrix per row, depending on `_import_status`:
+
+          Buys (watchlist — deduped by mhn):
+            * "new"          → append fresh row.
+            * "same"         → silently skip (no-op even if selected).
+            * "changed:<old>"→ modal Yes/No "Replace target X → Y?".
+                               Yes updates the existing row's
+                               target_price; No leaves it alone.
+
+          Sales (salelist — duplicates allowed):
+            * "new"          → append fresh row.
+            * "same"         → silently skip.
+            * "changed:<old>"→ modal per-row 4-button dialog:
+                * Replace → update existing row's target.
+                * Add +1  → append as a fresh copy (so we end up with
+                            one more local row at the Steam price).
+                * Skip    → no-op for this row.
+                * Cancel  → abort the rest of the import. Already-
+                            decided rows stay applied.
+        """
+        if self._import_tree is None:
+            return
+
+        kind = self._import_kind
+        path = SALELIST_PATH if kind == "sell" else WATCHLIST_PATH
+        rows = load_json(path, []) or []
+        added = updated = 0
+        cancelled = False
+
+        for iid in self._import_tree.selection():
+            src = self._import_rows[iid]
+            stat = src.get("_import_status", "new")
+
+            if stat == "new":
+                rows.append(self._import_make_record(src))
+                added += 1
+                continue
+            if stat == "same":
+                # Already in sync — even a selected "same" is a no-op
+                # by design, so the user can't accidentally double-add.
+                continue
+
+            # stat is "changed:<old>"
+            old_target = stat.split(":", 1)[1]
+            try:
+                old_fmt = f"{float(old_target):.2f}"
+            except (TypeError, ValueError):
+                old_fmt = str(old_target)
+            new_fmt = f"{src.get('price', 0):.2f}"
+            name = src.get("display_name") or src.get("market_hash_name") or "?"
+
+            if kind == "buy":
+                # Yes/No: replace the target or leave it alone.
+                if messagebox.askyesno(
+                    t("dlg.import.conflict.title"),
+                    t("dlg.import.conflict.buy_body",
+                      name=name, old=old_fmt, new=new_fmt),
+                    parent=self._import_dlg,
+                ):
+                    self._import_update_target(rows, src)
+                    updated += 1
+                # else: skip silently.
+                continue
+
+            # kind == "sell" → 4-button modal.
+            choice = self._ask_sell_conflict(name, old_fmt, new_fmt)
+            if choice == "replace":
+                self._import_update_target(rows, src)
+                updated += 1
+            elif choice == "add":
+                rows.append(self._import_make_record(src))
+                added += 1
+            elif choice == "skip":
+                pass  # silent skip — selected but user vetoed
+            elif choice == "cancel":
+                cancelled = True
+                break
+
+        save_json(path, rows)
+        # Both card-list panes share `_refresh_watchlist` because either
+        # of them might have grown rows that need to render.
+        self._refresh_watchlist()
+        self._close_import_dialog()
+
+        # Summary uses the same keys for both kinds; the irrelevant pair
+        # stays at zero, which reads cleanly enough.
+        if kind == "sell":
+            sell_new, sell_upd, buy_new, buy_upd = added, updated, 0, 0
+        else:
+            sell_new, sell_upd, buy_new, buy_upd = 0, 0, added, updated
+        messagebox.showinfo(
+            t("dlg.import.title"),
+            t("dlg.import.summary",
+              sell_new=sell_new, sell_upd=sell_upd,
+              buy_new=buy_new, buy_upd=buy_upd),
+            parent=self,
+        )
+        if cancelled:
+            # Soft note that the import didn't finish. No-op when the
+            # user explicitly clicked "Cancel import" — they already
+            # know — but easy to skip if it gets noisy in feedback.
+            log.info("import cancelled by user mid-flow")
+
+    def _ask_sell_conflict(self, name: str, old: str, new: str) -> str:
+        """Modal 4-button conflict dialog for sale-side imports.
+
+        Returns one of:
+          * "replace" → update the existing salelist row's price.
+          * "add"     → add a new copy with the Steam price.
+          * "skip"    → leave both alone, move on to the next row.
+          * "cancel"  → bail out of the import; already-applied rows stay.
+
+        Custom Toplevel because `messagebox` tops out at 3 buttons. The
+        dialog grabs focus and blocks the calling apply loop until the
+        user picks one — `wait_window` does the heavy lifting.
+        """
+        result = {"choice": "cancel"}  # default if window is closed via X
+
+        dlg = tk.Toplevel(self._import_dlg or self)
+        dlg.title(t("dlg.import.conflict.title"))
+        dlg.transient(self._import_dlg or self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        outer = ttk.Frame(dlg, padding=14)
+        outer.pack(fill=BOTH, expand=YES)
+        ttk.Label(
+            outer,
+            text=t("dlg.import.conflict.sell_body",
+                   name=name, old=old, new=new),
+            wraplength=420, justify=LEFT,
+        ).pack(anchor=W, pady=(0, 12))
+
+        def pick(value: str) -> None:
+            result["choice"] = value
+            try:
+                dlg.grab_release()
+            except tk.TclError:
+                pass
+            dlg.destroy()
+
+        # Button row. Top row holds the "constructive" choices (replace
+        # / add) in success/info colours; bottom row carries the
+        # "destructive-ish" ones (skip / cancel).
+        row1 = ttk.Frame(outer)
+        row1.pack(fill=X)
+        ttk.Button(
+            row1, text=t("dlg.import.conflict.replace"), bootstyle="success",
+            command=lambda: pick("replace"),
+        ).pack(side=LEFT, padx=(0, 6), expand=YES, fill=X)
+        ttk.Button(
+            row1, text=t("dlg.import.conflict.add_one"), bootstyle="info",
+            command=lambda: pick("add"),
+        ).pack(side=LEFT, expand=YES, fill=X)
+        row2 = ttk.Frame(outer)
+        row2.pack(fill=X, pady=(6, 0))
+        ttk.Button(
+            row2, text=t("dlg.import.conflict.skip"), bootstyle="secondary",
+            command=lambda: pick("skip"),
+        ).pack(side=LEFT, padx=(0, 6), expand=YES, fill=X)
+        ttk.Button(
+            row2, text=t("dlg.import.conflict.cancel"), bootstyle="danger",
+            command=lambda: pick("cancel"),
+        ).pack(side=LEFT, expand=YES, fill=X)
+
+        # Centre + focus + block until decision.
+        dlg.update_idletasks()
+        px = (self._import_dlg or self).winfo_rootx()
+        py = (self._import_dlg or self).winfo_rooty()
+        pw = (self._import_dlg or self).winfo_width()
+        ph = (self._import_dlg or self).winfo_height()
+        x = px + (pw - dlg.winfo_reqwidth()) // 2
+        y = py + (ph - dlg.winfo_reqheight()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.protocol("WM_DELETE_WINDOW", lambda: pick("cancel"))
+        dlg.wait_window()
+        return result["choice"]
+
+    @staticmethod
+    def _import_make_record(src: dict) -> dict:
+        """Turn a Steam-side dict into a watchlist/salelist entry.
+
+        `image_url` is intentionally `None` — the GUI's metadata
+        backfill thread (`_backfill_metadata`) will fill it in on the
+        next run, so we don't slow down the import by hitting Steam
+        Store once per imported card.
+
+        `imported` and `item_type` are the new fields surfaced as their
+        own columns in the card-list tab; we set them here so synced
+        rows render with both a 📥 marker AND a split-out "type" cell
+        from the get-go.
+        """
+        from steam import split_game_and_type
+        mhn = src.get("market_hash_name") or ""
+        # Steam's market_listing_game_name smushes "game — type" or
+        # "game type" into one string; split it so the tab can show
+        # them in separate columns.
+        game, item_type = split_game_and_type(src.get("game_name") or "")
+        return {
+            "id":               str(uuid.uuid4()),
+            "name":             mhn,             # legacy alias
+            "appid":            src.get("appid"),
+            "market_hash_name": mhn,
+            "display_name":     src.get("display_name") or "",
+            "game_name":        game or (src.get("game_name") or ""),
+            "item_type":        item_type,
+            "imported":         True,
+            "image_url":        None,
+            "target_price":     src.get("price"),
+            "status":           "",
+            "last_seen":        "—",
+        }
+
+    @staticmethod
+    def _import_update_target(rows: list[dict], src: dict) -> None:
+        """Replace the first row matching `src` with fresh Steam data.
+
+        Updates target_price plus the import-side metadata (item_type,
+        cleaned game_name) and stamps `imported=True` so the 📥 marker
+        in the card-list shows up regardless of whether this row was
+        originally manually added or already imported. The "imported"
+        flag is a "this row's price came from Steam" claim — a Steam-
+        driven update qualifies just as much as a Steam-driven insert.
+
+        The flag gets cleared the moment the user manually edits the
+        target via «Змінити ціль» — see `_edit_target` for that side.
+        """
+        from steam import split_game_and_type
+        game, item_type = split_game_and_type(src.get("game_name") or "")
+        appid = src.get("appid")
+        mhn = src.get("market_hash_name") or ""
+        new_price = src.get("price")
+        for r in rows:
+            if r.get("appid") == appid and \
+                    (r.get("market_hash_name") or r.get("name")) == mhn:
+                r["target_price"] = new_price
+                r["imported"] = True
+                r["item_type"] = item_type
+                # Refresh game_name if Steam has a cleaner version
+                # (older manually-added rows often have "—" here).
+                if game:
+                    r["game_name"] = game
+                return
 
     def _move_to_other_list(self):
         """Move selected card(s) from the active list to the other one.
