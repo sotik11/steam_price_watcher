@@ -52,6 +52,18 @@ log.setLevel(logging.INFO)
 # lines in any case.
 log.propagate = False
 
+# Sibling loggers — steam.py / telegram.py / alerts.py / browser_cookies.py
+# each set up their own `logging.getLogger("<name>")` at module level
+# with no handler attached. Without this, anything they log from a GUI
+# context goes to /dev/null and we lose the diagnostic trail (e.g.
+# wallet-info parsing warnings). Tee them into the same file handler
+# so the Журнал tab and watch.log capture them too.
+for _name in ("steam", "telegram", "alerts", "browser_cookies"):
+    _sib = logging.getLogger(_name)
+    _sib.addHandler(_gui_log_handler)
+    _sib.setLevel(logging.INFO)
+    _sib.propagate = False
+
 # Map a kind ("buy" / "sell") to its on-disk store. The two share a schema
 # and most of the GUI surface, but live in separate files so they can be
 # managed independently.
@@ -1388,7 +1400,7 @@ class App(tb.Window):
         threading.Thread(target=worker, daemon=True).start()
 
     def _refresh_wallet_balance(self) -> None:
-        """Pull the wallet balance from store.steampowered.com in a thread.
+        """Pull wallet balance + currency + country in a worker thread.
 
         Tier 2 (browser cookies) is the only login flow that gets us a
         real session; Tier 3 (manual ID) leaves `steam.cookies` empty
@@ -1396,12 +1408,19 @@ class App(tb.Window):
         applies after a Disconnect — `_disconnect_steam` wipes cookies
         AND resets the balance label to the placeholder.
 
-        `steam.fetch_wallet_balance` returns the formatted string Steam
-        served (handles locale and currency itself), so we pass it
-        straight through to `_update_user_widget`. None means either
-        no cookies or session expired — leave the existing label alone
-        and log a warning (the wallet fetch is best-effort polish, not
-        a critical path).
+        Beyond the floating-widget balance string, this also reads the
+        account's wallet_currency + wallet_country and pushes them
+        into `config.json.market`. Why here: the account page (the
+        only Steam endpoint we already authenticate against) carries
+        all three pieces of info in one request, so a single call
+        synchronises everything. Without this, the Settings pickers
+        would lie about the live account after a cookies login —
+        which is exactly the bug the user hit.
+
+        Persisted fields (`market.currency`, `market.country`) drive
+        Steam-Market polling and the History totals symbol, so getting
+        them in sync with the actual Steam account is what makes the
+        rest of the GUI honest about which locale we're operating in.
         """
         import steam
 
@@ -1412,15 +1431,113 @@ class App(tb.Window):
 
         def worker() -> None:
             try:
-                balance = steam.fetch_wallet_balance(cookies)
+                info = steam.fetch_wallet_info(cookies)
             except Exception as e:
                 log.warning("wallet refresh raised: %s", e)
                 return
-            if balance is None:
+            if not info:
                 return
-            self.after(0, lambda b=balance: self._update_user_widget(balance=b))
+            self.after(0, lambda i=info: self._apply_wallet_info(i))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_wallet_info(self, info: dict) -> None:
+        """Tk-thread half of `_refresh_wallet_balance` — apply fetched info.
+
+        Receives a dict from `steam.fetch_wallet_info` with the keys
+        balance, currency, country (any can be None independently).
+        Updates floating widget + Settings pickers + persisted config.
+
+        We re-load config from disk before writing so we don't clobber
+        unrelated keys written by another process (watch.py mutates
+        `state.json` but not config.json — still, the load-merge
+        pattern keeps us future-proof).
+        """
+        balance = info.get("balance")
+        currency = info.get("currency")
+        country = info.get("country")
+
+        if balance:
+            self._update_user_widget(balance=balance)
+
+        # Persist currency/country to config.market when they differ
+        # from what's there now. Skip when fields are None — `fetch_wallet_info`
+        # leaves them None if the page didn't carry the data, and we
+        # don't want to wipe a user-set value over that.
+        market = self.config_data.setdefault("market", {})
+        changed = False
+        if currency is not None and market.get("currency") != currency:
+            market["currency"] = currency
+            changed = True
+        if country and market.get("country") != country:
+            market["country"] = country
+            changed = True
+        if changed:
+            try:
+                on_disk = load_json(CONFIG_PATH) or {}
+            except Exception:
+                on_disk = {}
+            on_disk_market = on_disk.setdefault("market", {})
+            if currency is not None:
+                on_disk_market["currency"] = currency
+            if country:
+                on_disk_market["country"] = country
+            try:
+                save_json(CONFIG_PATH, on_disk)
+            except Exception as e:
+                log.warning("could not persist market region from wallet: %s", e)
+
+        # Push the new values into the Settings pickers so the user
+        # sees them updated immediately (without having to close and
+        # reopen the tab). Combobox `set()` updates the visible label;
+        # `var_currency`/`var_country` get updated so Save still sees
+        # the right values.
+        self._sync_market_pickers()
+
+        # History totals carry the currency symbol — recompute on the
+        # tab so a freshly-applied account currency takes effect
+        # without a restart. Guarded so we don't trip pre-build.
+        if changed and hasattr(self, "_refresh_history"):
+            try:
+                self._refresh_history()
+            except tk.TclError:
+                pass
+
+    def _sync_market_pickers(self) -> None:
+        """Reflect `config.market.currency`/`country` in Settings pickers.
+
+        Idempotent — safe to call even if Settings tab hasn't been
+        built yet (just bails). Used after a cookies-tier login to
+        push the account's wallet region into the visible dropdowns.
+        """
+        from regions import (STEAM_CURRENCIES, STEAM_COUNTRIES,
+                             currency_label, country_label)
+        market = self.config_data.get("market") or {}
+        cur_code = market.get("currency")
+        cnt_iso = market.get("country")
+
+        cb_cur = getattr(self, "_cb_currency", None)
+        cb_cnt = getattr(self, "_cb_country", None)
+        var_cur = getattr(self, "var_currency", None)
+        var_cnt = getattr(self, "var_country", None)
+
+        if cur_code is not None and cb_cur is not None and var_cur is not None:
+            try:
+                var_cur.set(int(cur_code))
+                if int(cur_code) in STEAM_CURRENCIES:
+                    cb_cur.set(currency_label(int(cur_code)))
+            except (tk.TclError, ValueError):
+                pass
+
+        if cnt_iso and cb_cnt is not None and var_cnt is not None:
+            try:
+                var_cnt.set(cnt_iso)
+                name = next((n for iso, n, _c in STEAM_COUNTRIES
+                             if iso == cnt_iso), None)
+                if name:
+                    cb_cnt.set(country_label(cnt_iso, name))
+            except tk.TclError:
+                pass
 
     def _open_steam_login_dialog(self) -> None:
         """Three-tier login dialog. Tier 3 (manual ID) is fully wired.
@@ -1712,6 +1829,9 @@ class App(tb.Window):
             except tk.TclError:
                 pass
         self._steam_dlg_refresh_connected_state()
+        # Now that we have a Steam ID, Currency + Country must lock to
+        # the account's region — see _update_currency_country_state.
+        self._update_currency_country_state()
 
     def _steam_dlg_disconnect(self) -> None:
         """Clear `config.json.steam`, reset widget to the placeholder.
@@ -1758,6 +1878,9 @@ class App(tb.Window):
         self._steam_dlg_set_status(
             t("dlg.steam_login.status_disconnected"), kind="muted",
         )
+        # No account → Currency + Country become editable display
+        # prefs again.
+        self._update_currency_country_state()
 
     def _steam_dlg_set_status(self, text: str, kind: str = "muted") -> None:
         """Recolour + retext the dialog's status line.
@@ -2269,14 +2392,20 @@ class App(tb.Window):
     def _kind_path(kind: str) -> Path:
         return LIST_PATHS[kind]
 
-    # Steam Market currency code → display symbol. Used by history totals.
-    # Codes come from Steam Market API; the four below are the only ones we
-    # actually offer in the Settings dropdown.
-    _CURRENCY_SYMBOLS = {1: "$", 3: "€", 5: "₽", 18: "₴"}
+    # Steam Market currency code → display symbol. Now sourced from
+    # `regions.CURRENCY_SYMBOLS` so the Settings currency dropdown, the
+    # floating-widget balance placeholder, and the History totals stay
+    # in sync — a single source of truth covers all 39 Steam currencies
+    # instead of the legacy four.
+    @property
+    def _CURRENCY_SYMBOLS(self) -> dict:
+        from regions import CURRENCY_SYMBOLS
+        return CURRENCY_SYMBOLS
 
     def _currency_symbol(self) -> str:
+        from regions import currency_symbol
         code = self.config_data.get("market", {}).get("currency", 18)
-        return self._CURRENCY_SYMBOLS.get(code, "")
+        return currency_symbol(code, fallback="")
 
     # ------------------------------------------------------------------
     # Native Windows title-bar tinting via DWM
@@ -4581,13 +4710,21 @@ class App(tb.Window):
     # ---- Settings --------------------------------------------------------
 
     def _build_settings_tab(self):
-        f = ttk.Frame(self.tab_settings, padding=12)
-        f.pack(fill=BOTH, expand=YES)
+        """Two-column form for app settings.
 
-        def row(label_key, row_idx):
-            ttk.Label(f, text=t(label_key), width=24, anchor=E
-                      ).grid(row=row_idx, column=0, sticky=E, pady=4, padx=(0, 8))
+        Left column: text/dropdown form fields (token, chat ID, theme,
+        language, font scale). Standard "label → input" alignment.
+        Right column: numeric/short fields (currency, country, interval,
+        poll delay, antispam). Inverse "input → label" alignment so the
+        small spinboxes and dropdowns sit closer to the page centre and
+        leave room for the labels on the right edge.
 
+        Below the two columns: full-width template editor. Variables and
+        HTML cheatsheet are split into two separate lines for readability.
+
+        Bottom: Steam-login button on the left, Test-message + "Telegram"
+        anchor label on the right, then a centred Save / Reset row.
+        """
         cfg = self.config_data
         tg = cfg.get("telegram", {})
         mkt = cfg.get("market", {})
@@ -4595,92 +4732,79 @@ class App(tb.Window):
         ui = cfg.get("ui", {})
         spam = cfg.get("antispam", {})
 
-        # Token + Chat ID are readonly by default with a small ✏ button
-        # next to them — protects against accidental edits (one missing
-        # character in a 40-char bot token is enough to break TG sends).
-        # The button toggles to ✓ while editing and back to ✏ on confirm.
-        row("lbl.bot_token", 0)
+        outer = ttk.Frame(self.tab_settings, padding=12)
+        outer.pack(fill=BOTH, expand=YES)
+
+        # ---- Two-column form (top) -----------------------------------
+        cols = ttk.Frame(outer)
+        cols.pack(fill=X, pady=(0, 12))
+        # weight=0 on each column — fixed-width left/right blocks with
+        # a stretchy gap (col 2) absorbing extra horizontal space at
+        # bigger window widths. Keeps fields tight against their labels.
+        cols.columnconfigure(0, weight=0)   # left labels
+        cols.columnconfigure(1, weight=0)   # left fields
+        cols.columnconfigure(2, weight=1)   # gap absorber
+        cols.columnconfigure(3, weight=0)   # right fields
+        cols.columnconfigure(4, weight=0)   # right labels
+
+        def left_label(label_key, row_idx):
+            ttk.Label(cols, text=t(label_key), anchor=E
+                      ).grid(row=row_idx, column=0, sticky=E,
+                             pady=4, padx=(0, 8))
+
+        def right_label(label_key, row_idx, **kwargs):
+            # Strip the trailing colon — the right column reads
+            # "value → label" so the colon on the label would face
+            # away from the input it describes. Left column keeps its
+            # colons (label → value, colons stay).
+            text = t(label_key).rstrip(":").rstrip()
+            ttk.Label(cols, text=text, anchor=W
+                      ).grid(row=row_idx, column=4, sticky=W,
+                             pady=4, padx=(8, 0), **kwargs)
+
+        # ---- LEFT column ---------------------------------------------
+        # Token + Chat ID are readonly + masked by default — protects
+        # against accidental edits AND keeps the secret value off-screen
+        # for over-the-shoulder situations. Click ✏ to reveal + edit.
+        left_label("lbl.bot_token", 0)
         self.var_token = tk.StringVar(value=tg.get("bot_token", ""))
-        token_holder = ttk.Frame(f)
+        token_holder = ttk.Frame(cols)
         token_holder.grid(row=0, column=1, sticky=W)
         self.entry_token = ttk.Entry(
-            token_holder, textvariable=self.var_token, width=50, state="readonly"
+            token_holder, textvariable=self.var_token,
+            width=18, state="readonly", show="•",
         )
         self.entry_token.pack(side=LEFT)
         self.btn_edit_token = ttk.Button(
             token_holder, text="✏", width=3, bootstyle="link",
         )
         self.btn_edit_token.configure(
-            command=lambda: self._toggle_edit(self.entry_token, self.btn_edit_token)
+            command=lambda: self._toggle_edit(
+                self.entry_token, self.btn_edit_token, mask_char="•",
+            )
         )
         self.btn_edit_token.pack(side=LEFT, padx=(4, 0))
 
-        row("lbl.chat_id", 1)
+        left_label("lbl.chat_id", 1)
         self.var_chat_id = tk.StringVar(value=str(tg.get("chat_id", "")))
-        chat_holder = ttk.Frame(f)
+        chat_holder = ttk.Frame(cols)
         chat_holder.grid(row=1, column=1, sticky=W)
         self.entry_chat = ttk.Entry(
-            chat_holder, textvariable=self.var_chat_id, width=30, state="readonly"
+            chat_holder, textvariable=self.var_chat_id,
+            width=18, state="readonly", show="•",
         )
         self.entry_chat.pack(side=LEFT)
         self.btn_edit_chat = ttk.Button(
             chat_holder, text="✏", width=3, bootstyle="link",
         )
         self.btn_edit_chat.configure(
-            command=lambda: self._toggle_edit(self.entry_chat, self.btn_edit_chat)
+            command=lambda: self._toggle_edit(
+                self.entry_chat, self.btn_edit_chat, mask_char="•",
+            )
         )
         self.btn_edit_chat.pack(side=LEFT, padx=(4, 0))
 
-        ttk.Button(f, text=t("btn.test_message"),
-                   command=self._test_telegram, bootstyle="info"
-                   ).grid(row=1, column=2, padx=8)
-
-        row("lbl.currency", 2)
-        self.var_currency = tk.IntVar(value=mkt.get("currency", 18))
-        currency_map = {"UAH (18)": 18, "USD (1)": 1, "EUR (3)": 3, "RUB (5)": 5}
-        cb_currency = ttk.Combobox(f, values=list(currency_map.keys()), state="readonly", width=12)
-        reverse_map = {v: k for k, v in currency_map.items()}
-        cb_currency.set(reverse_map.get(self.var_currency.get(), "UAH (18)"))
-        cb_currency.grid(row=2, column=1, sticky=W)
-        self._currency_map = currency_map
-        self._cb_currency = cb_currency
-
-        row("lbl.country", 3)
-        self.var_country = tk.StringVar(value=mkt.get("country", "UA"))
-        country_holder = ttk.Frame(f)
-        country_holder.grid(row=3, column=1, sticky=W)
-        self.entry_country = ttk.Entry(
-            country_holder, textvariable=self.var_country, width=8, state="readonly"
-        )
-        self.entry_country.pack(side=LEFT)
-        self.btn_edit_country = ttk.Button(
-            country_holder, text="✏", width=3, bootstyle="link",
-        )
-        self.btn_edit_country.configure(
-            command=lambda: self._toggle_edit(self.entry_country, self.btn_edit_country)
-        )
-        self.btn_edit_country.pack(side=LEFT, padx=(4, 0))
-
-        row("lbl.interval", 4)
-        self.var_interval = tk.IntVar(value=sched.get("interval_minutes", 5))
-        ttk.Spinbox(f, from_=1, to=60, textvariable=self.var_interval, width=8).grid(row=4, column=1, sticky=W)
-
-        # Pause between price-fetch requests inside one batch. Put just
-        # under "Interval" — both knobs concern Steam-polling cadence.
-        # Picked up on the fly: _save_settings refreshes self.config_data,
-        # and `_check_now` re-reads market.poll_delay_sec on every click.
-        # watch.py reads it fresh from disk on each scheduled run anyway.
-        row("lbl.poll_delay", 5)
-        self.var_poll_delay = tk.DoubleVar(value=mkt.get("poll_delay_sec", 1.5))
-        ttk.Spinbox(
-            f, from_=0.5, to=10.0, increment=0.1, format="%.1f",
-            textvariable=self.var_poll_delay, width=8,
-        ).grid(row=5, column=1, sticky=W)
-
-        row("lbl.theme", 6)
-        # Built-in ttkbootstrap themes — all 18 of them, in dark-then-light
-        # order so users see the more contrast-y options first. Custom
-        # themes from themes/*.json are appended at the end as requested.
+        left_label("lbl.theme", 2)
         builtin_themes = [
             "cyborg", "darkly", "solar", "superhero", "vapor",
             "cerculean", "cosmo", "flatly", "journal", "litera",
@@ -4690,107 +4814,278 @@ class App(tb.Window):
         custom_codes = [c["code"] for c in self._custom_themes]
         themes = builtin_themes + custom_codes
         self.var_theme = tk.StringVar(value=ui.get("theme", "superhero"))
-        cb_theme = ttk.Combobox(f, values=themes, textvariable=self.var_theme, state="readonly", width=16)
-        cb_theme.grid(row=6, column=1, sticky=W)
+        cb_theme = ttk.Combobox(
+            cols, values=themes, textvariable=self.var_theme,
+            state="readonly", width=10,
+        )
+        cb_theme.grid(row=2, column=1, sticky=W)
         cb_theme.bind("<<ComboboxSelected>>", self._on_theme_change)
 
-        # Language picker — values are display names from each lang/*.json
-        # `_meta.name`, but we map back to ISO codes when saving.
-        row("lbl.language", 7)
+        left_label("lbl.language", 3)
         self._lang_options = i18n.available_languages()
-        self._lang_name_to_code = {opt["name"]: opt["code"] for opt in self._lang_options}
+        self._lang_name_to_code = {opt["name"]: opt["code"]
+                                   for opt in self._lang_options}
         current_code = i18n.get_language()
         current_name = next(
-            (opt["name"] for opt in self._lang_options if opt["code"] == current_code),
+            (opt["name"] for opt in self._lang_options
+             if opt["code"] == current_code),
             current_code,
         )
         self.var_language = tk.StringVar(value=current_name)
         cb_lang = ttk.Combobox(
-            f, values=[opt["name"] for opt in self._lang_options],
-            textvariable=self.var_language, state="readonly", width=16,
+            cols, values=[opt["name"] for opt in self._lang_options],
+            # Match the Theme combobox width above so the left column
+            # has a single vertical edge — "Українська" / "English" both
+            # fit comfortably in 10.
+            textvariable=self.var_language, state="readonly", width=10,
         )
-        cb_lang.grid(row=7, column=1, sticky=W)
+        cb_lang.grid(row=3, column=1, sticky=W)
         cb_lang.bind("<<ComboboxSelected>>", self._on_language_change)
 
-        # Font scale dropdown — own row directly under Language. Values
-        # stored as int (1..5) but displayed as "x1".."x5" so the meaning
-        # is obvious. Layout polish can come later; for now we just stack
-        # under the language picker.
-        row("lbl.font_scale", 8)
+        left_label("lbl.font_scale", 4)
         current_scale = int(ui.get("font_scale", 1) or 1)
         # First slot reads "За замовчуванням" (= x1, the unscaled
         # baseline). The next four are x2..x5, each ramping the factor
-        # by 0.5 up to 3.0× the original. Centralised in _font_scale_*
-        # helpers below so save/load goes through the same vocabulary.
+        # by 0.5 up to 3.0× the original.
         font_scale_values = self._font_scale_combo_values()
-        self.var_font_scale = tk.StringVar(value=self._font_scale_to_label(current_scale))
+        self.var_font_scale = tk.StringVar(
+            value=self._font_scale_to_label(current_scale),
+        )
         cb_font = ttk.Combobox(
-            f, values=font_scale_values,
-            textvariable=self.var_font_scale, state="readonly", width=20,
+            cols, values=font_scale_values,
+            textvariable=self.var_font_scale, state="readonly", width=4,
         )
-        cb_font.grid(row=8, column=1, sticky=W)
+        cb_font.grid(row=4, column=1, sticky=W)
 
-        row("lbl.antispam_hours", 9)
-        self.var_remind_hours = tk.IntVar(value=spam.get("remind_after_hours", 24))
-        ttk.Spinbox(f, from_=1, to=168, textvariable=self.var_remind_hours, width=8).grid(row=9, column=1, sticky=W)
+        # ---- RIGHT column --------------------------------------------
+        # Numeric/short fields, with the value on the left and label on
+        # the right — keeps the small spinboxes from sliding far away
+        # from the centre of the window.
+        from regions import (STEAM_CURRENCIES, STEAM_COUNTRIES,
+                              currency_label, country_label)
 
-        row("lbl.repeat_if_lower", 10)
-        self.var_repeat_lower = tk.BooleanVar(value=spam.get("repeat_if_lower", True))
-        # Custom glyph-based check — see _make_scalable_check docstring for
-        # why ttk.Checkbutton was a bad fit (the indicator box doesn't
-        # scale with font on the ttkbootstrap themes we use).
-        self._make_scalable_check(f, self.var_repeat_lower).grid(
-            row=10, column=1, sticky=W
+        # Full Steam currency list, sorted by code. Display format is
+        # "UAH (18)" — matches the old shape so existing config files
+        # / Reset paths keep working unchanged.
+        self.var_currency = tk.IntVar(value=mkt.get("currency", 18))
+        currency_map = {currency_label(code): code
+                        for code in sorted(STEAM_CURRENCIES.keys())}
+        cb_currency = ttk.Combobox(
+            cols, values=list(currency_map.keys()),
+            # Match Country combobox width (11) for a tidy vertical edge.
+            state="readonly", width=11,
         )
+        reverse_map = {v: k for k, v in currency_map.items()}
+        cb_currency.set(reverse_map.get(self.var_currency.get(),
+                                        currency_label(18)))
+        cb_currency.grid(row=0, column=3, sticky=W, pady=4)
+        self._currency_map = currency_map
+        self._cb_currency = cb_currency
+        right_label("lbl.currency", 0)
 
-        row("lbl.template", 11)
-        template_holder = ttk.Frame(f)
-        template_holder.grid(row=11, column=1, sticky=W, pady=4)
-        # tk.Text isn't a ttk widget so it doesn't pick up the style-level
-        # selection colours we configured for ttk.Entry. Apply explicitly so
-        # selected text reads against the input background.
+        # Country dropdown: every Steam-supported region we know about.
+        # Picking one auto-syncs the currency dropdown (`_on_country_pick`)
+        # — that's a "nudge", not a hard binding: the user can switch
+        # currency manually after, e.g. someone in PL who wants Market
+        # in EUR. Display values are "Ukraine (UA)"; we store the raw
+        # ISO code in `var_country` so config.json schema doesn't change.
+        self.var_country = tk.StringVar(value=mkt.get("country", "UA"))
+        country_map = {country_label(iso, name): iso
+                       for iso, name, _cur in STEAM_COUNTRIES}
+        self._country_map = country_map
+        # Currency lookup keyed by ISO code — used by the auto-sync
+        # handler when the user picks a country.
+        self._country_to_currency = {iso: cur for iso, _n, cur
+                                     in STEAM_COUNTRIES}
+        country_reverse = {iso: label for label, iso in country_map.items()}
+        # Display name for the currently-saved country, or fall back to
+        # showing the raw ISO if the country isn't in our list.
+        current_country_label = country_reverse.get(
+            self.var_country.get(), self.var_country.get(),
+        )
+        cb_country = ttk.Combobox(
+            cols, values=list(country_map.keys()),
+            # Width sized to hide the trailing ISO-code parenthesis on
+            # long country names ("United States" → entry shows "United
+            # States", the "(US)" lives in the dropdown). Shorter names
+            # like "Ukraine (UA)" fit whole. Dropdown still shows the
+            # full "Name (ISO)" label.
+            state="readonly", width=11,
+        )
+        cb_country.set(current_country_label)
+        cb_country.grid(row=1, column=3, sticky=W, pady=4)
+        cb_country.bind("<<ComboboxSelected>>", self._on_country_pick)
+        self._cb_country = cb_country
+        right_label("lbl.country", 1)
+
+        # All three right-column spinboxes share width=4 — enough for
+        # "10.0" (the widest value: poll-delay), aligned with the others
+        # for a tidy column edge. Visual consistency matters more than
+        # pixel-perfect-sized boxes per value range.
+        self.var_interval = tk.IntVar(value=sched.get("interval_minutes", 5))
+        ttk.Spinbox(
+            cols, from_=1, to=60, textvariable=self.var_interval, width=4,
+        ).grid(row=2, column=3, sticky=W, pady=4)
+        right_label("lbl.interval", 2)
+
+        # Pause between price-fetch requests inside one batch. Right
+        # next to "Interval" — both knobs concern Steam-polling cadence.
+        self.var_poll_delay = tk.DoubleVar(
+            value=mkt.get("poll_delay_sec", 1.5),
+        )
+        ttk.Spinbox(
+            cols, from_=0.5, to=10.0, increment=0.1, format="%.1f",
+            textvariable=self.var_poll_delay, width=4,
+        ).grid(row=3, column=3, sticky=W, pady=4)
+        right_label("lbl.poll_delay", 3)
+
+        self.var_remind_hours = tk.IntVar(
+            value=spam.get("remind_after_hours", 24),
+        )
+        ttk.Spinbox(
+            cols, from_=1, to=168, textvariable=self.var_remind_hours,
+            width=4,
+        ).grid(row=4, column=3, sticky=W, pady=4)
+        right_label("lbl.antispam_hours", 4)
+
+        # "Повторити, якщо нижче" — single row spanning both right
+        # columns. The custom check exists because ttkbootstrap's
+        # Checkbutton indicator is a PhotoImage baked at theme init
+        # and doesn't scale with font size.
+        self.var_repeat_lower = tk.BooleanVar(
+            value=spam.get("repeat_if_lower", True),
+        )
+        repeat_holder = ttk.Frame(cols)
+        repeat_holder.grid(row=5, column=3, columnspan=2,
+                           sticky=W, pady=4, padx=(0, 0))
+        self._make_scalable_check(repeat_holder,
+                                  self.var_repeat_lower).pack(side=LEFT)
+        ttk.Label(repeat_holder, text=t("lbl.repeat_if_lower"),
+                  anchor=W).pack(side=LEFT, padx=(8, 0))
+
+        # ---- Template section ----------------------------------------
+        # Two-column layout: editor + var cheatsheet on the LEFT, live
+        # Telegram-style preview on the RIGHT. The left column stacks
+        # vertically — label, textarea+✏, then the variables/HTML
+        # hints — and is sized to roughly match the preview's vertical
+        # footprint so the whole row reads as one coherent block.
+        tpl_section = ttk.Frame(outer)
+        tpl_section.pack(fill=X, pady=(0, 12))
+
+        # Left column container packed first. Preview gets `side=RIGHT`
+        # further down so it docks to the right edge regardless of the
+        # left column's expanded size; we build the preview last because
+        # it binds to `self.txt_template` which has to exist already.
+        tpl_left = ttk.Frame(tpl_section)
+        tpl_left.pack(side=LEFT, anchor=NW, fill=BOTH, expand=YES,
+                      padx=(0, 12))
+
+        ttk.Label(tpl_left, text=t("lbl.template")
+                  ).pack(anchor=W, pady=(0, 4))
+
+        template_holder = ttk.Frame(tpl_left)
+        template_holder.pack(anchor=W)
+        # tk.Text isn't a ttk widget so it doesn't pick up the
+        # style-level selection colours we configured for ttk.Entry.
+        # Apply explicitly so selected text reads against the input bg.
+        #
+        # height=10 keeps the editor matched to the preview pane;
+        # width=72 makes the textarea a touch wider than the "Змінні:"
+        # cheatsheet that sits under it, so the cheatsheet looks anchored
+        # under the editor rather than spilling past its right edge.
         self.txt_template = tk.Text(
-            template_holder, width=55, height=5, wrap=tk.WORD,
+            template_holder, width=72, height=10, wrap=tk.WORD,
             selectbackground=self._text_sel_bg,
             selectforeground=self._text_sel_fg,
         )
         # Order: explicit user override → language default. Empty/blank
         # override falls back to the language default too.
-        template_value = (cfg.get("message_template") or "").strip() or t("tg.message.default")
-        # Insert BEFORE switching to disabled — Text rejects insert() while
-        # disabled. After locking, the user re-enables via the ✏ button.
+        template_value = (cfg.get("message_template") or "").strip() \
+            or t("tg.message.default")
+        # Insert BEFORE switching to disabled — Text rejects insert()
+        # while disabled. After locking, the user re-enables via ✏.
         self.txt_template.insert("1.0", template_value)
         self.txt_template.configure(state="disabled")
         self.txt_template.pack(side=LEFT)
+
+        # Two-button column to the right of the editor: ✏ toggles
+        # edit/commit; ✕ discards changes and exits edit mode. The
+        # cancel button needs to know what to restore — we snapshot
+        # the editor contents the moment ✏ is clicked (entering edit
+        # mode), and clear that snapshot after either ✓ or ✕ resolves.
+        self._template_original: str | None = None
+        tpl_btn_col = ttk.Frame(template_holder)
+        tpl_btn_col.pack(side=LEFT, padx=(4, 0), anchor=N)
         self.btn_edit_template = ttk.Button(
-            template_holder, text="✏", width=3, bootstyle="link",
+            tpl_btn_col, text="✏", width=3, bootstyle="link",
+            command=self._on_template_edit_toggle,
         )
-        self.btn_edit_template.configure(
-            command=lambda: self._toggle_edit(
-                self.txt_template, self.btn_edit_template, lock_state="disabled"
-            )
+        self.btn_edit_template.pack(side=TOP)
+        # Cancel button — only shown while editing. Mirrors the look
+        # of the ✓ commit button (filled red square via plain
+        # `bootstyle="danger"`) so the two button states sit side by
+        # side as matched "commit / discard" affordances. Hidden in
+        # the readonly state via pack_forget — there's no "cancel" if
+        # nothing's being edited, and the empty slot would just look
+        # like dead UI.
+        self.btn_cancel_template = ttk.Button(
+            tpl_btn_col, text="✕", width=3, bootstyle="danger",
+            command=self._on_template_cancel,
         )
-        # anchor=N keeps the button glued to the top edge of a multi-line
-        # Text widget — looks much tidier than floating in the middle.
-        self.btn_edit_template.pack(side=LEFT, padx=(4, 0), anchor=N)
-        ttk.Label(f, text=t("lbl.template_vars"),
-                  foreground="gray").grid(row=12, column=1, sticky=W)
+        # NOT packed initially — `_on_template_edit_toggle` packs it
+        # on edit entry and `pack_forget`s it on commit / cancel.
 
-        row("lbl.steam_login", 13)
-        # "Set up…" launches the 3-tier login dialog (QR / browser / manual).
-        # Only the manual tier is wired up end-to-end in Stage 1; the other
-        # two render as labelled stubs inside the dialog (see DESIGN.md →
-        # Phase 1 staging plan).
+        # Variables + HTML hints sit UNDER the editor, still in the
+        # left column. Two separate lines for readability.
+        ttk.Label(tpl_left, text=t("lbl.template_vars"),
+                  foreground="gray").pack(anchor=W, pady=(8, 0))
+        ttk.Label(tpl_left, text=t("lbl.template_html"),
+                  foreground="gray").pack(anchor=W)
+
+        # Preview pane on the right — built last because it binds to
+        # `self.txt_template` which only exists after the editor block
+        # above. `side=RIGHT` still parks it on the right edge of
+        # tpl_section regardless of build order.
+        self._build_template_preview(tpl_section)
+
+        # ---- Bottom row: Steam login | Test message + Telegram label -
+        # `pady=(24, ...)` gives a clear visual break between the
+        # template preview row above and the bottom-row services —
+        # otherwise the buttons end up sitting flush against the
+        # preview's bottom border.
+        bottom = ttk.Frame(outer)
+        bottom.pack(fill=X, pady=(24, 0))
+
+        steam_block = ttk.Frame(bottom)
+        steam_block.pack(side=LEFT)
+        ttk.Label(steam_block, text=t("lbl.steam_login")).pack(side=LEFT,
+                                                                padx=(0, 8))
         ttk.Button(
-            f, text=t("btn.steam_login_setup"),
+            steam_block, text=t("btn.steam_login_setup"),
             command=self._open_steam_login_dialog,
-        ).grid(row=13, column=1, sticky=W)
+            bootstyle="info",
+        ).pack(side=LEFT)
 
-        # Save + Reset live on the same row. Reset is bootstyle="danger"
-        # so it's visually weighted as "destructive" — the confirmation
-        # dialog catches the second-thought case before anything is wiped.
-        save_row = ttk.Frame(f)
-        save_row.grid(row=14, column=1, sticky=W, pady=(16, 0))
+        tg_block = ttk.Frame(bottom)
+        tg_block.pack(side=RIGHT)
+        ttk.Button(tg_block, text=t("btn.test_message"),
+                   command=self._test_telegram, bootstyle="info"
+                   ).pack(side=LEFT, padx=(0, 8))
+        # Plain label — same default font as the rest of the page;
+        # bolding it made the right edge feel heavier than the matching
+        # "Вхід у Steam:" anchor on the left.
+        ttk.Label(tg_block, text=t("lbl.telegram_section")
+                  ).pack(side=LEFT)
+
+        # ---- Save / Reset — centred, well below the bottom services -
+        # Big `pady` makes the destructive Reset button a deliberate
+        # reach — you have to actively scroll your eye down past
+        # everything else to find it. Saves a few accidental clicks.
+        save_row = ttk.Frame(outer)
+        save_row.pack(pady=(40, 0))
+        # Reset is bootstyle="danger" so it's visually weighted as
+        # "destructive"; the confirmation dialog catches the second-
+        # thought case before anything is wiped.
         ttk.Button(save_row, text=t("btn.save"),
                    command=self._save_settings, bootstyle="success"
                    ).pack(side=LEFT, padx=(0, 8))
@@ -4799,7 +5094,227 @@ class App(tb.Window):
                    bootstyle="danger"
                    ).pack(side=LEFT)
 
-    def _toggle_edit(self, widget, button: ttk.Button, lock_state: str = "readonly") -> None:
+        # Lock Currency + Country if a Steam ID is already attached.
+        # Has to happen AFTER the pickers are gridded — _update… reads
+        # `_cb_currency` / `_cb_country` off `self`. Idempotent: every
+        # tab rebuild (theme change, etc.) re-applies the right state.
+        self._update_currency_country_state()
+
+    def _build_template_preview(self, parent) -> None:
+        """Build the Telegram-style preview pane next to the template editor.
+
+        Layout — a single Frame with a 1-px solid border:
+          ┌──────────────────────┐
+          │  [poster image]      │  ← fixed PNG from preview/
+          │  rendered template   │  ← updates as user types
+          └──────────────────────┘
+
+        The image is the bundled `preview/led-backlit.png` — same kind
+        of poster Steam shows above a Telegram-style alert, just used
+        statically here so the user can see what the live message
+        layout will look like without sending one.
+
+        Tk has no built-in HTML rendering, so we parse the three tags
+        the message template supports (<b>, <u>, <blockquote>) into
+        Text widget tags. Anything else passes through literally.
+        """
+        # The pane lives inside the same horizontal holder as the
+        # template Text + ✏ button so they share a baseline. Border is
+        # `relief="solid"` with borderwidth=1 — matches the other
+        # bordered Frames in the app (Treeview tree_frame, etc.).
+        preview_frame = ttk.Frame(parent, relief="solid", borderwidth=1)
+        # `side=RIGHT` anchors the pane to the right edge of the
+        # template row; the left-column container then expands to fill
+        # whatever's left between it and the preview.
+        preview_frame.pack(side=RIGHT, anchor=NE)
+
+        # Poster image — load once at startup, hold a reference on
+        # self so Tk's image GC doesn't collect it the moment this
+        # method returns. Resize to a reasonable width via PIL
+        # `thumbnail` so the pane doesn't dominate the page.
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(BASE / "preview" / "led-backlit.png")
+            img.thumbnail((220, 280), Image.LANCZOS)
+            self._template_preview_img = ImageTk.PhotoImage(img)
+            ttk.Label(preview_frame,
+                      image=self._template_preview_img).pack(
+                side=TOP, padx=4, pady=(4, 0),
+            )
+        except Exception as exc:
+            log.warning("template preview image not loaded: %s", exc)
+
+        # Rendered text below the image. tk.Text gives us per-region
+        # tags for bold/underline/blockquote; ttk.Label would only
+        # let us apply one font to the whole string.
+        self.txt_template_preview = tk.Text(
+            preview_frame, width=28, height=4, wrap=tk.WORD,
+            relief="flat", borderwidth=0, state="disabled",
+            selectbackground=self._text_sel_bg,
+            selectforeground=self._text_sel_fg,
+        )
+        # Tag styling — mirrors how the actual Telegram message renders.
+        # Sizes tuned to roughly match the preview image's apparent text
+        # scale; user-tweakable later if needed.
+        self.txt_template_preview.tag_configure(
+            "b", font=("Segoe UI", 10, "bold"),
+        )
+        self.txt_template_preview.tag_configure("u", underline=True)
+        self.txt_template_preview.tag_configure(
+            "blockquote",
+            lmargin1=15, lmargin2=15,
+            foreground=self.style.colors.secondary,
+        )
+        self.txt_template_preview.pack(side=TOP, fill=X, padx=4, pady=4)
+
+        # Live updates: bind <<Modified>> on the editor. tk.Text's
+        # `edit_modified` flag has to be reset after each handler call,
+        # otherwise the event only fires once per session.
+        self.txt_template.bind("<<Modified>>", self._on_template_changed)
+        # Render once with the current contents so the preview isn't
+        # empty on first paint.
+        self._render_template_preview()
+
+    def _on_template_edit_toggle(self) -> None:
+        """✏ button — enter edit mode, or commit changes and lock again.
+
+        Custom replacement for the generic `_toggle_edit` so we can
+        snapshot the editor contents on entry (powers the ✕ cancel
+        button) and show / hide the cancel button by packing it on the
+        fly. Cancel is only meaningful while editing — keeping it
+        visible at all times would leave dead UI sitting next to the
+        readonly editor.
+        """
+        if str(self.txt_template.cget("state")) == "disabled":
+            # Entering edit mode — capture current text so ✕ has
+            # something to roll back to.
+            self._template_original = self.txt_template.get("1.0", "end-1c")
+            self.txt_template.configure(state="normal")
+            self.txt_template.focus_set()
+            try:
+                self.txt_template.mark_set("insert", "end-1c")
+            except tk.TclError:
+                pass
+            self.btn_edit_template.configure(text="✓", bootstyle="success")
+            # Pack ✕ right under ✓ so the two filled squares read as
+            # a matched "commit / discard" pair while editing.
+            self.btn_cancel_template.pack(side=TOP, pady=(4, 0))
+        else:
+            # Committing — keep whatever the user typed, drop snapshot,
+            # hide the ✕ button so the readonly state stays uncluttered.
+            self.txt_template.configure(state="disabled")
+            self.btn_edit_template.configure(text="✏", bootstyle="link")
+            self.btn_cancel_template.pack_forget()
+            self._template_original = None
+
+    def _on_template_cancel(self) -> None:
+        """✕ button — discard changes and exit edit mode."""
+        if self._template_original is None:
+            return
+        snapshot = self._template_original
+        self.txt_template.configure(state="normal")
+        self.txt_template.delete("1.0", "end")
+        self.txt_template.insert("1.0", snapshot)
+        self.txt_template.configure(state="disabled")
+        self.btn_edit_template.configure(text="✏", bootstyle="link")
+        self.btn_cancel_template.pack_forget()
+        self._template_original = None
+        # Repaint the preview pane against the restored text so the
+        # right-hand side reflects what the saved template actually says.
+        self._render_template_preview()
+
+    def _on_template_changed(self, _event=None) -> None:
+        """`<<Modified>>` handler — re-render the preview."""
+        try:
+            if not self.txt_template.edit_modified():
+                return
+            self.txt_template.edit_modified(False)
+        except tk.TclError:
+            return
+        self._render_template_preview()
+
+    # Sample values used in the preview. Kept tiny — the goal is to
+    # show "this is where the card name lands", not to look like real
+    # data the user might compare against. Locale-sensitive {operation}
+    # comes from i18n so the preview reads the same language as the
+    # actual alerts will.
+    @staticmethod
+    def _template_preview_sample() -> dict:
+        return {
+            "display_name": "Sample Card",
+            "name":         "Sample Card",
+            "game":         "Sample Game",
+            "price":        "5.00",
+            "target":       "4.00",
+            "volume":       "12",
+            "url":          "https://steamcommunity.com/market/listings/...",
+            "operation":    t("tg.operation.sell"),
+        }
+
+    def _render_template_preview(self) -> None:
+        """Substitute placeholders + render HTML tags into the preview Text."""
+        # Pull the current editor contents (works in both readonly and
+        # edit states — Text always reports its buffer).
+        template = self.txt_template.get("1.0", "end-1c")
+        try:
+            filled = template.format_map(self._template_preview_sample())
+        except (KeyError, IndexError, ValueError):
+            # Malformed format string — show the raw template so the
+            # user can see what they broke instead of a stack trace.
+            filled = template
+
+        self._insert_html_into_text(self.txt_template_preview, filled)
+
+    @staticmethod
+    def _insert_html_into_text(text_widget, html: str) -> None:
+        """Naive HTML-to-Tk-tags renderer.
+
+        Supports <b>, <u>, <blockquote>. Walks the string with a regex,
+        maintaining a stack of currently-open tags; each inserted run
+        gets the stack as its tag tuple so nested tags layer correctly
+        (bold + underline both apply when both are open).
+
+        Unrecognised tags pass through as literal text — keeps the
+        preview honest if the user types something we don't render
+        (Telegram would also just show it verbatim).
+        """
+        import re
+
+        text_widget.configure(state="normal")
+        text_widget.delete("1.0", "end")
+
+        pattern = re.compile(r"<(/?)(b|u|blockquote)>", re.IGNORECASE)
+        tag_stack: list[str] = []
+        pos = 0
+        for m in pattern.finditer(html):
+            if m.start() > pos:
+                text_widget.insert(
+                    "end", html[pos:m.start()], tuple(tag_stack),
+                )
+            is_close = bool(m.group(1))
+            name = m.group(2).lower()
+            if is_close:
+                # Pop the most-recent matching open. If they don't
+                # nest properly (e.g. "<b><u></b></u>") we still close
+                # the most-recent one — minor visual quirk, but the
+                # alternative (refusing to close) would leave bold/
+                # underline bleeding through the rest of the message.
+                for i in range(len(tag_stack) - 1, -1, -1):
+                    if tag_stack[i] == name:
+                        tag_stack.pop(i)
+                        break
+            else:
+                tag_stack.append(name)
+            pos = m.end()
+        # Trailing run after the last tag.
+        if pos < len(html):
+            text_widget.insert("end", html[pos:], tuple(tag_stack))
+
+        text_widget.configure(state="disabled")
+
+    def _toggle_edit(self, widget, button: ttk.Button,
+                     lock_state: str = "readonly",
+                     mask_char: str | None = None) -> None:
         """Flip a locked input widget between edit and locked modes.
 
         Works for both ttk.Entry (lock_state="readonly") and tk.Text
@@ -4807,18 +5322,31 @@ class App(tb.Window):
 
         Visual contract:
           * locked   → state=lock_state, button "✏" in neutral link colour
+                       Entry shows `mask_char` instead of real text when
+                       `mask_char` is non-empty (used for the Telegram
+                       token and chat ID — secrets we don't want over
+                       the shoulder).
           * editing  → state=normal,     button "✓" in success (green)
+                       Mask cleared so the user can read what they're
+                       typing.
         Pressing the button again locks the field; the underlying value
         (StringVar or Text buffer) keeps whatever the user typed.
         """
         if str(widget.cget("state")) == lock_state:
             widget.configure(state="normal")
+            # Drop the mask while editing so the user can see the value
+            # they're correcting. ttk.Text has no `show` option — only
+            # apply for widgets that support it.
+            if mask_char is not None and "show" in widget.keys():
+                widget.configure(show="")
             widget.focus_set()
             if hasattr(widget, "icursor"):
                 widget.icursor("end")
             button.configure(text="✓", bootstyle="success")
         else:
             widget.configure(state=lock_state)
+            if mask_char is not None and "show" in widget.keys():
+                widget.configure(show=mask_char)
             button.configure(text="✏", bootstyle="link")
 
     def _test_telegram(self):
@@ -4850,6 +5378,149 @@ class App(tb.Window):
         self._refresh_history()
         # New theme → new title-bar colour.
         self._apply_native_titlebar_theme()
+
+    def _on_country_pick(self, _event=None):
+        """Country dropdown changed — sync the currency dropdown to match.
+
+        We treat the mapping as a nudge, not a binding: we update the
+        currency picker for the new country, but the user's free to
+        change it back to whatever they want before pressing Save.
+        That covers e.g. a PL-based user who wants Market priced in EUR.
+
+        Side effect: the floating-widget's placeholder balance refreshes
+        its currency glyph too, so "0.00 ₴" → "0.00 €" without the user
+        having to save first.
+        """
+        from regions import currency_label
+
+        label = self._cb_country.get()
+        iso = self._country_map.get(label)
+        if not iso:
+            return
+        self.var_country.set(iso)
+        # Look up the country's default currency. Missing entry (we
+        # didn't catalogue every Steam country) means we just leave the
+        # currency picker alone — same outcome as the user not touching it.
+        new_currency = self._country_to_currency.get(iso)
+        if new_currency is not None:
+            self._cb_currency.set(currency_label(new_currency))
+            self.var_currency.set(new_currency)
+            # Repaint the placeholder balance so the symbol flips
+            # immediately — feels more responsive than waiting for Save.
+            self._refresh_balance_placeholder(new_currency)
+
+    def _refresh_balance_placeholder(self, currency_code: int) -> None:
+        """Repaint the floating-widget balance placeholder for a new currency.
+
+        Only meaningful when we DON'T have a live Steam session — the
+        widget shows "0.00 X" as a placeholder, and the X should match
+        whatever currency the user picked in Settings. When store
+        cookies are present, Steam serves the real wallet balance
+        (number + native symbol baked into the string), and we MUST
+        NOT touch it: Valve picks the format from the account, not
+        from our Market settings, and any substitution we'd do would
+        either lie about the currency or flicker. The real balance
+        gets refreshed via `_refresh_wallet_balance` after Save.
+        """
+        from regions import currency_symbol
+        steam_cfg = self.config_data.get("steam") or {}
+        cookies = steam_cfg.get("cookies") or {}
+        if (cookies.get("store.steampowered.com") or {}).get("steamLoginSecure"):
+            # Live session — leave Steam's formatted balance alone.
+            return
+        sym = currency_symbol(currency_code, fallback="")
+        self._update_user_widget(balance=f"0.00 {sym}")
+
+    def _update_currency_country_state(self) -> None:
+        """Lock Currency + Country pickers iff a cookies-based login is active.
+
+        Rationale: when we have Steam session cookies, Currency +
+        Country are dictated by THAT account's Steam region — the
+        Market endpoints and the wallet widget all use the cookies'
+        account, so letting the user fiddle with these would create a
+        contradictory display ("I'm logged in as a US user but the
+        widget shows UAH").
+
+        Manual-ID tier (Tier 3) does NOT lock the fields: there's no
+        real session, no wallet, no account-bound Market context — the
+        ID is just a profile pointer for the avatar / persona. The
+        user retains full control over which currency + country they
+        want Market requests and History totals to use.
+
+        Implementation note — we DON'T use `state="disabled"` here.
+        ttkbootstrap dims the disabled foreground to a near-unreadable
+        grey on dark themes, and `style.map("TCombobox",
+        foreground=[("disabled", fg_normal)])` doesn't reliably win
+        against ttkbootstrap's own state maps. So we keep the widget
+        in `readonly` (where text stays at normal foreground) and
+        suppress all dropdown-opening interactions via bindings.
+        Visual cue: the field looks identical to its editable form —
+        the user finds out it's locked when they try to click. Worth
+        it for the readability win.
+        """
+        # Pickers only exist while the Settings tab is built. Bail
+        # silently if called before that — callers (login, disconnect)
+        # may fire before the user has even opened the tab.
+        cb_cur = getattr(self, "_cb_currency", None)
+        cb_cnt = getattr(self, "_cb_country", None)
+        if cb_cur is None or cb_cnt is None:
+            return
+        steam_cfg = self.config_data.get("steam") or {}
+        cookies = steam_cfg.get("cookies") or {}
+        # Tier 2 marker: store-domain cookies contain the wallet token.
+        # We check that specific cookie so an empty/wiped cookies dict
+        # doesn't accidentally pass the truthy check.
+        has_session = bool(
+            (cookies.get("store.steampowered.com") or {}).get("steamLoginSecure")
+        )
+
+        # Remove any previous lock-bindings before either re-applying
+        # them or leaving the field free. Tracking funcids per-widget
+        # so we only remove OUR handlers, not class-level ones (e.g.
+        # the ttk default keyboard nav).
+        if not hasattr(self, "_currency_country_lock_binds"):
+            self._currency_country_lock_binds = {}
+        bind_track = self._currency_country_lock_binds  # alias
+        for cb in (cb_cur, cb_cnt):
+            for seq, fid in bind_track.get(cb, []):
+                try:
+                    cb.unbind(seq, fid)
+                except tk.TclError:
+                    pass
+            bind_track[cb] = []
+
+        # Country combobox needs its <<ComboboxSelected>> handler
+        # to stay attached when unlocked but be suppressed when locked.
+        # Easiest: re-bind it here every time (cheap), gated on lock state.
+        try:
+            cb_cnt.unbind("<<ComboboxSelected>>")
+        except tk.TclError:
+            pass
+
+        if not has_session:
+            # Unlocked: re-attach the country auto-sync handler, leave
+            # all other interactions alone. Done.
+            cb_cnt.bind("<<ComboboxSelected>>", self._on_country_pick)
+            return
+
+        # Locked: block every gesture that opens the dropdown or
+        # advances selection. Returning "break" stops the event from
+        # propagating to the class-level handler that actually opens
+        # the listbox. We cover:
+        #   - <Button-1>   click anywhere in the field or arrow
+        #   - <Down>/<Up>  keyboard-nav across items
+        #   - <Return>     keyboard-activated dropdown
+        #   - <space>      same, some themes bind it
+        #   - <MouseWheel> scroll-to-change behaviour
+        blocker = lambda _e: "break"  # noqa: E731 — trivial inline lambda
+        for cb in (cb_cur, cb_cnt):
+            for seq in ("<Button-1>", "<Down>", "<Up>",
+                        "<Return>", "<space>", "<MouseWheel>"):
+                try:
+                    fid = cb.bind(seq, blocker)
+                    bind_track[cb].append((seq, fid))
+                except tk.TclError:
+                    pass
 
     def _on_language_change(self, _event=None):
         """Save the new language and prompt for a restart.
@@ -4934,6 +5605,16 @@ class App(tb.Window):
         # Re-cap min size after — bigger fonts need a bigger floor.
         self._apply_font_scale(cfg["ui"]["font_scale"])
         self.after(50, self._apply_min_size)
+        # Currency / country may have changed. Two paths:
+        #   * No Steam session — `_refresh_balance_placeholder` repaints
+        #     the "0.00 X" placeholder with the new symbol.
+        #   * Live Steam session — placeholder helper bails (Steam owns
+        #     the wallet display), and `_refresh_wallet_balance` re-pulls
+        #     the formatted balance from store.steampowered.com. Steam
+        #     picks the symbol from the account, not from our market
+        #     settings, so the display reflects whatever Valve serves.
+        self._refresh_balance_placeholder(currency_val)
+        self._refresh_wallet_balance()
         self._set_status(t("status.settings_saved"))
 
     def _reset_settings_to_defaults(self):
@@ -4983,6 +5664,13 @@ class App(tb.Window):
         self._cb_currency.set(reverse_currency.get(defaults["currency"], "UAH (18)"))
 
         self.var_country.set(defaults["country"])
+        # Country is now a Combobox showing "Ukraine (UA)" — find the
+        # label that matches the default ISO so the dropdown actually
+        # reads "Ukraine (UA)" after reset, not the bare "UA".
+        reverse_country = {iso: lbl for lbl, iso in self._country_map.items()}
+        self._cb_country.set(
+            reverse_country.get(defaults["country"], defaults["country"])
+        )
         self.var_poll_delay.set(defaults["poll_delay_sec"])
         self.var_interval.set(defaults["interval_minutes"])
         self.var_theme.set(defaults["theme"])

@@ -656,6 +656,32 @@ _WALLET_BALANCE_RE = re.compile(
     r'<a[^>]*id=["\']header_wallet_balance["\'][^>]*>([^<]+)</a>',
     re.IGNORECASE,
 )
+# The account page embeds the user's region in a JS object on the
+# server-rendered HTML:
+#   g_rgWalletInfo = {"wallet_currency":18,"wallet_country":"UA",...};
+# We MUST anchor parsing inside g_rgWalletInfo because the page has
+# other JSON fragments mentioning "wallet_country" / "wallet_currency"
+# — Steam renders region/wallet-recharge availability lists in the
+# header and footer that include `"wallet_country":"TR"` and similar
+# entries for countries that are NOT the user's. Grabbing the first
+# match without anchoring picks one of those by chance and gives
+# wrong results (the bug we just fixed).
+#
+# Strategy: pull the g_rgWalletInfo = { ... }; block first, then
+# scan inside it for the two fields.
+_WALLET_INFO_BLOCK_RE = re.compile(
+    r'g_rgWalletInfo\s*=\s*(\{[^}]*\})\s*;',
+    re.IGNORECASE,
+)
+_WALLET_CURRENCY_RE = re.compile(
+    r'"wallet_currency"\s*:\s*(\d+)',
+)
+_WALLET_COUNTRY_RE = re.compile(
+    r'"wallet_country"\s*:\s*"([A-Z]{2})"',
+)
+# (Account-page fallback regexes removed — the modern /account/ template
+# no longer embeds g_rgWalletInfo / g_AccountData, so we rely on
+# /market/ exclusively for currency + country.)
 
 
 def fetch_wallet_balance(cookies: dict | None) -> str | None:
@@ -722,6 +748,122 @@ def fetch_wallet_balance(cookies: dict | None) -> str | None:
     raw = m.group(1).replace(" ", " ").strip()
     log.debug("wallet balance: %r", raw)
     return raw
+
+
+_MARKET_PAGE_URL = "https://steamcommunity.com/market/"
+
+
+def fetch_wallet_info(cookies: dict | None) -> dict | None:
+    """Two-step fetch: balance from /account/, currency+country from /market/.
+
+    Steam used to embed `g_rgWalletInfo = {...}` on the account page,
+    but the modern template no longer ships that JS object — only the
+    formatted balance string survives there. The Community Market page
+    DOES still render `g_rgWalletInfo` (it needs it to format listing
+    prices in the user's local currency), so we use the two-page combo:
+
+      * /account/                — store.steampowered.com  → balance
+      * /market/                 — steamcommunity.com      → currency + country
+
+    Returns:
+
+        {
+            "balance":  "5,46₴" | None,
+            "currency": 18 | None,    # Steam internal int code
+            "country":  "UA" | None,  # ISO-2
+        }
+
+    Any field is None independently if its source failed. Returns
+    None entirely if both source-domain cookies are missing (Tier 3
+    manual-ID flow — no session at all).
+
+    Logging is at warning for failure paths and info for the parsed
+    result so it's visible in the Журнал tab without bumping the
+    global log level.
+    """
+    store_cookies = (cookies or {}).get("store.steampowered.com") or {}
+    community_cookies = (cookies or {}).get("steamcommunity.com") or {}
+    if ("steamLoginSecure" not in store_cookies
+            and "steamLoginSecure" not in community_cookies):
+        log.debug("wallet info skipped — no session cookies on either domain")
+        return None
+
+    balance: str | None = None
+    currency: int | None = None
+    country: str | None = None
+
+    # --- balance: store-domain /account/ page -----------------------
+    if "steamLoginSecure" in store_cookies:
+        try:
+            resp = requests.get(
+                _ACCOUNT_PAGE_URL,
+                cookies=store_cookies,
+                headers={
+                    "User-Agent": _UA,
+                    "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.7,en;q=0.5",
+                    "Accept": ("text/html,application/xhtml+xml,application/xml;"
+                               "q=0.9,*/*;q=0.8"),
+                },
+                timeout=_TIMEOUT,
+                allow_redirects=True,
+            )
+            if resp.status_code == 200:
+                m_bal = _WALLET_BALANCE_RE.search(resp.text)
+                if m_bal:
+                    balance = m_bal.group(1).replace("\xa0", " ").strip()
+                else:
+                    log.warning("wallet balance not found on account page")
+            else:
+                log.warning("wallet balance HTTP %s", resp.status_code)
+        except requests.RequestException as e:
+            log.warning("wallet balance fetch failed: %s", e)
+
+    # --- currency + country: community-domain /market/ page ----------
+    # The community market page embeds g_rgWalletInfo for logged-in
+    # users so it can render listings in the user's local currency.
+    # Needs steamcommunity.com cookies (the store-domain cookies don't
+    # authenticate the community subdomain — different cookie scope).
+    if "steamLoginSecure" in community_cookies:
+        try:
+            resp = requests.get(
+                _MARKET_PAGE_URL,
+                cookies=community_cookies,
+                headers={
+                    "User-Agent": _UA,
+                    "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.7,en;q=0.5",
+                    "Accept": ("text/html,application/xhtml+xml,application/xml;"
+                               "q=0.9,*/*;q=0.8"),
+                },
+                timeout=_TIMEOUT,
+                allow_redirects=True,
+            )
+            if resp.status_code == 200:
+                text = resp.text
+                m_block = _WALLET_INFO_BLOCK_RE.search(text)
+                if m_block:
+                    block = m_block.group(1)
+                    m_cur = _WALLET_CURRENCY_RE.search(block)
+                    if m_cur:
+                        currency = int(m_cur.group(1))
+                    m_cnt = _WALLET_COUNTRY_RE.search(block)
+                    if m_cnt:
+                        country = m_cnt.group(1)
+                else:
+                    log.warning("wallet info block missing on market page "
+                                "(session may not be active on community domain)")
+            else:
+                log.warning("market page HTTP %s", resp.status_code)
+        except requests.RequestException as e:
+            log.warning("market page fetch failed: %s", e)
+
+    # Debug-level — useful for troubleshooting region auto-fill, but
+    # at INFO it shows up in the Журнал tab after every login / Save
+    # which is noise once the feature works.
+    log.debug("wallet info: balance=%r currency=%r country=%r",
+              balance, currency, country)
+    return {"balance": balance, "currency": currency, "country": country}
+
+
 
 
 # ---------------------------------------------------------------------------
