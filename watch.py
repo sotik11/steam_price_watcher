@@ -61,8 +61,17 @@ def _migrate_state_keys(state: dict) -> bool:
     for k in list(state.keys()):
         if k.startswith("__"):
             continue
-        if not k.startswith(("buy:", "sell:")):
+        # "game:" must be in this list — without it the migration
+        # mangled every game-alert key into "buy:game:…" on each run,
+        # losing the antispam entry and re-alerting every 5 minutes
+        # (the 2026-06-11 duplicate-alert bug).
+        if not k.startswith(("buy:", "sell:", "game:")):
             state["buy:" + k] = state.pop(k)
+            changed = True
+        elif k.startswith("buy:game:"):
+            # Heal keys already mangled by the buggy version: strip the
+            # bogus prefix so the antispam history is preserved.
+            state[k[len("buy:"):]] = state.pop(k)
             changed = True
     return changed
 
@@ -108,7 +117,12 @@ def _process_list(kind: str, list_path: Path, *,
     write the files back to disk.
     """
     items = load_json(list_path) or []
-    active = [c for c in items if c.get("status") not in _CLOSED_STATUSES]
+    # no_check («Не перевіряти») rows stay in the file and the GUI but
+    # are invisible to polling — exactly like closed ones, except the
+    # user can flip them back any time.
+    active = [c for c in items
+              if c.get("status") not in _CLOSED_STATUSES
+              and not c.get("no_check")]
     if not active:
         return False, False
 
@@ -272,6 +286,22 @@ def _process_list(kind: str, list_path: Path, *,
                            lowest=lowest))
                 continue
 
+        # «Не сповіщати» (all copies muted): mirror the would-be alert
+        # as a silent "checked" badge instead of a Telegram message.
+        # Mixed groups (some muted, some not) go through the normal
+        # path — the alert fires for the unmuted copies' sake.
+        if matching and all(w.get("no_alert") for w in matching):
+            hit = (lowest < target) if kind == "sell" else (lowest <= target)
+            for w in matching:
+                if hit and w.get("status") in ("", "checked"):
+                    if w.get("status") != "checked":
+                        w["status"] = "checked"
+                        list_dirty = True
+                elif not hit and w.get("status") == "checked":
+                    w["status"] = ""
+                    list_dirty = True
+            continue
+
         # Buy: alert when market hit OR dropped below my target ("good
         #   time to buy at my asking price").
         # Sell: alert only when market dropped STRICTLY below my target —
@@ -304,6 +334,124 @@ def _process_list(kind: str, list_path: Path, *,
                 if w.get("status") == "alerted":
                     w["status"] = ""
                     list_dirty = True
+
+    if list_dirty:
+        save_json(list_path, items)
+    return state_dirty, list_dirty
+
+
+def _game_minimum(g: dict) -> float | None:
+    """Historical-low price for one game (same math as the GUI).
+
+    `lowest_cut` (deepest recorded Steam discount %) × current regular
+    price. Snaps to Steam's own final price when today's discount
+    matches the cut — Steam rounds (675 × 10% → 67, not 67.50).
+    """
+    cut = g.get("lowest_cut")
+    regular = g.get("regular")
+    if not isinstance(cut, int) or not isinstance(regular, (int, float)):
+        return None
+    if g.get("discount_pct") == cut and isinstance(g.get("price"), (int, float)):
+        return g["price"]
+    return round(regular * (100 - cut) / 100.0, 2)
+
+
+def _process_games(*, config, state, country,
+                   template, token, chat_id,
+                   repeat_if_lower, remind_after_hours, now):
+    """Poll the wishlist-games list («Ігри» tab) and alert on all-time lows.
+
+    Gated on `ui.bonus_content` — switching the checkbox off stops the
+    polling entirely while keeping gamelist.json intact. One GetItems
+    batch per 50 games (store API, not the rate-limited market one),
+    so even 350+ games cost just a handful of requests.
+
+    Returns (state_dirty, list_dirty) like _process_list.
+    """
+    list_path = BASE / "gamelist.json"
+    items = load_json(list_path) or []
+    if not items:
+        return False, False
+
+    from steam import (fetch_game_info_batch, GAME_HEADER_IMAGE_URL,
+                       GAME_STORE_URL)
+    from alerts import evaluate_and_alert
+
+    log.info(t("log.checking", count=len(items)) + "  (games)")
+    info = fetch_game_info_batch([g["appid"] for g in items],
+                                 country=country)
+
+    state_dirty = False
+    list_dirty = False
+    for g in items:
+        if g.get("no_check") or g.get("status") in _CLOSED_STATUSES:
+            continue
+        d = info.get(g.get("appid"))
+        if not d:
+            continue
+        for field in ("price", "price_str", "regular", "discount_pct"):
+            if g.get(field) != d[field]:
+                g[field] = d[field]
+                list_dirty = True
+        # Keep the (rarely changing) name fresh too — Steam occasionally
+        # renames editions.
+        if d["name"] and g.get("name") != d["name"]:
+            g["name"] = d["name"]
+            list_dirty = True
+
+        # Alert rule: ANY active sale (знижка > 0). The historical
+        # minimum is NOT a gate — it only powers the 🔥 punch line and
+        # the red row tint in the GUI. (The earlier cut>0 gate silenced
+        # every game ITAD has no data for, which was wrong.)
+        if not (g.get("discount_pct") or 0) > 0:
+            if g.get("status") in ("alerted", "checked"):
+                g["status"] = ""
+                list_dirty = True
+            key = f"game:{g.get('appid')}:{g.get('name')}"
+            if state.pop(key, None) is not None:
+                state_dirty = True
+            continue
+
+        if not isinstance(g.get("price"), (int, float)):
+            continue
+        minimum = _game_minimum(g)
+        at_min = isinstance(minimum, (int, float)) and g["price"] <= minimum
+        # «Не сповіщати»: silent "checked" badge instead of Telegram.
+        if g.get("no_alert"):
+            if g.get("status") != "checked":
+                g["status"] = "checked"
+                list_dirty = True
+            continue
+        alert_info = {
+            "name": g.get("name") or str(g.get("appid")),
+            "appid": g.get("appid"),
+            "display_name": g.get("name") or "",
+            "game_name": g.get("name") or "",
+            "market_hash_name": g.get("name") or "",
+            "image_url": GAME_HEADER_IMAGE_URL.format(appid=g["appid"]),
+            "alert_url": GAME_STORE_URL.format(appid=g["appid"]),
+            "lowest_price": g["price"],
+            "lowest_price_raw": g.get("price_str") or f"{g['price']:.2f}",
+            # Target == current price → "lowest <= target" always holds
+            # during a sale; antispam governs repeats.
+            "target_price": g["price"],
+            "volume": f"-{g.get('discount_pct') or 0}%",
+            "at_historical_min": at_min,
+        }
+        sd, did_alert, did_reset, _reason = evaluate_and_alert(
+            kind="game", info=alert_info, state=state,
+            token=token, chat_id=chat_id, template=template,
+            repeat_if_lower=repeat_if_lower,
+            remind_after_hours=remind_after_hours, now=now,
+        )
+        if sd:
+            state_dirty = True
+        if did_alert and g.get("status") != "alerted":
+            g["status"] = "alerted"
+            list_dirty = True
+        elif did_reset and g.get("status") == "alerted":
+            g["status"] = ""
+            list_dirty = True
 
     if list_dirty:
         save_json(list_path, items)
@@ -380,6 +528,22 @@ def main():
         # don't even try the sell list this round.
         if _RATE_LIMIT_KEY in state:
             break
+
+    # Wishlist games («Ігри» tab) — only when the bonus-content switch
+    # is on, and never during a rate-limit cooldown armed above. Uses
+    # the store API (separate rate budget from the market endpoints),
+    # but skipping during a 429 keeps the whole run's behaviour simple.
+    if ((config.get("ui") or {}).get("bonus_content")
+            and _RATE_LIMIT_KEY not in state):
+        sd, ld = _process_games(
+            config=config, state=state, country=country,
+            template=template, token=token, chat_id=chat_id,
+            repeat_if_lower=repeat_if_lower,
+            remind_after_hours=remind_after_hours, now=now,
+        )
+        if sd:
+            state_changed = True
+        any_processed = any_processed or ld
 
     if state_changed:
         save_json(BASE / "state.json", state)

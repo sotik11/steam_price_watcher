@@ -1,4 +1,5 @@
 """Steam Community Market API helpers."""
+import json
 import logging
 import re
 import time
@@ -1317,3 +1318,168 @@ def split_game_and_type(game_name_raw: str) -> tuple[str, str]:
         return (game.strip(), item_type.strip())
 
     return (raw, "")
+
+# ---------------------------------------------------------------------------
+# Wishlist games — for the «Ігри» tab (price-drop tracking on wished games).
+# ---------------------------------------------------------------------------
+
+WISHLIST_API_URL = "https://api.steampowered.com/IWishlistService/GetWishlist/v1/"
+STORE_ITEMS_API_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
+AUGMENTED_PRICES_URL = "https://api.augmentedsteam.com/prices/v2"
+
+# Steam's standard header capsule — used as the Telegram alert photo for
+# game alerts. Served from the public CDN, no auth, exists for virtually
+# every store app.
+GAME_HEADER_IMAGE_URL = ("https://shared.cloudflare.steamstatic.com/"
+                         "store_item_assets/steam/apps/{appid}/header.jpg")
+
+GAME_STORE_URL = "https://store.steampowered.com/app/{appid}/"
+
+
+def fetch_wishlist(steamid: str) -> list[dict]:
+    """Fetch the user's wishlist appids via IWishlistService.
+
+    Public endpoint — works without auth for profiles whose wishlist
+    is visible. Returns a list of `{appid, priority, date_added}`
+    dicts straight from Steam. Raises on network failure so the GUI
+    can show a real error instead of "0 games".
+    """
+    resp = requests.get(
+        WISHLIST_API_URL,
+        params={"steamid": str(steamid)},
+        headers={"User-Agent": _UA},
+        timeout=_TIMEOUT,
+    )
+    resp.raise_for_status()
+    items = ((resp.json() or {}).get("response") or {}).get("items") or []
+    log.info("wishlist: %d items for steamid %s", len(items), steamid)
+    return items
+
+
+def fetch_game_info_batch(appids: list[int], country: str = "UA",
+                          language: str = "ukrainian",
+                          chunk_size: int = 50) -> dict[int, dict]:
+    """Batch-fetch name + current price for store apps.
+
+    Uses IStoreBrowseService/GetItems — ONE request per `chunk_size`
+    apps, localised name + price in the user's region. Returns
+    `{appid: {"name", "price", "price_str", "regular", "discount_pct"}}`.
+    Apps with no price (unreleased, delisted, free) get price=None.
+
+    `price` / `regular` are floats in the region currency main unit
+    (₴, not kopecks); `price_str` is Steam's own formatted string
+    ("67,00₴") for display.
+    """
+    out: dict[int, dict] = {}
+    for i in range(0, len(appids), chunk_size):
+        chunk = appids[i:i + chunk_size]
+        input_json = json.dumps({
+            "ids": [{"appid": int(a)} for a in chunk],
+            "context": {"language": language, "country_code": country},
+            "data_request": {"include_basic_info": True},
+        })
+        try:
+            resp = requests.get(
+                STORE_ITEMS_API_URL,
+                params={"input_json": input_json},
+                headers={"User-Agent": _UA},
+                timeout=_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            log.warning("game info batch failed at chunk %d: %s", i, e)
+            continue
+        if resp.status_code != 200:
+            log.warning("game info batch HTTP %s at chunk %d",
+                        resp.status_code, i)
+            continue
+        items = ((resp.json() or {}).get("response") or {}) \
+            .get("store_items") or []
+        for it in items:
+            appid = it.get("appid")
+            if not appid:
+                continue
+            bp = it.get("best_purchase_option") or {}
+            final_cents = bp.get("final_price_in_cents")
+            # GetItems returns prices as string cents in some fields —
+            # normalise carefully. formatted_final_price is the
+            # human-readable fallback.
+            price = None
+            if final_cents is not None:
+                try:
+                    price = int(final_cents) / 100.0
+                except (TypeError, ValueError):
+                    price = None
+            regular = None
+            orig_cents = bp.get("original_price_in_cents")
+            if orig_cents is not None:
+                try:
+                    regular = int(orig_cents) / 100.0
+                except (TypeError, ValueError):
+                    regular = None
+            if regular is None:
+                regular = price
+            out[int(appid)] = {
+                "name": it.get("name") or "",
+                "price": price,
+                "price_str": bp.get("formatted_final_price") or "",
+                "regular": regular,
+                "discount_pct": int(bp.get("discount_pct") or 0),
+            }
+    log.info("game info batch: %d/%d resolved", len(out), len(appids))
+    return out
+
+
+def fetch_historical_lows(appids: list[int], country: str = "UA",
+                          chunk_size: int = 100) -> dict[int, int]:
+    """Batch-fetch each game's lowest-ever Steam discount via Augmented Steam.
+
+    Returns `{appid: cut}` where `cut` is the deepest historical
+    discount percentage on the Steam store (the "Lowest Recorded
+    Price" SteamDB shows is the same data point). We deliberately use
+    the PERCENTAGE, not the absolute amount: ITAD tracks USD pricing,
+    but the cut applies identically across currencies, so
+    `regular_uah × (100 − cut) / 100` reproduces the UAH historical
+    low without any exchange-rate juggling.
+
+    Endpoint is the same one the Augmented Steam browser extension
+    hits (shop 61 = Steam, backed by IsThereAnyDeal). No auth. Apps
+    unknown to ITAD are simply absent from the result.
+    """
+    out: dict[int, int] = {}
+    for i in range(0, len(appids), chunk_size):
+        chunk = [int(a) for a in appids[i:i + chunk_size]]
+        try:
+            resp = requests.post(
+                AUGMENTED_PRICES_URL,
+                json={
+                    "country": country,
+                    "apps": chunk,
+                    "subs": [],
+                    "bundles": [],
+                    "voucher": True,
+                    "shops": [61],
+                },
+                headers={"User-Agent": _UA},
+                timeout=_TIMEOUT,
+            )
+        except requests.RequestException as e:
+            log.warning("historical lows batch failed at chunk %d: %s", i, e)
+            continue
+        if resp.status_code != 200:
+            log.warning("historical lows HTTP %s at chunk %d",
+                        resp.status_code, i)
+            continue
+        prices = (resp.json() or {}).get("prices") or {}
+        for key, entry in prices.items():
+            # Keys look like "app/870780".
+            if not key.startswith("app/"):
+                continue
+            try:
+                appid = int(key.split("/", 1)[1])
+            except ValueError:
+                continue
+            cut = ((entry or {}).get("lowest") or {}).get("cut")
+            if isinstance(cut, int):
+                out[appid] = cut
+    log.info("historical lows: %d/%d resolved", len(out), len(appids))
+    return out

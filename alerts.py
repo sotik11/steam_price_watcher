@@ -64,7 +64,11 @@ def evaluate_and_alert(*, kind: str, info: dict, state: dict,
         return False, False, False, "no price or target"
 
     key = f"{kind}:{appid}:{name}"
-    hit_target = (lowest <= target) if kind == "buy" else (lowest < target)
+    # buy + game share the inclusive rule (price AT the threshold is
+    # already interesting: buy → "can buy at my price", game → "the
+    # discount reached the historical low"). Sell stays strict — an
+    # equal price doesn't undercut my listing.
+    hit_target = (lowest < target) if kind == "sell" else (lowest <= target)
     if not hit_target:
         # Price is above target right now (for sell: lowest >= target,
         # because the rule is strict <). Two things to do:

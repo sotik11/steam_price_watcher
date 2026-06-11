@@ -3,6 +3,7 @@ import csv
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,13 @@ WATCHLIST_PATH = BASE / "watchlist.json"
 SALELIST_PATH = BASE / "salelist.json"
 STATE_PATH = BASE / "state.json"
 PURCHASES_PATH = BASE / "purchases.json"
+# Wishlist-games tracking («Ігри» tab). Survives the bonus_content
+# checkbox being switched off — the tab hides, the data stays.
+GAMELIST_PATH = BASE / "gamelist.json"
+# Appids the wishlist import must never surface again — entries Steam's
+# GetItems can't resolve to a name (delisted / region-locked / bare
+# placeholders). Adding a game manually by URL un-blacklists it.
+GAMEBLACKLIST_PATH = BASE / "gameblacklist.json"
 LOG_PATH = BASE / "watch.log"
 
 # Shared logger writing to watch.log so user-initiated actions ("Оновити
@@ -85,8 +93,17 @@ def _migrate_state_keys(state: dict) -> bool:
     """
     changed = False
     for key in list(state.keys()):
-        if not key.startswith(("buy:", "sell:")):
+        if key.startswith("__"):
+            continue
+        # "game:" must be listed — without it this migration mangled
+        # every game-alert key into "buy:game:…" on each run, losing
+        # the antispam entry and re-alerting endlessly (2026-06-11).
+        if not key.startswith(("buy:", "sell:", "game:")):
             state["buy:" + key] = state.pop(key)
+            changed = True
+        elif key.startswith("buy:game:"):
+            # Heal keys already mangled by the buggy version.
+            state[key[len("buy:"):]] = state.pop(key)
             changed = True
     return changed
 
@@ -759,6 +776,12 @@ class App(tb.Window):
     # "📥" vs "" (empty for manually-added rows), so a click bunches
     # the imported rows together which is exactly what the user wants.
     _UNSORTABLE_COLS = {"num", "link"}
+    # Columns whose values are TITLES — sorted lexicographically, never
+    # via the money-parse heuristic (digits inside "Spider-Man 2" are
+    # not prices). Spans all trees: cards (name/type/game), games
+    # (name), history (card/game). See the text branch in _sort_tree.
+    _TEXT_SORT_COLS = {"name", "type", "game", "card", "status",
+                       "operation", "date"}
 
     def _setup_sortable_columns(self, tree: ttk.Treeview,
                                 column_keys: list[str]) -> None:
@@ -801,8 +824,30 @@ class App(tb.Window):
         # nothing visible (the user just saw this happen). Plain string
         # sort over the two values is enough; no numeric / empty-last
         # special-casing here.
-        if col == "imported":
+        if col in ("imported", "no_check", "no_alert"):
             pairs.sort(key=lambda p: p[0] or "", reverse=descending)
+        elif col in self._TEXT_SORT_COLS:
+            # Name-like columns: NEVER try the numeric parse — game and
+            # card titles routinely contain digits ("Spider-Man 2",
+            # "Gothic 1 Remake") and _try_parse_money would happily
+            # extract them, bunching every numbered title into a bogus
+            # "numeric" bucket (the wishlist-sort bug). Lexicographic
+            # only, grouped by script per the user's spec: CJK first,
+            # then Cyrillic, then Latin/other — each alphabetical.
+            def text_key(pair):
+                val = (pair[0] or "").strip()
+                if not val or val == "—":
+                    return (3, "")
+                ch = val[0]
+                code = ord(ch)
+                if 0x2E80 <= code <= 0x9FFF or 0x3040 <= code <= 0x30FF:
+                    group = 0   # CJK / kana
+                elif 0x0400 <= code <= 0x04FF:
+                    group = 1   # Cyrillic
+                else:
+                    group = 2   # Latin + everything else
+                return (group, val.casefold())
+            pairs.sort(key=text_key, reverse=descending)
         else:
             def key(pair):
                 val = pair[0]
@@ -842,6 +887,8 @@ class App(tb.Window):
             return "sell"
         if tree is getattr(self, "hist_tree", None):
             return "history"
+        if tree is getattr(self, "games_tree", None):
+            return "games"
         return None
 
     def _persist_sort_state(self, tree: ttk.Treeview) -> None:
@@ -972,8 +1019,17 @@ class App(tb.Window):
         # window is resized smaller. Reserving the BOTTOM slot now means
         # whatever notebook claims is "everything except the bottom row".
         self.statusbar = ttk.Label(self, text="  " + t("status.ready"),
-                                    relief="sunken", anchor=W)
+                                    relief="sunken", anchor=W,
+                                    justify=LEFT)
         self.statusbar.pack(fill=X, side=BOTTOM, ipady=2)
+        # Wrap instead of clip: when the window is narrow the status
+        # line flows onto a second row (the Label grows, pack fill=X
+        # re-reserves the height) so the full text is always readable.
+        self.statusbar.bind(
+            "<Configure>",
+            lambda e: self.statusbar.configure(
+                wraplength=max(200, e.width - 16)),
+        )
 
         self.notebook = ttk.Notebook(self)
         # pady=(25, 0) leaves a 25-px gap between the title bar and the
@@ -1059,6 +1115,7 @@ class App(tb.Window):
 
         self.tab_purchase  = _scrollable_tab()
         self.tab_sales     = _scrollable_tab()
+        self.tab_games     = _scrollable_tab()
         self.tab_history   = _scrollable_tab()
         self.tab_scheduler = ttk.Frame(self.notebook)
         self.tab_log       = ttk.Frame(self.notebook)
@@ -1067,6 +1124,7 @@ class App(tb.Window):
         for tab, key in [
             (self.tab_purchase,  "tab.purchase"),
             (self.tab_sales,     "tab.sales"),
+            (self.tab_games,     "tab.games"),
             (self.tab_history,   "tab.history"),
             (self.tab_scheduler, "tab.scheduler"),
             (self.tab_log,       "tab.log"),
@@ -1077,6 +1135,13 @@ class App(tb.Window):
             # For regular ttk.Frame tabs, add directly.
             real_tab = getattr(tab, "_holder", tab)
             self.notebook.add(real_tab, text=t(key))
+
+        # «Ігри» is gated by the Settings «Бонусний контент» checkbox.
+        # notebook.hide keeps the widget (and its data) alive and
+        # remembers the position, so re-enabling restores it exactly
+        # between Продаж and Історія. notebook.add(holder) un-hides.
+        if not (self.config_data.get("ui", {}) or {}).get("bonus_content"):
+            self.notebook.hide(self.tab_games._holder)
 
         # When the user switches tabs, re-read the underlying JSON so any
         # change made by an out-of-process watch.py run is reflected
@@ -1091,6 +1156,7 @@ class App(tb.Window):
 
         self._build_card_list_tab(self.tab_purchase, "buy")
         self._build_card_list_tab(self.tab_sales,    "sell")
+        self._build_games_tab()
         self._build_settings_tab()
         self._build_scheduler_tab()
         self._build_history_tab()
@@ -1442,25 +1508,37 @@ class App(tb.Window):
         # standalone window with its own title bar.
         top.overrideredirect(True)
         top.attributes("-topmost", True)
-        # Match the theme so the toast doesn't read as alien on a dark
-        # palette. Use the `danger` colour as the fill — same red the
-        # rest of the app uses for "you need to act".
-        bg = self.style.colors.danger
+        # Fill with the ACTIVE-TAB accent (Steam-green on the claude
+        # theme) — the earlier danger-red blended into the red row
+        # tints of the table behind it. The tab colour is guaranteed
+        # to contrast with both the chrome and the table.
+        current_theme = self.style.theme_use()
+        theme_meta = getattr(self, "_custom_theme_by_code", {}) \
+            .get(current_theme, {})
+        bg = theme_meta.get("active_tab_bg") or self.style.colors.success
         fg = "#FFFFFF"
         # Outer frame with the bg colour; inner padding gives the text
         # some air. Done as plain tk widgets so we can colour-fill the
         # bg (ttk.Frame ignores background overrides on most themes).
-        frame = tk.Frame(top, background=bg, padx=12, pady=8,
+        frame = tk.Frame(top, padx=12, pady=8,
                           highlightthickness=1, highlightbackground="#000000")
         frame.pack()
         lbl = tk.Label(
             frame,
             text=t("toast.session_expired"),
-            background=bg, foreground=fg,
+            foreground=fg,
             font=("Segoe UI", 10, "bold"),
             cursor="hand2",
         )
         lbl.pack()
+        # Colours applied POST-creation on purpose: ttkbootstrap hooks
+        # the vanilla tk widget constructors and slaps the theme's
+        # background on top of whatever kwargs we passed (diag log
+        # showed '#1E1F1F' despite background='#84BD3A' in the call).
+        # A .configure() after __init__ wins because the hook only
+        # fires at construction time.
+        frame.configure(background=bg)
+        lbl.configure(background=bg, foreground=fg)
         # Click handler — both label + frame so the user can hit either.
         def _on_click(_e=None):
             self._dismiss_session_expired_toast()
@@ -2921,6 +2999,9 @@ class App(tb.Window):
             result["value"] = kind
             dlg.destroy()
 
+        # Cards only ever go to Покупка / Продаж. Game records never
+        # reach this dialog — _hist_readd routes them straight back to
+        # the «Ігри» list (a game can't become a market card).
         ttk.Button(btn_row, text=t("dlg.choose_op.buy"),
                    command=lambda: choose("buy"),
                    bootstyle="success").pack(side=LEFT, padx=6)
@@ -2959,7 +3040,7 @@ class App(tb.Window):
         # glance.
         cols = ("num", "name", "type", "game",
                 "target", "last", "spread", "status",
-                "link", "imported")
+                "link", "imported", "no_check", "no_alert")
         headings = [
             ("num",      t("col.num"),       40),
             ("name",     t("col.name"),     200),
@@ -2971,6 +3052,8 @@ class App(tb.Window):
             ("status",   t("col.status"),   130),
             ("link",     t("col.link"),     110),
             ("imported", t("col.imported"),  60),
+            ("no_check", t("col.no_check"),  40),
+            ("no_alert", t("col.no_alert"),  40),
         ]
 
         btn_frame = ttk.Frame(parent)
@@ -2986,7 +3069,7 @@ class App(tb.Window):
         for col, text, width in headings:
             if col in ("target", "last", "spread"):
                 anchor = E
-            elif col in ("num", "link", "imported"):
+            elif col in ("num", "link", "imported", "no_check", "no_alert"):
                 anchor = CENTER
             else:
                 anchor = W
@@ -3102,6 +3185,14 @@ class App(tb.Window):
                                 command=self._import_from_steam,
                                 bootstyle="warning")
         btn_import.pack(side=LEFT, padx=2)
+        # Polling/alert mute toggles — flag-flippers on the selection,
+        # same handlers the context menu uses (see _toggle_flag).
+        ttk.Button(row2, text=t("btn.no_check"),
+                   command=lambda k=kind: self._toggle_flag(k, "no_check")
+                   ).pack(side=LEFT, padx=2)
+        ttk.Button(row2, text=t("btn.no_alert"),
+                   command=lambda k=kind: self._toggle_flag(k, "no_alert")
+                   ).pack(side=LEFT, padx=2)
         self.list_action_buttons[kind] = {
             "completed": btn_completed,
             "not": btn_not,
@@ -3297,6 +3388,10 @@ class App(tb.Window):
             # added cards with synced ones.
             item_type = item.get("item_type") or ""
             imported_glyph = "📥" if item.get("imported") else ""
+            # Presentation-only «пропущено» for no_check rows — keeps
+            # the stored status intact for when the flag comes off.
+            if item.get("no_check"):
+                status = t("status.value.skipped")
             tree.insert(
                 "", END,
                 # iid = record's uuid (uniquely identifies even duplicate
@@ -3308,6 +3403,8 @@ class App(tb.Window):
                     target_str, last, spread_str, status,
                     t("col.link.open"),
                     imported_glyph,
+                    "🚫" if item.get("no_check") else "",
+                    "🔇" if item.get("no_alert") else "",
                 ),
                 tags=(row_tag,),
             )
@@ -3423,6 +3520,1042 @@ class App(tb.Window):
             btn.configure(state=NORMAL, bootstyle="danger")
         else:
             btn.configure(state=DISABLED, bootstyle="")
+
+    # ------------------------------------------------------------------
+    # «Ігри» tab — wishlist game price tracking (bonus content)
+    # ------------------------------------------------------------------
+    #
+    # A third tracked list, but for store games instead of market cards:
+    #   * rows come from the user's Steam wishlist (one-click import);
+    #   * "Мінімум" is the historical-low price reconstructed from the
+    #     deepest recorded discount (Augmented Steam / ITAD data — the
+    #     same number SteamDB shows as "Lowest Recorded Price") applied
+    #     to Steam's regular price in the user's currency;
+    #   * alert rule: current price <= minimum → the discount matched
+    #     (or beat) the all-time low. kind="game" in the shared
+    #     antispam state.
+    # Lives behind the «Бонусний контент» Settings checkbox: hiding the
+    # tab stops polling/alerts but keeps gamelist.json intact.
+
+    _GAMES_LINK_COL_ID = "#8"   # «Посилання» column in the games tree
+
+    def _build_games_tab(self) -> None:
+        parent = self.tab_games
+        cols = ("num", "name", "regular", "discount", "price", "minimum",
+                "status", "link", "imported", "no_check", "no_alert")
+        headings = [
+            ("num",      "col.num",            40),
+            ("name",     "col.games.name",    280),
+            ("regular",  "col.games.regular", 90),
+            ("discount", "col.games.discount", 80),
+            ("price",    "col.games.price",   100),
+            ("minimum",  "col.games.minimum", 100),
+            ("status",   "col.status",        110),
+            ("link",     "col.link",          110),
+            ("imported", "col.imported",       55),
+            ("no_check", "col.no_check",       40),
+            ("no_alert", "col.no_alert",       40),
+        ]
+
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(side=BOTTOM, fill=X, padx=8, pady=(0, 8))
+        tree_frame = ttk.Frame(parent, borderwidth=1, relief="solid")
+        tree_frame.pack(side=TOP, fill=BOTH, expand=YES, padx=8, pady=8)
+
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
+                            selectmode="extended")
+        for col, key, width in headings:
+            if col in ("price", "minimum", "regular"):
+                anchor = E
+            elif col in ("num", "discount", "link", "imported",
+                         "no_check", "no_alert"):
+                anchor = CENTER
+            else:
+                anchor = W
+            tree.heading(col, text=t(key), anchor=anchor)
+            tree.column(col, width=width, anchor=anchor)
+        self._apply_row_tags(tree)
+        self._setup_sortable_columns(tree, list(cols))
+        self.games_tree = tree
+
+        tree.bind("<<TreeviewSelect>>", self._on_games_select)
+        tree.bind("<Button-1>", self._on_games_click)
+        tree.bind("<Motion>", self._on_games_motion)
+        tree.bind("<Control-KeyPress>", self._on_tree_ctrl_a)
+        tree.bind("<Button-3>", self._show_games_context_menu)
+
+        vsb = ttk.Scrollbar(tree_frame, orient=VERTICAL, command=tree.yview,
+                            bootstyle="success")
+        tree.configure(yscrollcommand=lambda f, l, sb=vsb:
+                       self._autohide_scrollbar(sb, f, l))
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        # Row 1: per-row actions. Row 2: bulk imports + the mute/skip
+        # toggles — mirrors the card tabs' "actions on top, imports
+        # below" split and keeps row 1 short enough for narrow windows.
+        row1 = ttk.Frame(btn_frame)
+        row1.pack(fill=X, pady=(0, 4))
+        ttk.Button(row1, text=t("btn.add_by_url"),
+                   command=self._games_add_by_url).pack(side=LEFT, padx=2)
+        ttk.Button(row1, text=t("btn.games_import"),
+                   command=self._games_import_wishlist,
+                   bootstyle="warning").pack(side=LEFT, padx=2)
+        ttk.Button(row1, text=t("btn.games_import_lows"),
+                   command=self._games_import_lows,
+                   bootstyle="warning").pack(side=LEFT, padx=2)
+        ttk.Button(row1, text=t("btn.check_now"),
+                   command=self._games_check_now).pack(side=LEFT, padx=2)
+        self.btn_games_delete = ttk.Button(
+            row1, text=t("btn.remove"), command=self._games_delete,
+            state=DISABLED,
+        )
+        self.btn_games_delete.pack(side=LEFT, padx=2)
+
+        row2 = ttk.Frame(btn_frame)
+        row2.pack(fill=X)
+        # «Вже придбав» / «Ще ні» act on the selection — disabled until
+        # one exists, same contract as Видалити (see _on_games_select).
+        self.btn_games_bought = ttk.Button(
+            row2, text=t("btn.bought"), command=self._games_mark_bought,
+            state=DISABLED,
+        )
+        self.btn_games_bought.pack(side=LEFT, padx=2)
+        self.btn_games_notyet = ttk.Button(
+            row2, text=t("btn.not_bought"),
+            command=lambda: self._reset_status("game"),
+            state=DISABLED,
+        )
+        self.btn_games_notyet.pack(side=LEFT, padx=2)
+        ttk.Button(row2, text=t("btn.no_check"),
+                   command=lambda: self._toggle_flag("game", "no_check")
+                   ).pack(side=LEFT, padx=2)
+        ttk.Button(row2, text=t("btn.no_alert"),
+                   command=lambda: self._toggle_flag("game", "no_alert")
+                   ).pack(side=LEFT, padx=2)
+
+        self._refresh_games_list()
+
+    # ---- rendering ---------------------------------------------------
+
+    @staticmethod
+    def _game_minimum(g: dict) -> float | None:
+        """Historical-low price in the user's currency, or None.
+
+        `lowest_cut` (deepest recorded Steam discount, %) is the stored
+        fact; the price is derived from the CURRENT regular price. When
+        today's discount equals the historical cut, snap to Steam's own
+        final price — Steam rounds (675 × 10% → 67, not 67.50) and the
+        snapped value matches what the user actually sees in the store.
+        """
+        cut = g.get("lowest_cut")
+        regular = g.get("regular")
+        if not isinstance(cut, int) or not isinstance(regular, (int, float)):
+            return None
+        if g.get("discount_pct") == cut and isinstance(
+                g.get("price"), (int, float)):
+            return g["price"]
+        return round(regular * (100 - cut) / 100.0, 2)
+
+    def _refresh_games_list(self) -> None:
+        tree = getattr(self, "games_tree", None)
+        if tree is None:
+            return
+        tree.delete(*tree.get_children())
+        items = load_json(GAMELIST_PATH, []) or []
+        # Closed rows (bought) stay in the file for History lineage but
+        # leave the visible table — same contract as the card lists.
+        items = [g for g in items
+                 if g.get("status") not in CLOSED_STATUSES]
+        for i, g in enumerate(items):
+            price = g.get("price")
+            regular = g.get("regular")
+            minimum = self._game_minimum(g)
+            disc = g.get("discount_pct") or 0
+            # Presentation-only status remap: a no_check row reads
+            # «пропущено» regardless of what's stored — the stored
+            # status stays intact for when the flag comes off.
+            raw_status = "skipped" if g.get("no_check") \
+                else g.get("status", "")
+            status = t(f"status.value.{raw_status}") if raw_status else ""
+            if status == f"status.value.{raw_status}":
+                status = raw_status
+            zebra = "even" if i % 2 == 0 else "odd"
+            # Row tint: RED when the price is at the all-time low (act
+            # now!), GREEN when any sale is on, zebra otherwise. The
+            # red check requires a real discount so never-discounted
+            # games (minimum == regular) don't light up.
+            if (disc > 0 and (g.get("lowest_cut") or 0) > 0
+                    and isinstance(price, (int, float))
+                    and isinstance(minimum, (int, float))
+                    and price <= minimum):
+                row_tag = "bad_match"
+            elif disc > 0:
+                row_tag = "good_match"
+            else:
+                row_tag = zebra
+            tree.insert(
+                "", END, iid=g["id"],
+                values=(
+                    i + 1,
+                    g.get("name") or f"app {g.get('appid')}",
+                    f"{regular:.2f}" if isinstance(regular, (int, float))
+                    else "—",
+                    f"-{disc}%" if disc else "—",
+                    g.get("price_str") or "—",
+                    f"{minimum:.2f}" if minimum is not None else "—",
+                    status,
+                    t("col.link.open"),
+                    "📥" if g.get("imported") else "",
+                    "🚫" if g.get("no_check") else "",
+                    "🔇" if g.get("no_alert") else "",
+                ),
+                tags=(row_tag,),
+            )
+        self._mark_selected_rows(tree)
+        self._restore_sort_state(tree)
+        self._on_games_select()
+        # Status bar shows "додано ігор: N" while this tab is active.
+        self._update_statusbar()
+
+    def _games_selected(self) -> list[dict]:
+        tree = getattr(self, "games_tree", None)
+        if tree is None:
+            return []
+        sel = set(tree.selection())
+        items = load_json(GAMELIST_PATH, []) or []
+        return [g for g in items if g.get("id") in sel]
+
+    def _on_games_select(self, _event=None) -> None:
+        tree = getattr(self, "games_tree", None)
+        btn = getattr(self, "btn_games_delete", None)
+        if tree is None or btn is None:
+            return
+        self._mark_selected_rows(tree)
+        try:
+            has_sel = bool(tree.selection())
+        except tk.TclError:
+            return
+        btn.configure(state=NORMAL if has_sel else DISABLED,
+                      bootstyle="danger" if has_sel else "")
+        # Same enable-on-select contract for the deal-closing pair;
+        # colours only while armed so the disabled state reads neutral.
+        b_bought = getattr(self, "btn_games_bought", None)
+        b_notyet = getattr(self, "btn_games_notyet", None)
+        if b_bought is not None:
+            b_bought.configure(state=NORMAL if has_sel else DISABLED,
+                               bootstyle="success" if has_sel else "")
+        if b_notyet is not None:
+            b_notyet.configure(state=NORMAL if has_sel else DISABLED,
+                               bootstyle="warning" if has_sel else "")
+
+    def _on_games_click(self, event):
+        tree = event.widget
+        if (tree.identify_region(event.x, event.y) == "cell"
+                and tree.identify_column(event.x) == self._GAMES_LINK_COL_ID):
+            iid = tree.identify_row(event.y)
+            if iid:
+                items = load_json(GAMELIST_PATH, []) or []
+                g = next((x for x in items if x.get("id") == iid), None)
+                if g:
+                    from steam import GAME_STORE_URL
+                    webbrowser.open(GAME_STORE_URL.format(appid=g["appid"]))
+
+    def _on_games_motion(self, event):
+        tree = event.widget
+        in_link = (
+            tree.identify_region(event.x, event.y) == "cell"
+            and tree.identify_column(event.x) == self._GAMES_LINK_COL_ID
+            and tree.identify_row(event.y)
+        )
+        tree.configure(cursor="hand2" if in_link else "")
+
+    def _show_games_context_menu(self, event) -> None:
+        tree = event.widget
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in tree.selection():
+            tree.selection_set(iid)
+            tree.focus(iid)
+            self._on_games_select()
+        menu = tk.Menu(self, tearoff=0, font=self._context_menu_font())
+        menu.add_command(label=t("btn.check_now"),
+                         command=self._games_check_now)
+        menu.add_command(label=t("ctx.update_min"),
+                         command=self._games_update_min_selected)
+        menu.add_command(label=t("ctx.open_store"),
+                         command=self._games_open_store)
+        menu.add_separator()
+        menu.add_command(label=t("btn.no_check"),
+                         command=lambda: self._toggle_flag("game", "no_check"))
+        menu.add_command(label=t("btn.no_alert"),
+                         command=lambda: self._toggle_flag("game", "no_alert"))
+        menu.add_command(label=t("btn.reset_status"),
+                         command=lambda: self._reset_status("game"))
+        menu.add_command(label=t("btn.reset_min"),
+                         command=self._games_reset_min)
+        menu.add_separator()
+        menu.add_command(label=t("btn.bought"),
+                         command=self._games_mark_bought)
+        menu.add_command(label=t("btn.not_bought"),
+                         command=lambda: self._reset_status("game"))
+        menu.add_separator()
+        menu.add_command(label=t("btn.remove"), command=self._games_delete)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _toggle_flag(self, kind: str, flag: str) -> None:
+        """Flip no_check / no_alert on the selected rows of any list.
+
+        Group semantics for multi-select: if at least one selected row
+        does NOT carry the flag, the click SETS it everywhere (make
+        the selection uniform); only when all of them have it does the
+        click clear it. Matches how checkbox tri-state toggles behave.
+
+        Side effects on SET:
+          * no_check → nothing else; the row simply stops being polled
+            (status renders as «пропущено» at display time).
+          * no_alert → nothing immediately; alert paths will write
+            status="checked" instead of "alerted" on the next hit.
+        On CLEAR of no_alert we also demote a stored "checked" status
+        back to "" so the row doesn't keep a stale badge.
+        """
+        if kind == "game":
+            selected = self._games_selected()
+            path = GAMELIST_PATH
+        else:
+            selected = self._require_selection()
+            path = self._kind_path(kind)
+        if not selected:
+            return
+        sel_ids = {r["id"] for r in selected}
+        items = load_json(path, []) or []
+        targets = [r for r in items if r.get("id") in sel_ids]
+        new_value = not all(r.get(flag) for r in targets)
+        for r in targets:
+            r[flag] = new_value
+            if flag == "no_alert" and not new_value \
+                    and r.get("status") == "checked":
+                r["status"] = ""
+        save_json(path, items)
+        if kind == "game":
+            self._refresh_games_list()
+        else:
+            self._refresh_card_list(kind)
+
+    def _reset_status(self, kind: str) -> None:
+        """Wipe status + antispam history on the selected rows.
+
+        Testing aid mostly: a row stuck on «сповіщено» blocks repeat
+        alerts via antispam; this clears both the badge and the state
+        entry so the very next check treats the row as never-alerted
+        and fires a fresh first_alert if the condition still holds.
+        """
+        if kind == "game":
+            selected = self._games_selected()
+            path = GAMELIST_PATH
+        else:
+            selected = self._require_selection()
+            path = self._kind_path(kind)
+        if not selected:
+            return
+        sel_ids = {r["id"] for r in selected}
+        items = load_json(path, []) or []
+        state = load_json(STATE_PATH, {}) or {}
+        state_dirty = False
+        for r in items:
+            if r.get("id") not in sel_ids:
+                continue
+            if r.get("status") not in CLOSED_STATUSES:
+                r["status"] = ""
+            key = f"{kind}:{r.get('appid')}:{r.get('name')}"
+            if state.pop(key, None) is not None:
+                state_dirty = True
+        save_json(path, items)
+        if state_dirty:
+            save_json(STATE_PATH, state)
+        if kind == "game":
+            self._refresh_games_list()
+        else:
+            self._refresh_card_list(kind)
+        self._set_status(t("status.reset_done", count=len(sel_ids)))
+
+    def _games_open_store(self) -> None:
+        sel = self._games_selected()
+        if sel:
+            from steam import GAME_STORE_URL
+            webbrowser.open(GAME_STORE_URL.format(appid=sel[0]["appid"]))
+
+    # ---- actions -----------------------------------------------------
+
+    def _games_delete(self) -> None:
+        sel = self._games_selected()
+        if not sel:
+            return
+        names = ", ".join((g.get("name") or "?")[:40] for g in sel[:5])
+        if len(sel) > 5:
+            names += " …"
+        if not messagebox.askyesno(
+                t("dlg.games_remove.title"),
+                t("dlg.games_remove.body", count=len(sel), names=names),
+                parent=self):
+            return
+        sel_ids = {g["id"] for g in sel}
+        items = load_json(GAMELIST_PATH, []) or []
+        items = [g for g in items if g.get("id") not in sel_ids]
+        save_json(GAMELIST_PATH, items)
+        # Clear antispam entries so a re-added game starts fresh.
+        state = load_json(STATE_PATH, {}) or {}
+        dirty = False
+        for g in sel:
+            if state.pop(f"game:{g.get('appid')}:{g.get('name')}", None) is not None:
+                dirty = True
+        if dirty:
+            save_json(STATE_PATH, state)
+        self._refresh_games_list()
+        self._set_status(t("status.games_removed", count=len(sel)))
+
+    def _games_reset_min(self) -> None:
+        """Context-menu: forget the stored historical-low for selection.
+
+        Clears `lowest_cut`, so «Мінімальна» reads "—" until the next
+        «Імпорт мін. цін» / «Оновити мінімальну ціну». Useful when ITAD
+        served stale data and the user wants a clean re-fetch marker.
+        """
+        sel = self._games_selected()
+        if not sel:
+            return
+        sel_ids = {g["id"] for g in sel}
+        items = load_json(GAMELIST_PATH, []) or []
+        for g in items:
+            if g.get("id") in sel_ids:
+                g["lowest_cut"] = None
+        save_json(GAMELIST_PATH, items)
+        self._refresh_games_list()
+        self._set_status(t("status.reset_done", count=len(sel_ids)))
+
+    def _games_mark_bought(self) -> None:
+        """«Вже придбав» for games — same contract as the card lists.
+
+        Per selected game: price dialog (default = the current
+        discounted price), a purchases.json record with operation
+        "buy" + kind "game" (History link handler uses the kind to
+        open the STORE page instead of a market listing), then
+        status="bought" hides the row from the tab and the polls
+        while keeping it in gamelist.json. History totals pick the
+        spend up exactly like card purchases.
+        """
+        sel = self._games_selected()
+        if not sel:
+            return
+        sym = self._currency_symbol()
+        ts = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        items = load_json(GAMELIST_PATH, []) or []
+        by_id = {g.get("id"): g for g in items}
+        state = load_json(STATE_PATH, {}) or {}
+        new_purchases: list[dict] = []
+        closed = 0
+        for chosen in sel:
+            g = by_id.get(chosen.get("id"))
+            if g is None or g.get("status") in CLOSED_STATUSES:
+                continue
+            price = g.get("price")
+            default_str = (f"{price:.2f}"
+                           if isinstance(price, (int, float)) else "")
+            ans = simpledialog.askstring(
+                t("dlg.completed.title"),
+                t("dlg.completed.body_buy", name=g.get("name") or "?",
+                  sym=sym),
+                initialvalue=default_str, parent=self,
+            )
+            if ans is None:
+                continue
+            try:
+                price_val = float(ans.replace(",", "."))
+            except ValueError:
+                messagebox.showerror(t("dlg.error.title"),
+                                     t("dlg.bad_number"), parent=self)
+                continue
+            from steam import GAME_HEADER_IMAGE_URL
+            new_purchases.append({
+                "name": g.get("name"),
+                "display_name": g.get("name"),
+                "game_name": g.get("name"),
+                "image_url": GAME_HEADER_IMAGE_URL.format(appid=g["appid"]),
+                "appid": g.get("appid"),
+                "market_hash_name": g.get("name"),
+                "price": f"{price_val:.2f} {sym}".rstrip(),
+                "target": self._game_minimum(g),
+                "operation": "buy",
+                "kind": "game",
+                "timestamp": ts,
+            })
+            g["status"] = "bought"
+            state.pop(f"game:{g.get('appid')}:{g.get('name')}", None)
+            closed += 1
+        if not closed:
+            return
+        purchases = load_json(PURCHASES_PATH, []) or []
+        purchases.extend(new_purchases)
+        save_json(GAMELIST_PATH, items)
+        save_json(PURCHASES_PATH, purchases)
+        save_json(STATE_PATH, state)
+        self._refresh_games_list()
+        self._refresh_history()
+
+    def _games_import_wishlist(self) -> None:
+        """Import / refresh from the Steam wishlist.
+
+        Existing rows (matched by appid) get their name + price data
+        overwritten silently — re-import IS the refresh. Games present
+        in the wishlist but not in the list go through a checklist
+        dialog (pre-checked; the user unchecks what to skip, or cancels
+        the whole add). Games removed from the wishlist are left alone —
+        the local list is curated by the user, not mirrored.
+        """
+        steam_cfg = self.config_data.get("steam") or {}
+        steamid = (steam_cfg.get("id") or "").strip()
+        if not steamid:
+            messagebox.showinfo(t("dlg.games_import.title"),
+                                t("dlg.games_import.no_steamid"),
+                                parent=self)
+            return
+        self._set_status(t("status.games_importing"))
+
+        def worker():
+            import steam as steam_mod
+            try:
+                wl = steam_mod.fetch_wishlist(steamid)
+                appids = [w["appid"] for w in wl if w.get("appid")]
+                info = steam_mod.fetch_game_info_batch(
+                    appids,
+                    country=(self.config_data.get("market") or {})
+                    .get("country", "UA"),
+                )
+            except Exception as e:
+                log.error("wishlist import failed: %s", e)
+                self.after(0, lambda err=str(e): self._set_status(
+                    t("status.games_import_error", err=err)))
+                return
+            self.after(0, lambda: self._games_apply_import(appids, info))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _games_apply_import(self, appids: list[int],
+                            info: dict[int, dict]) -> None:
+        """Tk-thread half of the wishlist import.
+
+        Unresolvable wishlist entries — appids GetItems can't give a
+        NAME for (delisted, region-locked, bare placeholder pages) —
+        are useless rows ("app 2986410" with dashes everywhere). They
+        go to gameblacklist.json: skipped on this and every future
+        import, and any such rows already sitting in the list are
+        pruned. Manually adding a game by URL removes it from the
+        blacklist (explicit user intent beats the auto-filter).
+        """
+        blacklist = set(load_json(GAMEBLACKLIST_PATH, []) or [])
+        bl_dirty = False
+        items = load_json(GAMELIST_PATH, []) or []
+        # Prune existing junk rows: blacklisted OR still nameless.
+        pruned = [g for g in items
+                  if g.get("appid") not in blacklist and g.get("name")]
+        list_dirty = len(pruned) != len(items)
+        items = pruned
+        by_appid = {g.get("appid"): g for g in items}
+        updated = 0
+        new_games: list[dict] = []
+        for appid in appids:
+            if appid in blacklist:
+                continue
+            d = info.get(appid)
+            if not d or not d.get("name"):
+                # Steam can't even name it — blacklist so it never
+                # clutters the table again.
+                blacklist.add(appid)
+                bl_dirty = True
+                log.info("game %s unresolvable — blacklisted", appid)
+                continue
+            if appid in by_appid:
+                g = by_appid[appid]
+                g["name"] = d["name"] or g.get("name") or ""
+                g["price"] = d["price"]
+                g["price_str"] = d["price_str"]
+                g["regular"] = d["regular"]
+                g["discount_pct"] = d["discount_pct"]
+                g["imported"] = True
+                updated += 1
+            else:
+                new_games.append({
+                    "id": str(uuid.uuid4()),
+                    "appid": appid,
+                    "name": d["name"],
+                    "price": d["price"],
+                    "price_str": d["price_str"],
+                    "regular": d["regular"],
+                    "discount_pct": d["discount_pct"],
+                    "lowest_cut": None,
+                    "status": "",
+                    "imported": True,
+                    "added": datetime.now(timezone.utc).isoformat(),
+                })
+        if bl_dirty:
+            save_json(GAMEBLACKLIST_PATH, sorted(blacklist))
+        if updated or list_dirty:
+            save_json(GAMELIST_PATH, items)
+        if not new_games:
+            self._refresh_games_list()
+            discounted = sum(1 for g in items
+                             if (g.get("discount_pct") or 0) > 0
+                             and g.get("status") not in CLOSED_STATUSES)
+            self._set_status(t("status.games_import_done",
+                               added=0, updated=updated,
+                               discounted=discounted))
+            return
+        picked = self._games_pick_new_dialog(new_games)
+        if picked:
+            items.extend(picked)
+            save_json(GAMELIST_PATH, items)
+        self._refresh_games_list()
+        discounted = sum(1 for g in items
+                         if (g.get("discount_pct") or 0) > 0
+                         and g.get("status") not in CLOSED_STATUSES)
+        self._set_status(t("status.games_import_done",
+                           added=len(picked), updated=updated,
+                           discounted=discounted))
+
+    def _games_pick_new_dialog(self, new_games: list[dict]) -> list[dict]:
+        """Checklist modal for wishlist games not yet in the list.
+
+        Same interaction contract as the cards import dialog: every row
+        pre-checked, click toggles ☑/☐, «Додати» applies the checked
+        subset, «Скасувати» adds nothing. Blocks via wait_window.
+        """
+        result: list[dict] = []
+        dlg = tk.Toplevel(self)
+        dlg.title(t("dlg.games_import.title"))
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.geometry("640x480")
+
+        outer = ttk.Frame(dlg, padding=10)
+        outer.pack(fill=BOTH, expand=YES)
+        ttk.Label(outer, text=t("dlg.games_import.found",
+                                count=len(new_games))).pack(anchor=W)
+
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(side=BOTTOM, fill=X, pady=(8, 0))
+
+        frame = ttk.Frame(outer, borderwidth=1, relief="solid")
+        frame.pack(fill=BOTH, expand=YES, pady=(8, 0))
+        cols = ("chk", "name", "price", "discount")
+        tv = ttk.Treeview(frame, columns=cols, show="headings",
+                          selectmode="none")
+        tv.heading("chk", text="✓", anchor=CENTER)
+        tv.column("chk", width=40, anchor=CENTER, stretch=False)
+        tv.heading("name", text=t("col.games.name"), anchor=W)
+        tv.column("name", width=330, anchor=W)
+        tv.heading("price", text=t("col.games.price"), anchor=E)
+        tv.column("price", width=100, anchor=E)
+        tv.heading("discount", text=t("col.games.discount"), anchor=CENTER)
+        tv.column("discount", width=80, anchor=CENTER)
+        self._apply_row_tags(tv)
+        vsb = ttk.Scrollbar(frame, orient=VERTICAL, command=tv.yview,
+                            bootstyle="success")
+        tv.configure(yscrollcommand=vsb.set)
+        tv.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
+
+        checked: dict[str, bool] = {}
+        for i, g in enumerate(new_games):
+            iid = g["id"]
+            checked[iid] = True
+            disc = g.get("discount_pct") or 0
+            tv.insert("", END, iid=iid, values=(
+                "☑", g["name"], g.get("price_str") or "—",
+                f"-{disc}%" if disc else "—",
+            ), tags=("even" if i % 2 == 0 else "odd",))
+
+        def _toggle(event):
+            iid = tv.identify_row(event.y)
+            if not iid:
+                return
+            checked[iid] = not checked.get(iid, False)
+            vals = list(tv.item(iid, "values"))
+            vals[0] = "☑" if checked[iid] else "☐"
+            tv.item(iid, values=vals)
+        tv.bind("<Button-1>", _toggle)
+
+        def _apply():
+            result.extend(g for g in new_games if checked.get(g["id"]))
+            dlg.destroy()
+        ttk.Button(btn_row, text=t("dlg.games_import.add"),
+                   bootstyle="success", command=_apply
+                   ).pack(side=RIGHT, padx=(6, 0))
+        ttk.Button(btn_row, text=t("dlg.import.btn_cancel"),
+                   bootstyle="danger", command=dlg.destroy
+                   ).pack(side=RIGHT)
+
+        dlg.wait_window()
+        return result
+
+    def _games_add_by_url(self) -> None:
+        """Add a single game from a Steam store URL.
+
+        Accepts anything containing /app/{appid} (full store URLs with
+        slugs and query params included) or a bare numeric appid.
+        Manual add un-blacklists the appid — explicit user intent beats
+        the import's junk filter. Row gets imported=False so it reads
+        as hand-picked in the 📥 column.
+        """
+        ans = simpledialog.askstring(
+            t("dlg.games_import.title"), t("dlg.games_add_url.ask"),
+            parent=self)
+        if not ans:
+            return
+        m = re.search(r"/app/(\d+)", ans) or re.fullmatch(r"\s*(\d+)\s*", ans)
+        if not m:
+            messagebox.showerror(t("dlg.error.title"),
+                                 t("dlg.games_add_url.bad"), parent=self)
+            return
+        appid = int(m.group(1))
+        items = load_json(GAMELIST_PATH, []) or []
+        if any(g.get("appid") == appid for g in items):
+            self._set_status(t("status.games_already_listed"))
+            return
+        self._set_status(t("status.games_importing"))
+
+        def worker():
+            import steam as steam_mod
+            try:
+                info = steam_mod.fetch_game_info_batch(
+                    [appid],
+                    country=(self.config_data.get("market") or {})
+                    .get("country", "UA"),
+                )
+            except Exception as e:
+                self.after(0, lambda err=str(e): self._set_status(
+                    t("status.games_import_error", err=err)))
+                return
+            self.after(0, lambda: self._games_apply_add(appid, info))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _games_apply_add(self, appid: int, info: dict[int, dict]) -> None:
+        d = info.get(appid)
+        if not d or not d.get("name"):
+            self._set_status(t("status.games_import_error",
+                               err=f"app {appid} not resolvable"))
+            return
+        # Un-blacklist: the user explicitly wants this one tracked.
+        blacklist = set(load_json(GAMEBLACKLIST_PATH, []) or [])
+        if appid in blacklist:
+            blacklist.discard(appid)
+            save_json(GAMEBLACKLIST_PATH, sorted(blacklist))
+        items = load_json(GAMELIST_PATH, []) or []
+        items.append({
+            "id": str(uuid.uuid4()),
+            "appid": appid,
+            "name": d["name"],
+            "price": d["price"],
+            "price_str": d["price_str"],
+            "regular": d["regular"],
+            "discount_pct": d["discount_pct"],
+            "lowest_cut": None,
+            "status": "",
+            "imported": False,
+            "added": datetime.now(timezone.utc).isoformat(),
+        })
+        save_json(GAMELIST_PATH, items)
+        self._refresh_games_list()
+        self._set_status(t("status.games_added", name=d["name"]))
+
+    def _games_import_lows(self) -> None:
+        """Fetch historical-low discounts for EVERY game in the list."""
+        items = load_json(GAMELIST_PATH, []) or []
+        if not items:
+            self._set_status(t("status.games_empty"))
+            return
+        self._set_status(t("status.games_lows_importing"))
+        appids = [g["appid"] for g in items]
+
+        def worker():
+            import steam as steam_mod
+            try:
+                lows = steam_mod.fetch_historical_lows(
+                    appids,
+                    country=(self.config_data.get("market") or {})
+                    .get("country", "UA"),
+                )
+            except Exception as e:
+                log.error("historical lows import failed: %s", e)
+                self.after(0, lambda err=str(e): self._set_status(
+                    t("status.games_import_error", err=err)))
+                return
+            self.after(0, lambda: self._games_apply_lows(lows))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _games_apply_lows(self, lows: dict[int, int],
+                          only_appids: set[int] | None = None) -> None:
+        """Apply fetched historical-low cuts.
+
+        `only_appids` scopes the whole pass (updates, missing-data
+        warnings, the one-shot alert sweep) to that subset — the
+        context-menu «Оновити мінімальну ціну» works on the selection
+        ONLY, while the toolbar import covers the entire list.
+        """
+        items = load_json(GAMELIST_PATH, []) or []
+        resolved = 0
+        for g in items:
+            appid = g.get("appid")
+            if only_appids is not None and appid not in only_appids:
+                continue
+            cut = lows.get(appid)
+            if isinstance(cut, int):
+                g["lowest_cut"] = cut
+                resolved += 1
+            elif g.get("lowest_cut") is None:
+                # No data on ITAD for this app — note it in the log so
+                # the user knows why «Мінімум» stays a dash.
+                log.warning(t("log.games_no_low", name=g.get("name") or "?"))
+        save_json(GAMELIST_PATH, items)
+        self._refresh_games_list()
+        # Fresh minimums may reveal that a game is AT its all-time low
+        # right now — tell the user immediately instead of waiting for
+        # the next scheduler tick. Reuses the standard alert pipeline
+        # (cached prices, no refetch), so antispam makes it one-shot:
+        # the next poll sees the state entry and stays silent.
+        self._games_apply_check({}, evaluate_stored=True, force_at_min=True,
+                                only_appids=only_appids, quiet=True)
+        # Status line LAST — both refreshes above run _update_statusbar
+        # (the scheduler summary), which would overwrite anything set
+        # earlier. Whatever writes last owns the bar.
+        def _is_at_min(g: dict) -> bool:
+            """Red-row condition: on sale AND at/below the all-time low."""
+            return ((g.get("discount_pct") or 0) > 0
+                    and isinstance(g.get("price"), (int, float))
+                    and isinstance(self._game_minimum(g), (int, float))
+                    and g["price"] <= self._game_minimum(g)
+                    and g.get("status") not in CLOSED_STATUSES)
+
+        if only_appids is not None:
+            # Selection refresh: report only about the updated rows —
+            # the global counters would drown the answer the user
+            # actually asked for ("did MY game move?").
+            at_min_sel = sum(1 for g in items
+                             if g.get("appid") in only_appids
+                             and _is_at_min(g))
+            if at_min_sel:
+                self._set_status(t("status.games_lows_updated_min",
+                                   count=resolved, at_min=at_min_sel))
+            else:
+                self._set_status(t("status.games_lows_updated",
+                                   count=resolved))
+        else:
+            at_min = sum(1 for g in items if _is_at_min(g))
+            self._set_status(t("status.games_lows_done",
+                               count=resolved, total=len(items),
+                               at_min=at_min))
+
+    def _games_update_min_selected(self) -> None:
+        """Context-menu: refresh the historical low for selected games only."""
+        sel = self._games_selected()
+        if not sel:
+            return
+        appids = [g["appid"] for g in sel]
+        scope = set(appids)
+        self._set_status(t("status.games_lows_importing"))
+
+        def worker():
+            import steam as steam_mod
+            try:
+                lows = steam_mod.fetch_historical_lows(
+                    appids,
+                    country=(self.config_data.get("market") or {})
+                    .get("country", "UA"),
+                )
+            except Exception as e:
+                log.error("historical low refresh failed: %s", e)
+                self.after(0, lambda err=str(e): self._set_status(
+                    t("status.games_import_error", err=err)))
+                return
+            # Scope the apply to the selection — without it the pass
+            # touched (and force-alerted) the WHOLE list.
+            self.after(0, lambda: self._games_apply_lows(
+                lows, only_appids=scope))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _games_check_now(self) -> None:
+        """Re-poll prices for the selected games (or all when none picked).
+
+        One GetItems batch per 50 games — no per-item delay needed, the
+        store API isn't the rate-limited market endpoint.
+        """
+        sel = self._games_selected()
+        items_all = load_json(GAMELIST_PATH, []) or []
+        # no_check rows are excluded even when explicitly selected —
+        # «Не перевіряти» means exactly that. Closed (bought) rows are
+        # done deals, nothing to poll.
+        targets = [g for g in (sel or items_all)
+                   if not g.get("no_check")
+                   and g.get("status") not in CLOSED_STATUSES]
+        if not targets:
+            self._set_status(t("status.games_empty"))
+            return
+        appids = [g["appid"] for g in targets]
+        self._set_status(t("status.checking_multi", count=len(appids)))
+
+        def worker():
+            import steam as steam_mod
+            try:
+                info = steam_mod.fetch_game_info_batch(
+                    appids,
+                    country=(self.config_data.get("market") or {})
+                    .get("country", "UA"),
+                )
+            except Exception as e:
+                log.error("games price check failed: %s", e)
+                self.after(0, lambda err=str(e): self._set_status(
+                    t("status.games_import_error", err=err)))
+                return
+            self.after(0, lambda: self._games_apply_check(info))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _games_apply_check(self, info: dict[int, dict],
+                           evaluate_stored: bool = False,
+                           force_at_min: bool = False,
+                           only_appids: set[int] | None = None,
+                           quiet: bool = False) -> None:
+        """Apply freshly polled prices + run the alert evaluation.
+
+        `evaluate_stored=True` runs the alert pass over rows that have
+        NO fresh fetch in `info`, using the prices already on record —
+        the post-«Імпорт мін. цін» path uses this to fire immediate
+        alerts for games that just turned out to be at their all-time
+        low, without re-polling Steam.
+
+        `force_at_min=True` (same path) clears the antispam entry for
+        games sitting AT the minimum before evaluating, so the user
+        gets the promised one-shot Telegram message even if the game
+        was already alerted earlier under a plain-sale rule. One-shot
+        per import click — the evaluation re-arms antispam right after.
+        """
+        from alerts import evaluate_and_alert
+        from steam import GAME_HEADER_IMAGE_URL, GAME_STORE_URL
+
+        items = load_json(GAMELIST_PATH, []) or []
+        state = load_json(STATE_PATH, {}) or {}
+        state_dirty = False
+        alerted = 0
+        cfg = self.config_data
+        tg_cfg = cfg.get("telegram", {})
+        token = tg_cfg.get("bot_token", "")
+        chat_id = str(tg_cfg.get("chat_id", ""))
+        template = (cfg.get("message_template") or "").strip() \
+            or t("tg.message.default")
+        spam = cfg.get("antispam", {})
+        now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        for g in items:
+            if g.get("no_check") or g.get("status") in CLOSED_STATUSES:
+                continue
+            if (only_appids is not None
+                    and g.get("appid") not in only_appids):
+                continue
+            d = info.get(g.get("appid"))
+            if d:
+                g["price"] = d["price"]
+                g["price_str"] = d["price_str"]
+                g["regular"] = d["regular"]
+                g["discount_pct"] = d["discount_pct"]
+            elif not evaluate_stored:
+                continue
+            minimum = self._game_minimum(g)
+            # Alert rule: ANY active sale (знижка > 0). The historical
+            # minimum is NOT a gate — plenty of wishlist games have no
+            # ITAD data and the user still wants to hear about their
+            # sales. The minimum only powers the 🔥 punch line in the
+            # Telegram message + the red row tint.
+            if not (g.get("discount_pct") or 0) > 0:
+                # Sale ended → clear alert state so the next sale fires
+                # a fresh first_alert.
+                if g.get("status") in ("alerted", "checked"):
+                    g["status"] = ""
+                key = f"game:{g.get('appid')}:{g.get('name')}"
+                if state.pop(key, None) is not None:
+                    state_dirty = True
+                continue
+            if (not token or not chat_id
+                    or not isinstance(g.get("price"), (int, float))):
+                continue
+            at_min = (isinstance(minimum, (int, float))
+                      and g["price"] <= minimum)
+            # «Не сповіщати»: still polled (prices updated above), but
+            # the Telegram path is skipped. The sale is running, so the
+            # row earns the silent "checked" badge.
+            if g.get("no_alert"):
+                if g.get("status") != "checked":
+                    g["status"] = "checked"
+                continue
+            if force_at_min and at_min:
+                # Post-lows one-shot: drop the antispam entry so the
+                # evaluation below fires a fresh first_alert even for a
+                # game already alerted under the plain-sale rule.
+                if state.pop(f"game:{g.get('appid')}:{g.get('name')}",
+                             None) is not None:
+                    state_dirty = True
+            alert_info = {
+                "name": g.get("name") or str(g.get("appid")),
+                "appid": g.get("appid"),
+                "display_name": g.get("name") or "",
+                "game_name": g.get("name") or "",
+                "market_hash_name": g.get("name") or "",
+                "image_url": GAME_HEADER_IMAGE_URL.format(appid=g["appid"]),
+                "alert_url": GAME_STORE_URL.format(appid=g["appid"]),
+                "lowest_price": g["price"],
+                "lowest_price_raw": g.get("price_str") or f"{g['price']:.2f}",
+                # Target == current price → evaluate_and_alert's
+                # "lowest <= target" always holds while a sale runs;
+                # antispam governs repeats (deeper cut → re-alert via
+                # repeat_if_lower; otherwise remind_after_hours).
+                "target_price": g["price"],
+                "volume": f"-{g.get('discount_pct') or 0}%",
+                "at_historical_min": at_min,
+            }
+            sd, did_alert, did_reset, _reason = evaluate_and_alert(
+                kind="game", info=alert_info, state=state,
+                token=token, chat_id=chat_id, template=template,
+                repeat_if_lower=spam.get("repeat_if_lower", True),
+                remind_after_hours=spam.get("remind_after_hours", 24),
+                now=now_dt,
+            )
+            if sd:
+                state_dirty = True
+            if did_alert:
+                alerted += 1
+                g["status"] = "alerted"
+            elif did_reset and g.get("status") == "alerted":
+                g["status"] = ""
+
+        save_json(GAMELIST_PATH, items)
+        if state_dirty:
+            save_json(STATE_PATH, state)
+        self._refresh_games_list()
+        # `quiet` callers (the post-lows sweep) own the status line —
+        # don't clobber their "мінімальні ціни: …" message with the
+        # generic "Перевірено N".
+        if not quiet:
+            self._set_status(t("status.games_checked",
+                               count=len(info), alerted=alerted))
 
     # ------------------------------------------------------------------
     # Metadata backfill
@@ -3732,6 +4865,22 @@ class App(tb.Window):
             label=t("btn.not_bought"),
             command=self._mark_not_bought,
             state=_state_of("not"),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label=t("btn.no_check"),
+            command=lambda k=kind: self._toggle_flag(k, "no_check"),
+            state=_state_of("remove"),
+        )
+        menu.add_command(
+            label=t("btn.no_alert"),
+            command=lambda k=kind: self._toggle_flag(k, "no_alert"),
+            state=_state_of("remove"),
+        )
+        menu.add_command(
+            label=t("btn.reset_status"),
+            command=lambda k=kind: self._reset_status(k),
+            state=_state_of("remove"),
         )
         menu.add_separator()
         menu.add_command(
@@ -4222,6 +5371,11 @@ class App(tb.Window):
         selected = self._require_selection()
         if not selected:
             return
+        # «Не перевіряти» rows are excluded even from an explicit manual
+        # check — the flag means "leave this one alone, period".
+        selected = [w for w in selected if not w.get("no_check")]
+        if not selected:
+            return
         kind = self._active_kind()
         path = self._kind_path(kind)
 
@@ -4367,6 +5521,22 @@ class App(tb.Window):
                                    name=pretty_name(w)[:40],
                                    lowest=lowest_now))
                         continue
+
+                # «Не сповіщати»: price data above is already applied;
+                # mirror the would-be alert as a silent "checked" badge
+                # and skip the Telegram path entirely.
+                if w.get("no_alert"):
+                    target_na = w.get("target_price")
+                    lowest_na = info.get("lowest_price")
+                    if (isinstance(target_na, (int, float))
+                            and isinstance(lowest_na, (int, float))):
+                        hit = (lowest_na < target_na) if kind == "sell" \
+                            else (lowest_na <= target_na)
+                        if hit and w.get("status") in ("", "checked"):
+                            w["status"] = "checked"
+                        elif not hit and w.get("status") == "checked":
+                            w["status"] = ""
+                    continue
 
                 # Now run the alert evaluation — same logic watch.py uses.
                 # Merge the polled price info onto the card record so
@@ -6359,12 +7529,14 @@ class App(tb.Window):
         log.info("log toggles: system_log=%s debug_log=%s", sys_log, dbg_log)
 
     def _on_bonus_content_toggle(self) -> None:
-        """Persist the «Бонусний контент» switch + (later) toggle the tab.
+        """Persist the «Бонусний контент» switch + show/hide the «Ігри» tab.
 
-        For now the only effect is the config write — the wishlist-
-        tracking tab this gates will be wired here when it lands (show
-        via notebook.add / hide via notebook.hide, keeping the widgets
-        and their data alive between flips).
+        notebook.hide keeps the tab's widget tree (and the Treeview's
+        contents) alive and remembers the position; notebook.add on a
+        hidden-but-managed child restores it to that same slot, so the
+        tab reliably re-appears between Продаж and Історія. gamelist.json
+        is untouched either way — disabling the tab merely stops the
+        polling/alerts (watch.py checks this same config flag).
         """
         enabled = bool(self.var_bonus_content.get())
         self.config_data.setdefault("ui", {})["bonus_content"] = enabled
@@ -6377,6 +7549,18 @@ class App(tb.Window):
             save_json(CONFIG_PATH, on_disk)
         except Exception as e:
             log.warning("could not persist bonus_content toggle: %s", e)
+        # Live tab toggle. Guarded — the checkbox var can fire during
+        # Settings construction before the games tab exists.
+        holder = getattr(getattr(self, "tab_games", None), "_holder", None)
+        if holder is not None:
+            try:
+                if enabled:
+                    self.notebook.add(holder)
+                    self._refresh_games_list()
+                else:
+                    self.notebook.hide(holder)
+            except tk.TclError:
+                pass
         log.info("bonus content %s", "enabled" if enabled else "disabled")
 
     def _on_language_change(self, _event=None):
@@ -6806,6 +7990,8 @@ class App(tb.Window):
         self.hist_tree.bind("<Motion>", self._on_hist_tree_motion)
         # Same Ctrl+A toggle as the card-list trees.
         self.hist_tree.bind("<Control-KeyPress>", self._on_tree_ctrl_a)
+        # Right-click context menu mirroring the History buttons.
+        self.hist_tree.bind("<Button-3>", self._show_hist_context_menu)
         vsb2 = ttk.Scrollbar(hist_frame, orient=VERTICAL, command=self.hist_tree.yview,
                              bootstyle="success")
         self.hist_tree.configure(
@@ -7251,6 +8437,13 @@ class App(tb.Window):
         p = self._hist_selected()
         if not p:
             return
+        # Game purchases (kind == "game", written by «Вже придбав» on
+        # the Ігри tab) link to the STORE page — they have no market
+        # listing to open.
+        if p.get("kind") == "game":
+            from steam import GAME_STORE_URL
+            webbrowser.open(GAME_STORE_URL.format(appid=p["appid"]))
+            return
         from steam import market_url
         webbrowser.open(market_url(p["appid"], p.get("market_hash_name", p.get("name"))))
 
@@ -7393,6 +8586,97 @@ class App(tb.Window):
                 ])
         messagebox.showinfo(t("dlg.export.title"), t("dlg.export.saved", path=path))
 
+    def _show_hist_context_menu(self, event) -> None:
+        """Right-click menu on the History table — mirrors its buttons.
+
+        Same selection convention as the card lists: clicking inside
+        the current selection keeps it, clicking an unselected row
+        re-targets the selection to that row, empty space → no menu.
+        Selection-dependent entries grey out without a selection.
+        """
+        tree = self.hist_tree
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in tree.selection():
+            tree.selection_set(iid)
+            tree.focus(iid)
+            self._mark_selected_rows(tree)
+            self._update_hist_delete_state()
+        menu = tk.Menu(self, tearoff=0, font=self._context_menu_font())
+        menu.add_command(label=t("btn.history_market_log"),
+                         command=self._open_market_history)
+        menu.add_command(label=t("btn.history_export"),
+                         command=self._hist_export_csv)
+        menu.add_separator()
+        menu.add_command(label=t("btn.history_readd"),
+                         command=self._hist_readd)
+        menu.add_command(label=t("btn.history_edit"),
+                         command=self._hist_edit)
+        menu.add_separator()
+        menu.add_command(label=t("btn.history_delete"),
+                         command=self._hist_delete)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _games_readd_records(self, recs: list[dict]) -> None:
+        """Return game purchases from History to the «Ігри» list.
+
+        Dedup by appid — the games list doesn't tolerate duplicates: an
+        active row means "already tracked" and is reported, a closed
+        (bought) row is resurrected, a missing one is recreated minimal
+        (prices fill in on the next check). Always ends with a visible
+        messagebox so the move is never silent.
+        """
+        gitems = load_json(GAMELIST_PATH, []) or []
+        gstate = load_json(STATE_PATH, {}) or {}
+        returned: list[str] = []
+        already: list[str] = []
+        seen: set = set()
+        for p in recs:
+            appid = p.get("appid")
+            if appid in seen:
+                continue
+            seen.add(appid)
+            gname = p.get("game_name") or p.get("name") or f"app {appid}"
+            existing = next(
+                (g for g in gitems if g.get("appid") == appid), None)
+            if existing is not None and \
+                    existing.get("status") not in CLOSED_STATUSES:
+                already.append(gname)
+                continue
+            gstate.pop(f"game:{appid}:{gname}", None)
+            if existing is not None:
+                existing["status"] = ""
+            else:
+                gitems.append({
+                    "id": str(uuid.uuid4()),
+                    "appid": appid,
+                    "name": gname,
+                    "price": None, "price_str": "",
+                    "regular": None, "discount_pct": 0,
+                    "lowest_cut": None, "status": "",
+                    "imported": False,
+                    "added": datetime.now(timezone.utc).isoformat(),
+                })
+            returned.append(gname)
+        if returned:
+            save_json(GAMELIST_PATH, gitems)
+            save_json(STATE_PATH, gstate)
+            self._refresh_games_list()
+        lines = []
+        if returned:
+            lines.append(t("dlg.games_readd.returned",
+                           names=", ".join(returned)))
+        if already:
+            lines.append(t("dlg.games_readd.already",
+                           names=", ".join(already)))
+        if lines:
+            messagebox.showinfo(t("dlg.games_readd.title"),
+                                "\n\n".join(lines), parent=self)
+
     def _hist_readd(self):
         """Re-add selected history record(s) back into the watch/sale list.
 
@@ -7409,6 +8693,17 @@ class App(tb.Window):
         from steam import pretty_name
 
         selected = self._require_hist_selection()
+        if not selected:
+            return
+
+        # Game purchases (kind == "game") can ONLY go back to the «Ігри»
+        # list — no destination dialog for them. Cards proceed through
+        # the usual Покупка/Продаж picker. A mixed selection handles
+        # both halves independently.
+        game_recs = [p for p in selected if p.get("kind") == "game"]
+        selected = [p for p in selected if p.get("kind") != "game"]
+        if game_recs:
+            self._games_readd_records(game_recs)
         if not selected:
             return
 
@@ -7670,8 +8965,11 @@ class App(tb.Window):
     def _on_tab_changed(self, _event=None) -> None:
         """Refresh tab contents from disk when the user switches to them.
 
-        Tab order: 0=Придбання, 1=Продаж, 2=Історія, 3=Планувальник,
-        4=Журнал, 5=Налаштування.
+        Dispatches on the selected tab's WIDGET PATH, not its index —
+        the «Ігри» tab is dynamically hidden/shown by the bonus-content
+        checkbox, and index-based dispatch would silently re-route every
+        tab to the wrong refresher whenever the set of visible tabs
+        changes.
 
         watch.py runs out-of-process (Task Scheduler / Run now), so the
         in-memory state in the GUI goes stale between user actions. The
@@ -7679,23 +8977,33 @@ class App(tb.Window):
         the user looks at the tab.
         """
         try:
-            tab = self.notebook.index(self.notebook.select())
+            selected = self.notebook.select()  # tab window pathname
         except tk.TclError:
             return
-        if tab == 0:          # Придбання
+
+        def _path(tab) -> str:
+            return str(getattr(tab, "_holder", tab))
+
+        if selected == _path(self.tab_purchase):
             self._refresh_card_list("buy")
-        elif tab == 1:        # Продаж
+        elif selected == _path(self.tab_sales):
             self._refresh_card_list("sell")
-        elif tab == 2:        # Історія
+        elif selected == _path(self.tab_games):
+            self._refresh_games_list()
+        elif selected == _path(self.tab_history):
             self._refresh_history()
-        elif tab == 4:        # Журнал
+        elif selected == _path(self.tab_log):
             self._refresh_log()
 
     def _start_log_autoupdate(self):
         def _tick():
-            tab = self.notebook.index(self.notebook.select())
-            if tab == 4:  # Журнал
-                self._refresh_log()
+            # Widget-path comparison, same reason as _on_tab_changed —
+            # the dynamic «Ігри» tab makes numeric indices unstable.
+            try:
+                if self.notebook.select() == str(self.tab_log):
+                    self._refresh_log()
+            except tk.TclError:
+                pass
             # Scheduler tab no longer auto-refreshes — schtasks /Query is
             # expensive and the status only changes when the user mutates
             # the task through our own buttons (which already trigger a
@@ -7728,6 +9036,22 @@ class App(tb.Window):
             text = t("status.task_disabled", buy=buy_count, sell=sell_count)
         else:
             text = t("status.task_missing", buy=buy_count, sell=sell_count)
+        # Games count rides along only while the «Ігри» tab is in front —
+        # it's noise in the card-centric tabs.
+        try:
+            games_holder = getattr(getattr(self, "tab_games", None),
+                                   "_holder", None)
+            if (games_holder is not None
+                    and self.notebook.select() == str(games_holder)):
+                games = load_json(GAMELIST_PATH, []) or []
+                active_games = [g for g in games
+                                if g.get("status") not in CLOSED_STATUSES]
+                discounted = sum(1 for g in active_games
+                                 if (g.get("discount_pct") or 0) > 0)
+                text += t("status.games_count",
+                          count=len(active_games), discounted=discounted)
+        except tk.TclError:
+            pass
         self.statusbar.configure(text="  " + text)
 
 
