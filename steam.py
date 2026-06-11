@@ -9,6 +9,19 @@ from i18n import t
 
 log = logging.getLogger("steam")
 
+
+class SteamSessionExpired(Exception):
+    """Raised when an authenticated Steam endpoint signals stale cookies.
+
+    Distinct from a plain RequestException / generic HTTP failure because
+    callers (GUI import flow) want to:
+      * surface a "log in again" message instead of "no data";
+      * trigger the session-expired toast + badge.
+    HTTP 401/403 are obvious; community endpoints like /market/mylistings
+    also return 400 with a JSON envelope when the session is dead — we
+    treat that the same.
+    """
+
 PRICE_OVERVIEW_URL = "https://steamcommunity.com/market/priceoverview/"
 ORDERBOOK_URL = "https://steamcommunity.com/market/orderbook"
 LISTINGS_URL = "https://steamcommunity.com/market/listings/{appid}/{name}"
@@ -769,17 +782,34 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
 
         {
             "balance":  "5,46₴" | None,
-            "currency": 18 | None,    # Steam internal int code
-            "country":  "UA" | None,  # ISO-2
+            "currency": 18 | None,        # Steam internal int code
+            "country":  "UA" | None,      # ISO-2
+            "session_expired": True | False | None,
         }
+
+    `session_expired` is the explicit "your cookies are stale" signal:
+      * True  — we had cookies AND the request reached Steam but neither
+                page returned the logged-in shape (balance element
+                missing OR g_rgWalletInfo block missing). Steam's normal
+                expired-cookie behaviour: a 200 with the login page HTML
+                instead of the requested page, so we can't rely on HTTP
+                status alone — content sniffing is the only reliable
+                check.
+      * False — at least one page returned the logged-in shape, so the
+                session is alive even if the other page failed.
+      * None  — we didn't try (no cookies on either domain).
+
+    The caller (GUI _apply_wallet_info) uses this to switch on the
+    "session expired" toast + ⚠ widget indicator without us doing any
+    UI work down here.
 
     Any field is None independently if its source failed. Returns
     None entirely if both source-domain cookies are missing (Tier 3
     manual-ID flow — no session at all).
 
-    Logging is at warning for failure paths and info for the parsed
-    result so it's visible in the Журнал tab without bumping the
-    global log level.
+    Logging is at warning for failure paths so they show up in the
+    Журнал tab; the per-call parsed-result line stays at debug to
+    avoid noise after every successful refresh.
     """
     store_cookies = (cookies or {}).get("store.steampowered.com") or {}
     community_cookies = (cookies or {}).get("steamcommunity.com") or {}
@@ -791,9 +821,15 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
     balance: str | None = None
     currency: int | None = None
     country: str | None = None
+    # Tri-state: True/False once we get any response, None until then.
+    # Inverted at the end: any successful logged-in shape flips it False;
+    # if every attempt produced "no logged-in markers" we leave True.
+    expired_signals = 0  # how many domains returned "looks expired"
+    domain_attempts = 0  # how many domains we actually queried
 
     # --- balance: store-domain /account/ page -----------------------
     if "steamLoginSecure" in store_cookies:
+        domain_attempts += 1
         try:
             resp = requests.get(
                 _ACCOUNT_PAGE_URL,
@@ -812,11 +848,22 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
                 if m_bal:
                     balance = m_bal.group(1).replace("\xa0", " ").strip()
                 else:
-                    log.warning("wallet balance not found on account page")
+                    # 200 OK but no header_wallet_balance element — Steam
+                    # served the login page in place of /account/. This
+                    # is the canonical expired-cookies signature.
+                    log.warning("wallet balance not found on account page "
+                                "(store session likely expired)")
+                    expired_signals += 1
             else:
                 log.warning("wallet balance HTTP %s", resp.status_code)
+                # 401/403/302→login on /account/ → also expired.
+                if resp.status_code in (401, 403):
+                    expired_signals += 1
         except requests.RequestException as e:
             log.warning("wallet balance fetch failed: %s", e)
+            # Network errors don't count as expired — could be flaky DNS.
+            # Leave session_expired alone.
+            domain_attempts -= 1  # this attempt is inconclusive
 
     # --- currency + country: community-domain /market/ page ----------
     # The community market page embeds g_rgWalletInfo for logged-in
@@ -824,6 +871,7 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
     # Needs steamcommunity.com cookies (the store-domain cookies don't
     # authenticate the community subdomain — different cookie scope).
     if "steamLoginSecure" in community_cookies:
+        domain_attempts += 1
         try:
             resp = requests.get(
                 _MARKET_PAGE_URL,
@@ -850,18 +898,40 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
                         country = m_cnt.group(1)
                 else:
                     log.warning("wallet info block missing on market page "
-                                "(session may not be active on community domain)")
+                                "(community session likely expired)")
+                    expired_signals += 1
             else:
                 log.warning("market page HTTP %s", resp.status_code)
+                if resp.status_code in (401, 403):
+                    expired_signals += 1
         except requests.RequestException as e:
             log.warning("market page fetch failed: %s", e)
+            domain_attempts -= 1
 
-    # Debug-level — useful for troubleshooting region auto-fill, but
-    # at INFO it shows up in the Журнал tab after every login / Save
-    # which is noise once the feature works.
-    log.debug("wallet info: balance=%r currency=%r country=%r",
-              balance, currency, country)
-    return {"balance": balance, "currency": currency, "country": country}
+    # Final expired verdict: only flag True if we actually tried at
+    # least one domain AND every successful attempt produced an
+    # "expired" signature. Mixed results (one fresh, one expired) =
+    # session is alive — Steam sometimes drops one cookie sooner than
+    # the other and the alive one is enough for our purposes.
+    # Verdict policy: ANY domain returning an expired signature flags
+    # the session as expired — even if the other domain is still alive.
+    # Earlier logic let store-side liveness mask community-side death,
+    # which is exactly how the user ended up with a working balance
+    # widget but a broken "Import from Steam" (mylistings/orders both
+    # 400 on a dead community session).
+    if domain_attempts == 0:
+        session_expired = None
+    else:
+        session_expired = (expired_signals > 0)
+
+    log.debug("wallet info: balance=%r currency=%r country=%r expired=%r",
+              balance, currency, country, session_expired)
+    return {
+        "balance": balance,
+        "currency": currency,
+        "country": country,
+        "session_expired": session_expired,
+    }
 
 
 
@@ -960,6 +1030,14 @@ def fetch_market_listings(cookies: dict | None) -> list[dict]:
             break
         if resp.status_code != 200:
             log.warning("mylistings HTTP %s at start=%d", resp.status_code, start)
+            # Steam community endpoints reply 400 (with a JSON envelope)
+            # for stale cookies, 401/403 for missing/revoked ones.
+            # All three mean "log in again" — translate into the
+            # explicit signal the import-flow handler watches for.
+            if resp.status_code in (400, 401, 403):
+                raise SteamSessionExpired(
+                    f"mylistings returned HTTP {resp.status_code}"
+                )
             break
         try:
             data = resp.json()
@@ -1107,12 +1185,31 @@ def fetch_buy_orders(cookies: dict | None) -> list[dict]:
         return []
     if resp.status_code != 200:
         log.warning("buy orders HTTP %s", resp.status_code)
+        # Same cookies-stale signal as fetch_market_listings — raise
+        # so the GUI import flow can show "log in again" instead of
+        # silently rendering "nothing to import".
+        if resp.status_code in (400, 401, 403):
+            raise SteamSessionExpired(
+                f"buy orders returned HTTP {resp.status_code}"
+            )
         return []
 
     html = resp.text
     if "mybuyorder_" not in html:
-        # Empty buy-orders list — Steam doesn't render the section at all
-        # when there's nothing in it. Different from "regex failed".
+        # Two cases land here: a real empty buy-orders list, OR a dead
+        # session (Steam serves the login page with HTTP 200 instead of
+        # refusing the request). We tell them apart by sniffing for a
+        # POSITIVE "logged in" marker — `g_steamID = "76561…"` (steamID
+        # as a JS string) on a real market page, vs `g_steamID = false`
+        # on the login page. Negative markers (login URL, openid, etc.)
+        # gave false positives because Steam puts a "Sign in" link in
+        # the header for logged-in users too.
+        m_id = re.search(r'g_steamID\s*=\s*"(\d+)"', html)
+        if not m_id or m_id.group(1) == "0":
+            log.warning("buy orders returned login page — session expired")
+            raise SteamSessionExpired(
+                "buy orders page has no g_steamID — reads as logged-out"
+            )
         log.info("no active buy orders")
         return []
 

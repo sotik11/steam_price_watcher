@@ -189,11 +189,23 @@ class App(tb.Window):
     # Picked to play with the superhero (dark) theme; if the user switches
     # to a light theme, _configure_styles re-derives them on the fly.
     _ROW_TAGS = {
-        "alerted":      {"background": "#2d4a3b", "foreground": "#d6f5e0"},
+        # Green/red are the "deal status" tints — applied per row based
+        # on the lowest_price vs target_price comparison (direction
+        # depends on kind: buy wants ≤, sell wants ≥). See the picker
+        # in `_refresh_card_list`. Stayed at the same shades as the old
+        # `alerted` tag so existing screenshots / muscle memory still
+        # match — "alerted" itself is now meant as a state-column-only
+        # signal, not a row colour.
+        "good_match":   {"background": "#2d4a3b", "foreground": "#d6f5e0"},
+        "bad_match":    {"background": "#5a2d2d", "foreground": "#f5d6d6"},
+        # `error` is a separate concern — the card *failed* to poll
+        # (HTTP failure, missing metadata). Same red as bad_match so
+        # they read as "something's off" without us having to teach
+        # three reds, but it's gated by status, not by price math.
         "error":        {"background": "#5a2d2d", "foreground": "#f5d6d6"},
-        # Rate-limited: muted gold. Distinct from green (alerted) and red
-        # (real error) — Steam just told us to back off, the card isn't
-        # broken, we just couldn't poll it this round.
+        # Rate-limited: muted gold. Distinct from green (good_match)
+        # and red (bad_match / error) — Steam just told us to back off,
+        # the card isn't broken, we just couldn't poll it this round.
         "rate_limited": {"background": "#5D5119", "foreground": "#F5E9C0"},
         "even":     {},   # placeholder — filled in _configure_styles()
         "odd":      {},
@@ -217,6 +229,16 @@ class App(tb.Window):
         self.config_data = load_config()
         ui_cfg = self.config_data.get("ui", {})
         theme = ui_cfg.get("theme", "superhero")
+        # Apply log toggles BEFORE we start doing anything significant
+        # — system_log routes uncaught exceptions to our logger, and
+        # we want that hook in place before any callback can fire.
+        # Tk.report_callback_exception is set on `self`, so we need
+        # super().__init__ to have run first; defer that part until
+        # after the bootstrap.
+        self._pending_log_toggles = (
+            bool(ui_cfg.get("system_log", False)),
+            bool(ui_cfg.get("debug_log", False)),
+        )
         # Apply UI language *before* building widgets so every label is
         # already in the right tongue. i18n bootstraps from config.json
         # automatically, but we re-apply explicitly so a config that's
@@ -229,6 +251,9 @@ class App(tb.Window):
         # chosen theme below once Style exists and our custom themes are
         # loaded.
         super().__init__(title=t("app.title"), themename="superhero", size=(1100, 620))
+        # Now that `self` is a real Tk root, we can hook
+        # report_callback_exception. Logger levels can be done here too.
+        self._apply_log_config(*self._pending_log_toggles)
         # Register every themes/*.json now that Style is alive. Returns
         # metadata used later to append them to the Settings picker.
         self._custom_themes = custom_themes.register_all()
@@ -727,7 +752,13 @@ class App(tb.Window):
 
     # Columns we never sort by: "num" stays 1..N (re-numbered after sort),
     # "link" is just a clickable icon — sorting it is meaningless.
-    _UNSORTABLE_COLS = {"num", "link", "imported"}
+    # `num` is just a 1..N row counter — sorting it is the same as
+    # "reset to file order" and looked confusing. `link` is the «🌐
+    # Відкрити на маркеті» click target — same string in every row,
+    # nothing to sort by. `imported` IS sortable now: the value is
+    # "📥" vs "" (empty for manually-added rows), so a click bunches
+    # the imported rows together which is exactly what the user wants.
+    _UNSORTABLE_COLS = {"num", "link"}
 
     def _setup_sortable_columns(self, tree: ttk.Treeview,
                                 column_keys: list[str]) -> None:
@@ -751,7 +782,10 @@ class App(tb.Window):
 
         Sort key tries numeric first (so "5.49 ₴" beats "12.00 ₴" the
         right way round), then alphabetic, then dumps empty / "—"
-        placeholders at the end regardless of direction.
+        placeholders at the end regardless of direction — UNLESS the
+        column treats empty as a meaningful value (see `imported`,
+        where "" means "manually added" and the user expects clicking
+        twice to reverse the groups).
         """
         prev_col = getattr(tree, "_sort_col", None)
         prev_desc = getattr(tree, "_sort_desc", False)
@@ -761,29 +795,112 @@ class App(tb.Window):
 
         pairs = [(tree.set(iid, col), iid) for iid in tree.get_children("")]
 
-        def key(pair):
-            val = pair[0]
-            if val is None or val in ("", "—"):
-                return (2, "")  # always at the end
-            num = _try_parse_money(val)
-            if num is not None:
-                return (0, num)
-            return (1, str(val).lower())
+        # `imported` is a two-state column: "📥" vs "" (manually added).
+        # Both are first-class values, so empty must reverse together
+        # with non-empty on a second click — otherwise the toggle does
+        # nothing visible (the user just saw this happen). Plain string
+        # sort over the two values is enough; no numeric / empty-last
+        # special-casing here.
+        if col == "imported":
+            pairs.sort(key=lambda p: p[0] or "", reverse=descending)
+        else:
+            def key(pair):
+                val = pair[0]
+                if val is None or val in ("", "—"):
+                    return (2, "")  # always at the end
+                num = _try_parse_money(val)
+                if num is not None:
+                    return (0, num)
+                return (1, str(val).lower())
 
-        pairs.sort(key=key, reverse=descending)
-        # Empty / dash rows always at the end, regardless of direction.
-        # The (2, "") tie-key already does that on the way up; on the way
-        # down `reverse=True` would put them first, so we segregate.
-        if descending:
-            empties = [p for p in pairs if p[0] in ("", "—", None)]
-            others = [p for p in pairs if p[0] not in ("", "—", None)]
-            pairs = others + empties
+            pairs.sort(key=key, reverse=descending)
+            # Empty / dash rows always at the end, regardless of direction.
+            # The (2, "") tie-key already does that on the way up; on the way
+            # down `reverse=True` would put them first, so we segregate.
+            if descending:
+                empties = [p for p in pairs if p[0] in ("", "—", None)]
+                others = [p for p in pairs if p[0] not in ("", "—", None)]
+                pairs = others + empties
 
         for i, (_, iid) in enumerate(pairs):
             tree.move(iid, "", i)
 
         self._renumber_tree(tree)
         self._update_sort_indicators(tree)
+        # Persist so a restart restores the same order. Cheap — config.json
+        # writes are tiny and clicks on a heading are rare.
+        self._persist_sort_state(tree)
+
+    # Maps a Treeview widget back to a stable config key. We pin this
+    # to the three tables that support sort persistence (purchase /
+    # sale lists + history). Returns None for any other tree (so the
+    # persist/restore helpers safely no-op).
+    def _tree_sort_key(self, tree: ttk.Treeview) -> str | None:
+        if tree is self.list_trees.get("buy"):
+            return "buy"
+        if tree is self.list_trees.get("sell"):
+            return "sell"
+        if tree is getattr(self, "hist_tree", None):
+            return "history"
+        return None
+
+    def _persist_sort_state(self, tree: ttk.Treeview) -> None:
+        """Save the (column, descending) pair for this tree to config.
+
+        Stored under `ui.sort_state.<key>`, where key is buy / sell /
+        history. Load-merge writeback so we don't clobber unrelated
+        config keys; failures are non-fatal (warning only).
+        """
+        key = self._tree_sort_key(tree)
+        if key is None:
+            return
+        col = getattr(tree, "_sort_col", None)
+        desc = bool(getattr(tree, "_sort_desc", False))
+        entry = {"col": col, "desc": desc} if col else None
+        # Mirror in self.config_data so a same-session call to
+        # `_restore_sort_state` reads the latest value without
+        # re-hitting disk.
+        self.config_data.setdefault("ui", {}).setdefault(
+            "sort_state", {})[key] = entry
+        try:
+            on_disk = load_json(CONFIG_PATH) or {}
+        except Exception:
+            on_disk = {}
+        ui_block = on_disk.setdefault("ui", {})
+        sort_block = ui_block.setdefault("sort_state", {})
+        sort_block[key] = entry
+        try:
+            save_json(CONFIG_PATH, on_disk)
+        except Exception as e:
+            log.warning("could not persist sort state: %s", e)
+
+    def _restore_sort_state(self, tree: ttk.Treeview) -> None:
+        """Re-apply the saved column + direction after a tree refresh.
+
+        Safe no-op when nothing is saved, or when the saved column
+        doesn't exist anymore (e.g. config from an older schema).
+        Called at the end of `_refresh_card_list` / `_refresh_history`.
+        """
+        key = self._tree_sort_key(tree)
+        if key is None:
+            return
+        saved = (self.config_data.get("ui", {})
+                                  .get("sort_state", {}) or {}).get(key)
+        if not saved:
+            return
+        col = saved.get("col")
+        if not col or col not in tree["columns"] or col in self._UNSORTABLE_COLS:
+            return
+        desc = bool(saved.get("desc"))
+        # Reuse `_sort_tree`'s toggle logic by seeding the "previous"
+        # state: if we want descending, pretend the column was just
+        # clicked once (asc), so the next call flips to desc. For
+        # ascending, leave prev_col=None so the first click goes asc.
+        tree._sort_col = col if desc else None
+        tree._sort_desc = False
+        # `_sort_tree` itself re-saves to config; that's a no-op write
+        # of the same value, so fine.
+        self._sort_tree(tree, col)
 
     @staticmethod
     def _renumber_tree(tree: ttk.Treeview) -> None:
@@ -1009,19 +1126,36 @@ class App(tb.Window):
         Walks `event.widget.master` chain so descendants of an action
         button or Treeview are caught too (in practice neither has many
         descendants, but the walk is cheap).
+
+        `event.widget` is normally a widget instance but Tk sometimes
+        hands us its pathname STRING instead — happens when the source
+        is a transient widget that's already been destroyed (e.g. a
+        tk_popup menu just dismissed), or in edge cases on Windows for
+        clicks inside Toplevel popups. A string has no `.master`, so we
+        resolve it back to a widget via `self.nametowidget(...)` (Tk's
+        own name→widget lookup). Fall back to bailing if the name can't
+        be resolved either — the widget is truly gone and there's
+        nothing to walk.
         """
         widget = event.widget
+        if isinstance(widget, str):
+            try:
+                widget = self.nametowidget(widget)
+            except (KeyError, tk.TclError):
+                return
         cur = widget
         while cur is not None:
             if isinstance(cur, (ttk.Button, ttk.Treeview,
                                 ttk.Scrollbar, ttk.Entry,
                                 tk.Text, ttk.Combobox, ttk.Spinbox,
-                                ttk.Radiobutton, ttk.Checkbutton)):
+                                ttk.Radiobutton, ttk.Checkbutton,
+                                tk.Menu)):
                 # Click landed on (or inside) an interactive control —
                 # leave the selection alone so the control's own
-                # behaviour can rely on it.
+                # behaviour can rely on it. tk.Menu added so right-click
+                # menu interactions don't trip the neutral-area dismiss.
                 return
-            cur = cur.master
+            cur = getattr(cur, "master", None)
         # Neutral area click — drop selection on every card-list tree.
         for tree in self.list_trees.values():
             try:
@@ -1153,6 +1287,232 @@ class App(tb.Window):
             c.create_text(size / 2, size / 2,
                           text="S", fill="#FFFFFF",
                           font=("Segoe UI", int(size * 0.55), "bold"))
+
+    # ------------------------------------------------------------------
+    # Session-expired UX: ⚠ badge on the avatar + toast above the widget
+    # ------------------------------------------------------------------
+    #
+    # Triggered by `fetch_wallet_info` returning `session_expired=True`
+    # — Steam responded but with the logged-out page shape, i.e. our
+    # cookies are stale. We surface this two ways:
+    #   * A small ⚠ badge painted on the bottom-right of the avatar
+    #     canvas, blinking once per second so it draws the eye.
+    #   * A toast (borderless Toplevel) just below the user-widget,
+    #     auto-dismissing after ~12 seconds or on click.
+    # Both are clickable and open the Steam-login dialog.
+    #
+    # State is idempotent through `_set_session_warning` — calling with
+    # the same value as the current state is a no-op, so the worker
+    # thread can fire it on every refresh without flicker.
+
+    # Badge dimensions inside the avatar canvas. Sized so the ⚠ glyph
+    # is readable but doesn't crowd the avatar — about 40% of canvas.
+    _SESSION_BADGE_DIAMETER = 18
+    _SESSION_BADGE_BLINK_MS = 700
+
+    def _set_session_warning(self, active: bool) -> None:
+        """Flip the session-expired indicator on or off (idempotent).
+
+        Persists the active state on `self._session_warning_active` so
+        the toast and blink loop know whether they're still wanted.
+        Tolerates being called before `_build_user_widget` (early
+        bootstrap path) — bails silently when the avatar canvas isn't
+        there yet.
+        """
+        # Lazy init — these attrs don't exist until first call.
+        if not hasattr(self, "_session_warning_active"):
+            self._session_warning_active = False
+            self._session_warning_blink_visible = True
+            self._session_warning_blink_job = None
+            self._session_warning_toast = None
+        if active == self._session_warning_active:
+            return
+        self._session_warning_active = active
+        canvas = getattr(self, "avatar_canvas", None)
+        if canvas is None:
+            return
+        if active:
+            log.info("steam session expired — showing badge + toast")
+            self._draw_session_badge()
+            # Tag-bind so only clicks on the badge itself trigger login
+            # — clicks elsewhere on the avatar still do nothing (and
+            # the username/balance labels keep their own bindings).
+            try:
+                canvas.tag_bind("session_warning", "<Button-1>",
+                                lambda _e: self._open_steam_login_dialog())
+                canvas.tag_bind("session_warning", "<Enter>",
+                                lambda _e: canvas.configure(cursor="hand2"))
+                canvas.tag_bind("session_warning", "<Leave>",
+                                lambda _e: canvas.configure(cursor=""))
+            except tk.TclError:
+                pass
+            self._start_session_badge_blink()
+            self._show_session_expired_toast()
+        else:
+            log.info("steam session restored — clearing badge")
+            if self._session_warning_blink_job is not None:
+                try:
+                    self.after_cancel(self._session_warning_blink_job)
+                except (tk.TclError, ValueError):
+                    pass
+                self._session_warning_blink_job = None
+            try:
+                canvas.delete("session_warning")
+            except tk.TclError:
+                pass
+            self._dismiss_session_expired_toast()
+
+    def _draw_session_badge(self) -> None:
+        """Paint the ⚠ badge on the avatar canvas (idempotent)."""
+        canvas = getattr(self, "avatar_canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.delete("session_warning")
+        except tk.TclError:
+            return
+        if not self._session_warning_blink_visible:
+            return
+        d = self._SESSION_BADGE_DIAMETER
+        size = self._AVATAR_SIZE
+        # Bottom-right corner, with a 1 px margin from the canvas edge.
+        x1 = size - d - 1
+        y1 = size - d - 1
+        x2 = size - 1
+        y2 = size - 1
+        # Yellow disk + dark outline so it reads on both bright and
+        # dark avatars.
+        canvas.create_oval(
+            x1, y1, x2, y2,
+            fill="#F5C518", outline="#1B2838", width=2,
+            tags=("session_warning",),
+        )
+        # Hand-drawn "!" — Tk's font rendering of "⚠" varies wildly
+        # across platforms, so a centred exclamation glyph is more
+        # reliable. Two pieces: vertical stroke + dot at the bottom.
+        cx = (x1 + x2) / 2
+        # Vertical bar
+        canvas.create_line(
+            cx, y1 + 4, cx, y2 - 5,
+            fill="#1B2838", width=2, capstyle="round",
+            tags=("session_warning",),
+        )
+        # Dot
+        canvas.create_oval(
+            cx - 1, y2 - 4, cx + 1, y2 - 2,
+            fill="#1B2838", outline="",
+            tags=("session_warning",),
+        )
+
+    def _start_session_badge_blink(self) -> None:
+        """Schedule the badge blink loop while warning is active.
+
+        Toggles `_session_warning_blink_visible` and redraws every
+        `_SESSION_BADGE_BLINK_MS` ms. Self-stops when the warning is
+        cleared (the `_session_warning_active` check in the callback).
+        """
+        if not self._session_warning_active:
+            return
+        self._session_warning_blink_visible = \
+            not self._session_warning_blink_visible
+        self._draw_session_badge()
+        self._session_warning_blink_job = self.after(
+            self._SESSION_BADGE_BLINK_MS,
+            self._start_session_badge_blink,
+        )
+
+    def _show_session_expired_toast(self) -> None:
+        """Pop a small clickable toast under the user-widget.
+
+        Uses a borderless Toplevel positioned via `geometry()` so it
+        floats relative to the main window. Auto-dismisses after
+        ~12 seconds (configurable per call), or immediately on click.
+        Clicking opens the Steam-login dialog. Re-entrant — if a
+        toast is already up, do nothing (avoids stacking).
+        """
+        if (self._session_warning_toast is not None
+                and self._session_warning_toast.winfo_exists()):
+            return
+        try:
+            top = tk.Toplevel(self)
+        except tk.TclError:
+            return
+        self._session_warning_toast = top
+        # Borderless so it looks like a notification chip, not a
+        # standalone window with its own title bar.
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        # Match the theme so the toast doesn't read as alien on a dark
+        # palette. Use the `danger` colour as the fill — same red the
+        # rest of the app uses for "you need to act".
+        bg = self.style.colors.danger
+        fg = "#FFFFFF"
+        # Outer frame with the bg colour; inner padding gives the text
+        # some air. Done as plain tk widgets so we can colour-fill the
+        # bg (ttk.Frame ignores background overrides on most themes).
+        frame = tk.Frame(top, background=bg, padx=12, pady=8,
+                          highlightthickness=1, highlightbackground="#000000")
+        frame.pack()
+        lbl = tk.Label(
+            frame,
+            text=t("toast.session_expired"),
+            background=bg, foreground=fg,
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2",
+        )
+        lbl.pack()
+        # Click handler — both label + frame so the user can hit either.
+        def _on_click(_e=None):
+            self._dismiss_session_expired_toast()
+            self._open_steam_login_dialog()
+        for w in (frame, lbl):
+            w.bind("<Button-1>", _on_click)
+        # Position under the user-widget. user_cluster is `place`d at
+        # `relx=1.0, x=-14, y=5, anchor=ne`, so absolute right edge ≈
+        # window-x + window-width − 14, and absolute top ≈ window-y + 5.
+        # We anchor toast's top-right to the SAME right edge but ~50 px
+        # below the widget. update_idletasks first so winfo_* values
+        # reflect the current geometry, not a stale one.
+        self.update_idletasks()
+        try:
+            cluster = getattr(self, "user_cluster", None)
+            cluster_w = cluster.winfo_width() if cluster else 0
+            cluster_h = cluster.winfo_height() if cluster else 0
+            win_x = self.winfo_rootx()
+            win_y = self.winfo_rooty()
+            win_w = self.winfo_width()
+            top.update_idletasks()
+            toast_w = top.winfo_reqwidth()
+            toast_h = top.winfo_reqheight()
+            # Place toast so its right edge aligns with cluster's right
+            # edge, and its top sits cluster_h + 8 px below window-top.
+            x = win_x + win_w - 14 - toast_w
+            y = win_y + 5 + cluster_h + 8
+            top.geometry(f"{toast_w}x{toast_h}+{x}+{y}")
+        except tk.TclError:
+            pass
+        top.lift()
+        # Auto-dismiss after 12 seconds. Stored as an after-id on the
+        # toplevel so a manual dismiss can cancel it.
+        top._dismiss_job = top.after(
+            12_000, self._dismiss_session_expired_toast,
+        )
+
+    def _dismiss_session_expired_toast(self) -> None:
+        """Tear down the session-expired toast if it's up."""
+        top = self._session_warning_toast
+        self._session_warning_toast = None
+        if top is None:
+            return
+        try:
+            if getattr(top, "_dismiss_job", None) is not None:
+                top.after_cancel(top._dismiss_job)
+        except (tk.TclError, ValueError, AttributeError):
+            pass
+        try:
+            top.destroy()
+        except tk.TclError:
+            pass
 
     def _measure_last_tab_right(self, nb: ttk.Notebook, n_tabs: int) -> int:
         """Right pixel coordinate of the last tab in the strip.
@@ -1456,6 +1816,16 @@ class App(tb.Window):
         balance = info.get("balance")
         currency = info.get("currency")
         country = info.get("country")
+        expired = info.get("session_expired")
+
+        # Session-expired UX: only flip on a definitive True/False; None
+        # means "couldn't tell" (network error etc.) — leave the
+        # previous state alone so a flaky moment doesn't trigger the
+        # warning theatre.
+        if expired is True:
+            self._set_session_warning(True)
+        elif expired is False:
+            self._set_session_warning(False)
 
         if balance:
             self._update_user_widget(balance=balance)
@@ -1863,6 +2233,9 @@ class App(tb.Window):
         self._update_user_widget(username="Username", balance=f"0.00 {sym}")
         self._draw_placeholder_avatar()
         self._user_avatar_ref = None
+        # Disconnect explicitly resolves any lingering "session expired"
+        # state — the user has acknowledged it and started over.
+        self._set_session_warning(False)
 
         # Also wipe the dialog's entry + status, so the next manual attempt
         # starts on a clean slate.
@@ -2630,6 +3003,12 @@ class App(tb.Window):
         # (A=65), so this works on Cyrillic keyboard too — same trick as
         # _install_clipboard_shortcuts.
         tree.bind("<Control-KeyPress>", self._on_tree_ctrl_a)
+        # Right-click → context menu (each action delegates back to the
+        # same handler the toolbar buttons use, so all the
+        # enable/disable rules ride along for free — see
+        # `_show_card_context_menu`).
+        tree.bind("<Button-3>",
+                  lambda e, k=kind: self._show_card_context_menu(e, k))
 
         # bootstyle="success" gives ttkbootstrap's image-rendered thumb the
         # `s.colors.success` tint — which we re-aliased to the active-tab
@@ -2880,16 +3259,33 @@ class App(tb.Window):
             display_name = pretty_name(item)
             game_name = item.get("game_name") or "—"
 
-            # Pick row tag: raw status overrides alternating colours.
-            # We branch on the *raw* value, not the localised one, so that
-            # row colours stay stable across language switches.
+            # Pick row tag. Priority order:
+            #   1. rate_limited / error — Steam-side problems, gold/red
+            #      from the status, not from a price comparison.
+            #   2. price vs target — green when the deal direction is
+            #      met, red when it isn't. Rules differ by list kind:
+            #         buy  → green when lowest ≤ target  (can buy now)
+            #         sell → green when lowest ≥ target  (price still
+            #                holds; flip red when undercut).
+            #      `alerted` is NO LONGER a row tint — the status
+            #      column already tells the user, and a green row that
+            #      meets the threshold reads the same intent. This
+            #      keeps the table calmer (no double-encoding) and
+            #      makes "I undershot my sell price" visually obvious.
+            #   3. zebra fallback when last_seen / target are missing.
+            # Branching on raw status (not the localised string) so
+            # row colours don't shift when the user changes language.
             zebra = "even" if row_index % 2 == 0 else "odd"
-            if raw_status == "alerted":
-                row_tag = "alerted"
-            elif raw_status == "rate_limited":
+            if raw_status == "rate_limited":
                 row_tag = "rate_limited"
             elif raw_status == "error":
                 row_tag = "error"
+            elif last_num is not None and target_num is not None:
+                if kind == "buy":
+                    meets = last_num <= target_num
+                else:  # sell
+                    meets = last_num >= target_num
+                row_tag = "good_match" if meets else "bad_match"
             else:
                 row_tag = zebra
 
@@ -2919,6 +3315,10 @@ class App(tb.Window):
         # Refresh wiped the tags — restore the "selected" marker so the
         # current selection stays visible.
         self._mark_selected_rows(tree)
+        # Re-apply any persisted sort order so a restart (or a
+        # «Запустити зараз» followed by refresh) keeps the column the
+        # user picked last time, instead of falling back to file order.
+        self._restore_sort_state(tree)
         self._update_action_buttons()
         self._update_statusbar()
 
@@ -3002,6 +3402,27 @@ class App(tb.Window):
                 buttons["duplicate"].configure(
                     state=NORMAL if sel_items else DISABLED,
                 )
+
+    def _update_hist_delete_state(self) -> None:
+        """Mirror card-list «Видалити» contract on the History tab.
+
+        Disabled + plain-style when nothing is selected; enabled with
+        the `danger` bootstyle the moment the click would do real work.
+        Bound to `hist_tree.<<TreeviewSelect>>` so the state tracks
+        whatever the user has highlighted, including multi-select.
+        """
+        btn = getattr(self, "btn_hist_delete", None)
+        tree = getattr(self, "hist_tree", None)
+        if btn is None or tree is None:
+            return
+        try:
+            has_sel = bool(tree.selection())
+        except tk.TclError:
+            return
+        if has_sel:
+            btn.configure(state=NORMAL, bootstyle="danger")
+        else:
+            btn.configure(state=DISABLED, bootstyle="")
 
     # ------------------------------------------------------------------
     # Metadata backfill
@@ -3145,6 +3566,199 @@ class App(tb.Window):
         kind = "buy" if tree is self.list_trees.get("buy") else "sell"
         items = load_json(self._kind_path(kind), [])
         item = next((x for x in items if x.get("id") == iid), None)
+        if not item:
+            return
+        from steam import market_url
+        webbrowser.open(market_url(item["appid"], item["market_hash_name"]))
+
+    def _show_card_context_menu(self, event, kind: str) -> None:
+        """Right-click handler — pop the context menu over the clicked row.
+
+        Selection model:
+          * If the user right-clicks INSIDE the current selection (single
+            or multi), we leave the selection alone — they want to act
+            on the whole set.
+          * If they right-click a row that ISN'T currently selected, we
+            replace selection with just that row. This matches the
+            convention every file manager / IDE uses.
+          * If they right-click empty space (below the rows), do nothing
+            — no menu, per the user's preference. Same rule as Explorer
+            when you right-click in dead space inside a listview.
+
+        Menu items themselves are plain `command=self._existing_method`
+        — same handlers the toolbar buttons use. Enable/disable state
+        is read from those buttons via `_update_action_buttons` so
+        we don't re-derive the rules per item.
+        """
+        tree = event.widget
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return  # empty area — no menu
+
+        current_sel = tree.selection()
+        if iid not in current_sel:
+            # Reset selection to just this row before popping menu.
+            tree.selection_set(iid)
+            tree.focus(iid)
+            # Touch the highlight tags + downstream button state so the
+            # menu fires against the same row visually selected.
+            self._mark_selected_rows(tree)
+            self._update_action_buttons()
+
+        menu = self._build_card_context_menu(kind)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            # tk_popup leaves the menu grabbed; release so clicks
+            # elsewhere don't get swallowed by it on some WMs.
+            menu.grab_release()
+
+    # Context-menu font scaling: follow the global Settings dropdown
+    # but cap at x3 — bigger menus push items off the screen on a
+    # 1080p monitor and we lose the "compact pick list" feel.
+    _CONTEXT_MENU_MAX_SCALE = 3
+
+    def _context_menu_font(self) -> tuple:
+        """Compute (family, size [, weight]) for the right-click menu.
+
+        Reads the current global font scale (`self._font_scale`),
+        clamps to `_CONTEXT_MENU_MAX_SCALE`, and multiplies the
+        unscaled TkMenuFont size we cached at startup. Using the
+        cached size — not the live TkMenuFont — keeps us from
+        double-scaling when the global TkMenuFont has already been
+        bumped by `_apply_font_scale`.
+        """
+        import tkinter.font as tkfont
+        try:
+            src = tkfont.nametofont("TkMenuFont")
+            family = src.cget("family") or "Segoe UI"
+            weight = src.cget("weight") or "normal"
+        except tk.TclError:
+            family, weight = "Segoe UI", "normal"
+        base = (self._original_font_sizes or {}).get("TkMenuFont", 9)
+        scale = min(
+            max(1, int(getattr(self, "_font_scale", 1) or 1)),
+            self._CONTEXT_MENU_MAX_SCALE,
+        )
+        mult = self._FONT_SCALE_FACTORS[scale]
+        size = max(1, int(round(base * mult)))
+        # Drop the weight tuple slot unless it's actually bold —
+        # ("Segoe UI", 12) is friendlier to Tk than the 3-tuple with
+        # weight="normal".
+        if weight and weight != "normal":
+            return (family, size, weight)
+        return (family, size)
+
+    def _build_card_context_menu(self, kind: str) -> tk.Menu:
+        """Construct (or rebuild) the right-click menu for one list kind.
+
+        Built fresh on each right-click so item state (enabled/disabled,
+        i18n text) is current — caching across language switches or
+        selection changes would be a maintenance trap for a six-item
+        menu. The cost is trivial.
+
+        Item commands point to the same `self._foo` handlers wired to
+        the toolbar buttons — see `btn_specs` in the card-list tab
+        builder. That means new behaviour (e.g. confirmation dialog
+        added to `_remove_card`) ripples here automatically.
+        """
+        # Pass the scaled font here (not via `menu.configure` after
+        # creation) — on some Tk builds, after-the-fact configure on
+        # a tk.Menu doesn't propagate to its items. Setting it at
+        # construction time is the reliable path.
+        menu = tk.Menu(self, tearoff=0, font=self._context_menu_font())
+        # The toolbar's enable/disable state is the single source of
+        # truth — same conditions apply here. We pull it from the
+        # button refs that `_update_action_buttons` already maintains.
+        btns = self.list_action_buttons.get(kind) or {}
+
+        def _state_of(btn_key: str) -> str:
+            """Mirror the toolbar button's state on the menu item."""
+            btn = btns.get(btn_key)
+            if btn is None:
+                return "normal"
+            try:
+                return "disabled" if str(btn.cget("state")) == "disabled" \
+                    else "normal"
+            except tk.TclError:
+                return "normal"
+
+        # The selection-aware actions: Check now / Edit target /
+        # Duplicate / Move-to-other / Bought-Sold / Not bought / Remove.
+        # The toolbar buttons in row1 don't all map to keys in
+        # list_action_buttons — only the ones with selection-dependent
+        # state do. The rest are always-enabled (Check now / Edit target
+        # / link), so we just leave their state="normal".
+        menu.add_command(
+            label=t("btn.check_now"),
+            command=self._check_now,
+            state=_state_of("check"),
+        )
+        menu.add_command(
+            label=t("col.link.open"),
+            command=self._open_selected_market_link,
+            state=_state_of("check"),  # same gate: needs a selection
+        )
+        menu.add_separator()
+        menu.add_command(
+            label=t("btn.edit_target"),
+            command=self._edit_target,
+            # _edit_target itself bails if no selection — but disabling
+            # via the same gate as the toolbar's «Видалити» button
+            # keeps the UX consistent.
+            state=_state_of("remove"),
+        )
+        if kind == "sell":
+            menu.add_command(
+                label=t("btn.duplicate"),
+                command=self._duplicate_card,
+                state=_state_of("duplicate"),
+            )
+        move_key = "btn.move_to_sell" if kind == "buy" else "btn.move_to_buy"
+        menu.add_command(
+            label=t(move_key),
+            command=self._move_to_other_list,
+            state=_state_of("move"),
+        )
+        menu.add_separator()
+        # "Придбав" on buy tab, "Продав" on sell tab.
+        action_key = "btn.bought" if kind == "buy" else "btn.sold"
+        menu.add_command(
+            label=t(action_key),
+            command=self._mark_completed,
+            state=_state_of("completed"),
+        )
+        menu.add_command(
+            label=t("btn.not_bought"),
+            command=self._mark_not_bought,
+            state=_state_of("not"),
+        )
+        menu.add_separator()
+        menu.add_command(
+            label=t("btn.remove"),
+            command=self._remove_card,
+            state=_state_of("remove"),
+        )
+        return menu
+
+    def _open_selected_market_link(self) -> None:
+        """Open the first selected card's Steam Market listing URL.
+
+        Used by the right-click menu's "Відкрити на маркеті" entry —
+        the toolbar didn't have a dedicated button (the link column
+        in each row was the entry point), but a menu item asking for
+        the same thing is a natural ask. Pulls the active tree from
+        the card-list helper so the same code serves buy + sell.
+        """
+        tree = self._active_tree()
+        if tree is None:
+            return
+        sel = tree.selection()
+        if not sel:
+            return
+        kind = "buy" if tree is self.list_trees.get("buy") else "sell"
+        items = load_json(self._kind_path(kind), []) or []
+        item = next((x for x in items if x.get("id") == sel[0]), None)
         if not item:
             return
         from steam import market_url
@@ -3722,6 +4336,38 @@ class App(tb.Window):
                             if state.pop(state_key, None) is not None:
                                 state_dirty = True
 
+                # Leader suppression (sell only) — mirror of watch.py's
+                # rule: with 2+ copies of this card listed and one of
+                # them at exactly the market minimum, the user leads the
+                # market and the rest of the group stays silent. Row
+                # colours are untouched (they're derived from price math
+                # at render time); only the alert path is muted.
+                if kind == "sell":
+                    ident_l = (w.get("appid"), w.get("name"))
+                    lowest_now = info.get("lowest_price")
+                    group = [x for x in items
+                             if (x.get("appid"), x.get("name")) == ident_l]
+                    if (len(group) >= 2
+                            and isinstance(lowest_now, (int, float))
+                            and any(
+                                isinstance(x.get("target_price"), (int, float))
+                                and abs(x["target_price"] - lowest_now) < 0.005
+                                for x in group)):
+                        # Same cleanup as watch.py: leadership regained →
+                        # stale "сповіщено" badges come off the whole
+                        # group and the antispam entry resets, so the
+                        # next real undercut fires a fresh first_alert.
+                        for x in group:
+                            if x.get("status") == "alerted":
+                                x["status"] = ""
+                        state_key = f"{kind}:{w.get('appid')}:{w.get('name')}"
+                        if state.pop(state_key, None) is not None:
+                            state_dirty = True
+                        log.info(t("log.leader_suppressed",
+                                   name=pretty_name(w)[:40],
+                                   lowest=lowest_now))
+                        continue
+
                 # Now run the alert evaluation — same logic watch.py uses.
                 # Merge the polled price info onto the card record so
                 # `info` has both target_price (from card) and lowest_price
@@ -4005,10 +4651,26 @@ class App(tb.Window):
         outer = ttk.Frame(dlg, padding=12)
         outer.pack(fill=BOTH, expand=YES)
 
-        # Status line at the top — narrow, no expand. Just used during
-        # the loading phase to tell the user we're talking to Steam.
-        self._import_status = ttk.Label(outer, text=t("dlg.import.loading"))
+        # Status line at the top — narrow, no expand. Used during the
+        # loading phase to tell the user we're talking to Steam, and
+        # for terminal-error messages ("session expired", "nothing
+        # found", etc.). `wraplength` is dynamically resized in the
+        # <Configure> handler below so long messages wrap to dialog
+        # width instead of being clipped at the right edge.
+        self._import_status = ttk.Label(
+            outer, text=t("dlg.import.loading"),
+            wraplength=600, justify="left",
+        )
         self._import_status.pack(side=TOP, anchor=W, pady=(0, 8), fill=X)
+        # Track dialog resize → keep wraplength ~ dialog_width − 2×padding.
+        # Bound on the dialog so widget moves inside `outer` don't fire it.
+        def _resize_status(_e):
+            try:
+                width = max(200, dlg.winfo_width() - 40)
+                self._import_status.configure(wraplength=width)
+            except tk.TclError:
+                pass
+        dlg.bind("<Configure>", _resize_status)
 
         # Button row BEFORE the content area — packing it with side=BOTTOM
         # reserves its slot first so the expanding section above can't push
@@ -4065,6 +4727,13 @@ class App(tb.Window):
                     payload = steam.fetch_market_listings(cookies)
                 else:
                     payload = steam.fetch_buy_orders(cookies)
+            except steam.SteamSessionExpired:
+                # Specific: tell the user it's a session problem (not
+                # "you have no listings") AND raise the global toast
+                # + ⚠ badge so they have a single click to relogin.
+                err = t("import.session_expired")
+                log.warning("import aborted — community session expired")
+                self.after(0, lambda: self._set_session_warning(True))
             except Exception as e:
                 err = str(e)
                 log.exception("import fetch failed")
@@ -4766,43 +5435,46 @@ class App(tb.Window):
         # Token + Chat ID are readonly + masked by default — protects
         # against accidental edits AND keeps the secret value off-screen
         # for over-the-shoulder situations. Click ✏ to reveal + edit.
+        # Token + Chat ID rows use a slightly different layout from the
+        # rows below: the Entry itself sits in col 1 (right-aligned, so
+        # its right edge matches the comboboxes underneath), and the ✏
+        # edit button sits in col 2 (the gap absorber). That way the
+        # button "leaks" past the virtual right-edge line — the user
+        # asked for that explicitly: line up inputs, but the pencil
+        # icons may overhang.
         left_label("lbl.bot_token", 0)
         self.var_token = tk.StringVar(value=tg.get("bot_token", ""))
-        token_holder = ttk.Frame(cols)
-        token_holder.grid(row=0, column=1, sticky=W)
         self.entry_token = ttk.Entry(
-            token_holder, textvariable=self.var_token,
+            cols, textvariable=self.var_token,
             width=18, state="readonly", show="•",
         )
-        self.entry_token.pack(side=LEFT)
+        self.entry_token.grid(row=0, column=1, sticky=E)
         self.btn_edit_token = ttk.Button(
-            token_holder, text="✏", width=3, bootstyle="link",
+            cols, text="✏", width=3, bootstyle="link",
         )
         self.btn_edit_token.configure(
             command=lambda: self._toggle_edit(
                 self.entry_token, self.btn_edit_token, mask_char="•",
             )
         )
-        self.btn_edit_token.pack(side=LEFT, padx=(4, 0))
+        self.btn_edit_token.grid(row=0, column=2, sticky=W, padx=(4, 0))
 
         left_label("lbl.chat_id", 1)
         self.var_chat_id = tk.StringVar(value=str(tg.get("chat_id", "")))
-        chat_holder = ttk.Frame(cols)
-        chat_holder.grid(row=1, column=1, sticky=W)
         self.entry_chat = ttk.Entry(
-            chat_holder, textvariable=self.var_chat_id,
+            cols, textvariable=self.var_chat_id,
             width=18, state="readonly", show="•",
         )
-        self.entry_chat.pack(side=LEFT)
+        self.entry_chat.grid(row=1, column=1, sticky=E)
         self.btn_edit_chat = ttk.Button(
-            chat_holder, text="✏", width=3, bootstyle="link",
+            cols, text="✏", width=3, bootstyle="link",
         )
         self.btn_edit_chat.configure(
             command=lambda: self._toggle_edit(
                 self.entry_chat, self.btn_edit_chat, mask_char="•",
             )
         )
-        self.btn_edit_chat.pack(side=LEFT, padx=(4, 0))
+        self.btn_edit_chat.grid(row=1, column=2, sticky=W, padx=(4, 0))
 
         left_label("lbl.theme", 2)
         builtin_themes = [
@@ -4818,7 +5490,7 @@ class App(tb.Window):
             cols, values=themes, textvariable=self.var_theme,
             state="readonly", width=10,
         )
-        cb_theme.grid(row=2, column=1, sticky=W)
+        cb_theme.grid(row=2, column=1, sticky=E)
         cb_theme.bind("<<ComboboxSelected>>", self._on_theme_change)
 
         left_label("lbl.language", 3)
@@ -4839,7 +5511,7 @@ class App(tb.Window):
             # fit comfortably in 10.
             textvariable=self.var_language, state="readonly", width=10,
         )
-        cb_lang.grid(row=3, column=1, sticky=W)
+        cb_lang.grid(row=3, column=1, sticky=E)
         cb_lang.bind("<<ComboboxSelected>>", self._on_language_change)
 
         left_label("lbl.font_scale", 4)
@@ -4855,7 +5527,51 @@ class App(tb.Window):
             cols, values=font_scale_values,
             textvariable=self.var_font_scale, state="readonly", width=4,
         )
-        cb_font.grid(row=4, column=1, sticky=W)
+        cb_font.grid(row=4, column=1, sticky=E)
+
+        # ---- Log verbosity toggles (left column rows 5-6) ------------
+        # Two opt-in controls (off by default) for capturing more
+        # diagnostic detail in the Журнал tab. Live-applied via the
+        # var trace and persisted to config.json immediately, so the
+        # user doesn't need to hit Save after flipping them.
+        #
+        # Layout note: the labels here are noticeably longer than the
+        # other left-column labels ("Розмір шрифту:" etc), so putting
+        # them in column 0 would push the input column out — making
+        # the whole form jagged. Instead we span both grid columns
+        # with a single holder Frame anchored to the RIGHT (`sticky=E`).
+        # That keeps the checkboxes' right edge aligned with the input
+        # column above, and keeps the long labels from inflating column 0.
+        ui_cur = self.config_data.get("ui", {}) or {}
+        self.var_system_log = tk.BooleanVar(
+            value=bool(ui_cur.get("system_log", False)),
+        )
+        sys_holder = ttk.Frame(cols)
+        sys_holder.grid(row=5, column=0, columnspan=2, sticky=E, pady=4)
+        ttk.Label(sys_holder, text=t("lbl.system_log"),
+                  anchor=E).pack(side=LEFT)
+        self._make_scalable_check(
+            sys_holder, self.var_system_log,
+        ).pack(side=LEFT, padx=(8, 0))
+
+        self.var_debug_log = tk.BooleanVar(
+            value=bool(ui_cur.get("debug_log", False)),
+        )
+        dbg_holder = ttk.Frame(cols)
+        dbg_holder.grid(row=6, column=0, columnspan=2, sticky=E, pady=4)
+        ttk.Label(dbg_holder, text=t("lbl.debug_log"),
+                  anchor=E).pack(side=LEFT)
+        self._make_scalable_check(
+            dbg_holder, self.var_debug_log,
+        ).pack(side=LEFT, padx=(8, 0))
+
+        # Attach trace AFTER the initial value is set, otherwise the
+        # `set(...)` above would fire `_on_log_toggle_change` and write
+        # config.json during widget construction.
+        self.var_system_log.trace_add(
+            "write", lambda *_: self._on_log_toggle_change())
+        self.var_debug_log.trace_add(
+            "write", lambda *_: self._on_log_toggle_change())
 
         # ---- RIGHT column --------------------------------------------
         # Numeric/short fields, with the value on the left and label on
@@ -4963,6 +5679,26 @@ class App(tb.Window):
         ttk.Label(repeat_holder, text=t("lbl.repeat_if_lower"),
                   anchor=W).pack(side=LEFT, padx=(8, 0))
 
+        # «Бонусний контент» — opt-in switch for the upcoming wishlist-
+        # tracking tab. Persisted immediately on flip (no Save needed),
+        # same live-toggle contract as the log checkboxes: the tab is
+        # meant to appear/disappear on the fly. Layout mirrors the
+        # repeat-checkbox row right above.
+        ui_cfg_now = self.config_data.get("ui", {}) or {}
+        self.var_bonus_content = tk.BooleanVar(
+            value=bool(ui_cfg_now.get("bonus_content", False)),
+        )
+        bonus_holder = ttk.Frame(cols)
+        bonus_holder.grid(row=6, column=3, columnspan=2,
+                          sticky=W, pady=4, padx=(0, 0))
+        self._make_scalable_check(bonus_holder,
+                                  self.var_bonus_content).pack(side=LEFT)
+        ttk.Label(bonus_holder, text=t("lbl.bonus_content"),
+                  anchor=W).pack(side=LEFT, padx=(8, 0))
+        # Trace AFTER initial set so construction doesn't write config.
+        self.var_bonus_content.trace_add(
+            "write", lambda *_: self._on_bonus_content_toggle())
+
         # ---- Template section ----------------------------------------
         # Two-column layout: editor + var cheatsheet on the LEFT, live
         # Telegram-style preview on the RIGHT. The left column stacks
@@ -4970,7 +5706,11 @@ class App(tb.Window):
         # hints — and is sized to roughly match the preview's vertical
         # footprint so the whole row reads as one coherent block.
         tpl_section = ttk.Frame(outer)
-        tpl_section.pack(fill=X, pady=(0, 12))
+        # Extra top-pady (≈ one row height) creates a visual break
+        # between the form rows above and the template editor block —
+        # asked for by the user so the form doesn't run straight into
+        # the bigger Шаблон / Превью section.
+        tpl_section.pack(fill=X, pady=(20, 12))
 
         # Left column container packed first. Preview gets `side=RIGHT`
         # further down so it docks to the right edge regardless of the
@@ -5522,6 +6262,123 @@ class App(tb.Window):
                 except tk.TclError:
                     pass
 
+    # ------------------------------------------------------------------
+    # Log verbosity toggles — Settings checkboxes for "Системний лог" /
+    # "Debug log". Two orthogonal concerns:
+    #   * system_log → route uncaught Python AND Tk-callback exceptions
+    #                  into our logger as ERROR. Without it, those
+    #                  tracebacks evaporate (pythonw discards stderr),
+    #                  which makes "weird click crashed the widget"
+    #                  reports unreproducible.
+    #   * debug_log  → flip every named-logger level from INFO down to
+    #                  DEBUG. Floods the Журнал with raw HTTP request
+    #                  lines, wallet-info parse details, etc.
+    # ------------------------------------------------------------------
+
+    def _apply_log_config(self, system_log: bool, debug_log: bool) -> None:
+        """Apply the two log toggles to the running process.
+
+        Idempotent — safe to call from `__init__` (bootstrap) and from
+        the `var_*.trace_add` callback (live toggle). Stores the
+        original `sys.excepthook` once so disabling later restores it
+        instead of leaving our hook in place forever.
+        """
+        import sys
+        import traceback
+
+        # --- debug level --------------------------------------------
+        level = logging.DEBUG if debug_log else logging.INFO
+        # Match the sibling loggers we register at module load (see top
+        # of file). If we add new loggers later, update both lists.
+        for name in ("gui", "steam", "telegram", "alerts",
+                     "browser_cookies"):
+            logging.getLogger(name).setLevel(level)
+
+        # --- system log: uncaught exception routing -----------------
+        if not hasattr(self, "_default_excepthook"):
+            self._default_excepthook = sys.excepthook
+        if system_log:
+            def _gui_excepthook(exc_type, exc_value, exc_tb):
+                tb_text = "".join(traceback.format_exception(
+                    exc_type, exc_value, exc_tb,
+                ))
+                log.error("uncaught exception:\n%s", tb_text.rstrip())
+                # Chain to the original hook so anything else watching
+                # stderr (PyCharm debugger, console) still sees it.
+                self._default_excepthook(exc_type, exc_value, exc_tb)
+
+            sys.excepthook = _gui_excepthook
+
+            # Tk has its own callback-exception path that doesn't go
+            # through sys.excepthook — set ours on the root window.
+            def _tk_callback_exception(exc_type, exc_value, exc_tb):
+                tb_text = "".join(traceback.format_exception(
+                    exc_type, exc_value, exc_tb,
+                ))
+                log.error("tk callback exception:\n%s", tb_text.rstrip())
+
+            self.report_callback_exception = _tk_callback_exception
+        else:
+            # Disable: restore the saved defaults so we don't leave a
+            # stale hook running after the user toggles off.
+            sys.excepthook = self._default_excepthook
+            try:
+                # Drop the instance-level override so Tk falls back to
+                # the base class default (prints to stderr).
+                del self.report_callback_exception
+            except AttributeError:
+                pass
+
+    def _on_log_toggle_change(self) -> None:
+        """Reapply log config + persist to disk when a checkbox flips.
+
+        Bound via `var_system_log.trace_add("write", …)` and same for
+        `var_debug_log`. Apply-and-save is immediate (no Save button
+        required) — log toggles are the kind of thing the user tries
+        on and expects to survive a restart even if they forgot to
+        hit Save.
+        """
+        sys_log = bool(self.var_system_log.get())
+        dbg_log = bool(self.var_debug_log.get())
+        self._apply_log_config(sys_log, dbg_log)
+        # Load-merge persist so we don't clobber unrelated config keys
+        # written by another process / tab between sessions.
+        try:
+            on_disk = load_json(CONFIG_PATH) or {}
+        except Exception:
+            on_disk = {}
+        ui_block = on_disk.setdefault("ui", {})
+        ui_block["system_log"] = sys_log
+        ui_block["debug_log"] = dbg_log
+        self.config_data.setdefault("ui", {})["system_log"] = sys_log
+        self.config_data.setdefault("ui", {})["debug_log"] = dbg_log
+        try:
+            save_json(CONFIG_PATH, on_disk)
+        except Exception as e:
+            log.warning("could not persist log toggles: %s", e)
+        log.info("log toggles: system_log=%s debug_log=%s", sys_log, dbg_log)
+
+    def _on_bonus_content_toggle(self) -> None:
+        """Persist the «Бонусний контент» switch + (later) toggle the tab.
+
+        For now the only effect is the config write — the wishlist-
+        tracking tab this gates will be wired here when it lands (show
+        via notebook.add / hide via notebook.hide, keeping the widgets
+        and their data alive between flips).
+        """
+        enabled = bool(self.var_bonus_content.get())
+        self.config_data.setdefault("ui", {})["bonus_content"] = enabled
+        try:
+            on_disk = load_json(CONFIG_PATH) or {}
+        except Exception:
+            on_disk = {}
+        on_disk.setdefault("ui", {})["bonus_content"] = enabled
+        try:
+            save_json(CONFIG_PATH, on_disk)
+        except Exception as e:
+            log.warning("could not persist bonus_content toggle: %s", e)
+        log.info("bonus content %s", "enabled" if enabled else "disabled")
+
     def _on_language_change(self, _event=None):
         """Save the new language and prompt for a restart.
 
@@ -5575,6 +6432,12 @@ class App(tb.Window):
                 # and "x2"..."x5"). _apply_font_scale clamps the result
                 # so hand-edited configs can't push out of range either.
                 "font_scale": self._font_scale_from_label(self.var_font_scale.get()),
+                # Log toggles. Trace-write already persists on every
+                # flip, but Save sweeps them in too so a Reset-then-
+                # Save can wipe them, and so a hand-edited config can
+                # be normalised from one place.
+                "system_log": bool(self.var_system_log.get()),
+                "debug_log": bool(self.var_debug_log.get()),
                 # Snapshot of the current window size+position. Restored
                 # on next launch (see __init__). Reset writes "1100x620"
                 # here via self.geometry() right before calling us, so
@@ -5687,6 +6550,10 @@ class App(tb.Window):
         self.var_remind_hours.set(defaults["remind_after_hours"])
         # Triggers the trace_add → glyph redraws to ☑/☐ automatically.
         self.var_repeat_lower.set(defaults["repeat_if_lower"])
+        # Log toggles reset to off — Reset is "back to defaults", and
+        # defaults are off for both. Trace will fire and persist for us.
+        self.var_system_log.set(False)
+        self.var_debug_log.set(False)
 
         # Template field is a tk.Text in disabled state — unlock briefly
         # to replace its contents with the language default, then relock.
@@ -5930,10 +6797,10 @@ class App(tb.Window):
             self.hist_tree.column(col, width=width, anchor=anchor)
         self._apply_row_tags(self.hist_tree)
         self._setup_sortable_columns(self.hist_tree, list(cols))
-        # Same selection-tag trick as the watchlist tree so rows you click
-        # actually look selected.
-        self.hist_tree.bind("<<TreeviewSelect>>",
-                            lambda _e: self._mark_selected_rows(self.hist_tree))
+        # Selection handler is wired AFTER the action-button row builds —
+        # see further down (it needs `self.btn_hist_delete` to exist so
+        # the same callback can flip its enabled state). The
+        # `_mark_selected_rows` part lives in the combined handler.
         # Click on the link column opens the market listing in a browser.
         self.hist_tree.bind("<Button-1>", self._on_hist_tree_click)
         self.hist_tree.bind("<Motion>", self._on_hist_tree_motion)
@@ -5955,6 +6822,7 @@ class App(tb.Window):
         # is placed before "Редагувати ціну" because re-adding is the
         # more common follow-up to looking at a past purchase; price
         # editing is a niche cleanup action and lives next to Delete.
+        self.btn_hist_delete = None
         for key, cmd in [
             ("btn.history_market_log", self._open_market_history),
             ("btn.history_export",     self._hist_export_csv),
@@ -5962,7 +6830,25 @@ class App(tb.Window):
             ("btn.history_edit",       self._hist_edit),
             ("btn.history_delete",     self._hist_delete),
         ]:
-            ttk.Button(btn_f, text=t(key), command=cmd).pack(side=LEFT, padx=2)
+            btn = ttk.Button(btn_f, text=t(key), command=cmd)
+            btn.pack(side=LEFT, padx=2)
+            if key == "btn.history_delete":
+                # Same enable-on-select / red-when-active contract as
+                # the «Видалити» button on the Покупка / Продаж tabs.
+                # State flips via `_update_hist_delete_state`, bound to
+                # the tree's <<TreeviewSelect>> below.
+                btn.configure(state=DISABLED, bootstyle="")
+                self.btn_hist_delete = btn
+
+        # React to selection changes — the existing handler already
+        # paints the row highlights; we just chain our button update
+        # after it. Wrapping rather than re-binding so we don't
+        # replace the original handler.
+        prev_select_cb = self.hist_tree.bind("<<TreeviewSelect>>")
+        def _on_hist_select(_e=None, _orig=prev_select_cb):
+            self._mark_selected_rows(self.hist_tree)
+            self._update_hist_delete_state()
+        self.hist_tree.bind("<<TreeviewSelect>>", _on_hist_select)
 
         # Totals panel — purchases / sales / spent — laid out adaptively
         # by _reflow_history_bottom (three modes: inline / vertical /
@@ -6223,6 +7109,13 @@ class App(tb.Window):
                 t("col.link.open"),
             ), tags=(row_tag,))
         self._mark_selected_rows(self.hist_tree)
+        # Persisted sort order across restarts — same contract as the
+        # card-list trees.
+        self._restore_sort_state(self.hist_tree)
+        # Re-sync the «Видалити» button — refresh wipes selection,
+        # which fires TreeviewSelect, but the button state could be
+        # stale if e.g. we just deleted the last selected row.
+        self._update_hist_delete_state()
         self._refresh_history_stats(purchases)
 
     def _refresh_history_stats(self, purchases: list | None = None) -> None:

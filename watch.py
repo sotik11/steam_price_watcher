@@ -240,6 +240,38 @@ def _process_list(kind: str, list_path: Path, *,
                 w["last_seen"] = new_last_seen
                 list_dirty = True
 
+        # Leader suppression (sell only). When the user has 2+ copies of
+        # the same card listed and at least one of them sits exactly at
+        # the market minimum (target == lowest), the user IS the market
+        # leader — the "undercut" the other copies see is their own
+        # cheaper listing, not a competitor. Alerting on those would be
+        # pure noise, so the whole group goes quiet. The rows keep their
+        # normal red/green tinting in the GUI (price math is untouched);
+        # only the Telegram side is muted. The moment a competitor
+        # undercuts below the leader's price, target == lowest stops
+        # holding and alerts flow again.
+        if kind == "sell" and len(matching) >= 2:
+            leader = any(
+                isinstance(w.get("target_price"), (int, float))
+                and abs(w["target_price"] - lowest) < 0.005
+                for w in matching
+            )
+            if leader:
+                # Regaining leadership resolves the situation the earlier
+                # alert warned about — drop the stale "сповіщено" badge on
+                # the whole group and wipe the antispam entry, so if a
+                # competitor undercuts again later the group fires a fresh
+                # first_alert instead of being muted by repeat_if_lower.
+                for w in matching:
+                    if w.get("status") == "alerted":
+                        w["status"] = ""
+                        list_dirty = True
+                if state.pop(key, None) is not None:
+                    state_dirty = True
+                log.info(t("log.leader_suppressed", name=pretty[:40],
+                           lowest=lowest))
+                continue
+
         # Buy: alert when market hit OR dropped below my target ("good
         #   time to buy at my asking price").
         # Sell: alert only when market dropped STRICTLY below my target —
