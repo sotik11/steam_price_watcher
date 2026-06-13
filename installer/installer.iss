@@ -75,9 +75,13 @@ Source: "..\gui_debug.bat";           DestDir: "{app}"; Flags: ignoreversion
 Source: "..\setup_env.bat";           DestDir: "{app}"; Flags: ignoreversion
 Source: "..\run.vbs";                 DestDir: "{app}"; Flags: ignoreversion
 ; --- resources -------------------------------------------------------------
-Source: "..\requirements.txt";        DestDir: "{app}"; Flags: ignoreversion
+Source: "..\requirements.txt";          DestDir: "{app}"; Flags: ignoreversion
+Source: "..\requirements-optional.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\config.example.json";     DestDir: "{app}"; Flags: ignoreversion
 Source: "..\icon.ico";                DestDir: "{app}"; Flags: ignoreversion
+; Prebuilt wheels for deps with no PyPI wheel on this Python (rookiepy).
+; setup_env.bat installs from here offline; missing/mismatch just skips.
+Source: "wheels\*";  DestDir: "{app}\wheels"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\assets\*";  DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\lang\*";    DestDir: "{app}\lang";   Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\themes\*";  DestDir: "{app}\themes"; Flags: ignoreversion recursesubdirs createallsubdirs

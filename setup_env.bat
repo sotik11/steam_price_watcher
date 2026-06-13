@@ -91,9 +91,17 @@ rem  The app imports rookiepy inside try/except, so missing it is harmless
 rem  (only Chrome/Edge/Opera App-Bound cookie extraction is unavailable).
 if exist "requirements-optional.txt" (
     echo [setup_env] Installing optional deps ^(best effort^) ...>> "%LOG%"
-    ".venv\Scripts\python.exe" -m pip install -r requirements-optional.txt --only-binary=:all: --disable-pip-version-check >> "%LOG%" 2>&1
+    if exist "wheels" (
+        rem  Install strictly from the bundled wheels\ folder - offline, no
+        rem  PyPI, no compilation. rookiepy ships here as a prebuilt wheel
+        rem  (PyPI has none for 3.13). A platform/version mismatch just makes
+        rem  pip skip; we ignore the failure either way.
+        ".venv\Scripts\python.exe" -m pip install -r requirements-optional.txt --no-index --find-links "%~dp0wheels" --disable-pip-version-check >> "%LOG%" 2>&1
+    ) else (
+        ".venv\Scripts\python.exe" -m pip install -r requirements-optional.txt --only-binary=:all: --disable-pip-version-check >> "%LOG%" 2>&1
+    )
     if errorlevel 1 (
-        echo [setup_env] Optional deps skipped ^(no prebuilt wheel^) - OK.>> "%LOG%"
+        echo [setup_env] Optional deps skipped - OK ^(app works without them^).>> "%LOG%"
     )
 )
 
