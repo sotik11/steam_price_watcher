@@ -6987,11 +6987,11 @@ class App(tb.Window):
 
         Layout — a single Frame with a 1-px solid border:
           ┌──────────────────────┐
-          │  [poster image]      │  ← fixed PNG from preview/
+          │  [poster image]      │  ← fixed PNG from assets/
           │  rendered template   │  ← updates as user types
           └──────────────────────┘
 
-        The image is the bundled `preview/led-backlit.png` — same kind
+        The image is the bundled `assets/led-backlit.png` — same kind
         of poster Steam shows above a Telegram-style alert, just used
         statically here so the user can see what the live message
         layout will look like without sending one.
@@ -7016,7 +7016,7 @@ class App(tb.Window):
         # `thumbnail` so the pane doesn't dominate the page.
         try:
             from PIL import Image, ImageTk
-            img = Image.open(BASE / "preview" / "led-backlit.png")
+            img = Image.open(BASE / "assets" / "led-backlit.png")
             img.thumbnail((220, 280), Image.LANCZOS)
             self._template_preview_img = ImageTk.PhotoImage(img)
             ttk.Label(preview_frame,
