@@ -240,12 +240,13 @@ begin
   CopyDataFile(srcDir, dstDir, 'state.json');
 end;
 
-{ Restore user data into the freshly installed app, if the import checkbox
-  is on. Source priority:
-    1. Desktop\<AppName>  — the folder our "delete + keep data" mode makes
-       (or one the user dropped there). Copy it in.
-    2. data already at the install path — leave it untouched (no overwrite).
-    3. a .zip the user picked — unpack it into the install dir.
+{ Restore user data into the installed app when the import checkbox is on.
+  Source priority (both OVERWRITE whatever's already at the install path -
+  ticking the box is an explicit "bring my data in" on any mode, update
+  included):
+    1. a .zip the user explicitly picked — unpack it (-Force overwrites);
+    2. else Desktop\<AppName> — the folder the delete-with-keep mode makes
+       (or one dropped there manually) — copied in (CopyFile overwrites).
   Runs at post-install (files are in place, before the app launches). }
 procedure ImportUserData(appDir: String);
 var
@@ -254,14 +255,6 @@ var
 begin
   if (ImportDataCheck = nil) or (not ImportDataCheck.Checked) then
     Exit;
-  deskDir := ExpandConstant('{userdesktop}\{#MyAppName}');
-  if FileExists(deskDir + '\config.json') then
-  begin
-    ImportDataFiles(deskDir, appDir);
-    Exit;
-  end;
-  if FileExists(appDir + '\config.json') then
-    Exit;   { data already present at the install path — keep it }
   zip := '';
   if ZipPathEdit <> nil then
     zip := Trim(ZipPathEdit.Text);
@@ -272,7 +265,11 @@ begin
          + ''' -DestinationPath ''' + appDir + ''' -Force"',
          '', SW_HIDE, ewWaitUntilTerminated, rc);
     UsedZipImport := True;
+    Exit;
   end;
+  deskDir := ExpandConstant('{userdesktop}\{#MyAppName}');
+  if FileExists(deskDir + '\config.json') then
+    ImportDataFiles(deskDir, appDir);
 end;
 
 { For the final-page "delete archive" task: shown only if we unpacked a
@@ -501,10 +498,10 @@ begin
   importInfo.Height := ScaleY(64);
   importInfo.WordWrap := True;
   importInfo.Caption :=
-    'Джерело шукається у такому порядку: тека "{#MyAppName}" на Робочому '
-    + 'столі (її створює видалення «зі збереженням даних») → наявні дані '
-    + 'за шляхом встановлення (не перезаписуються) → інакше вкажіть '
-    + '.zip-архів нижче.';
+    'Якщо позначено — дані буде відновлено (з ПЕРЕЗАПИСОМ наявних): '
+    + 'спершу з вказаного .zip-архіву, інакше з теки "{#MyAppName}" на '
+    + 'Робочому столі (її створює видалення «зі збереженням даних»). '
+    + 'Працює і при оновленні.';
 
   ZipPathEdit := TNewEdit.Create(ImportPage);
   ZipPathEdit.Parent := ImportPage.Surface;
@@ -532,10 +529,10 @@ begin
     (Uninstall modes exit before reaching it anyway.) }
   if (PageID = wpSelectDir) and ExistingInstall then
     Result := True;
-  { Import page: shown on a fresh install or a clean reinstall (mode 1).
-    On a plain update the data is already in place, so skip it. }
-  if (ImportPage <> nil) and (PageID = ImportPage.ID) then
-    Result := ExistingInstall and (InstallMode <> 1);
+  { Import page is shown on every install path that proceeds to copying
+    files — fresh, update (mode 0) and clean reinstall (mode 1). The two
+    delete modes never reach it (they ExitProcess on the mode page). So:
+    never skip it here. When the checkbox is left off it's a no-op anyway. }
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
