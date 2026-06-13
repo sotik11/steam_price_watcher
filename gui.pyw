@@ -1488,55 +1488,43 @@ class App(tb.Window):
         )
 
     def _show_session_expired_toast(self) -> None:
-        """Pop a small clickable toast under the user-widget.
+        """Pop a small clickable toast just under the user-widget.
 
-        Uses a borderless Toplevel positioned via `geometry()` so it
-        floats relative to the main window. Auto-dismisses after
-        ~12 seconds (configurable per call), or immediately on click.
-        Clicking opens the Steam-login dialog. Re-entrant — if a
-        toast is already up, do nothing (avoids stacking).
+        Implemented as a `place`d `tk.Frame` INSIDE the main window
+        (not a standalone Toplevel) — same trick as the avatar cluster.
+        A Toplevel positioned in screen coords drifted off-screen when
+        the main window sat near the top edge of the display; a placed
+        child can't leave the window and tracks it on move/resize for
+        free. Auto-dismisses after ~12 s or on click (→ login dialog).
+        Re-entrant: if a toast is already up, do nothing.
         """
         if (self._session_warning_toast is not None
                 and self._session_warning_toast.winfo_exists()):
             return
-        try:
-            top = tk.Toplevel(self)
-        except tk.TclError:
-            return
-        self._session_warning_toast = top
-        # Borderless so it looks like a notification chip, not a
-        # standalone window with its own title bar.
-        top.overrideredirect(True)
-        top.attributes("-topmost", True)
         # Fill with the ACTIVE-TAB accent (Steam-green on the claude
         # theme) — the earlier danger-red blended into the red row
-        # tints of the table behind it. The tab colour is guaranteed
-        # to contrast with both the chrome and the table.
+        # tints of the table behind it.
         current_theme = self.style.theme_use()
         theme_meta = getattr(self, "_custom_theme_by_code", {}) \
             .get(current_theme, {})
         bg = theme_meta.get("active_tab_bg") or self.style.colors.success
-        fg = "#FFFFFF"
-        # Outer frame with the bg colour; inner padding gives the text
-        # some air. Done as plain tk widgets so we can colour-fill the
-        # bg (ttk.Frame ignores background overrides on most themes).
-        frame = tk.Frame(top, padx=12, pady=8,
-                          highlightthickness=1, highlightbackground="#000000")
-        frame.pack()
+        fg = "#000000"
+        # Plain tk.Frame child of the main window so we can colour-fill
+        # the bg (ttk.Frame ignores background overrides on most themes).
+        frame = tk.Frame(self, padx=12, pady=8,
+                         highlightthickness=1, highlightbackground="#000000")
+        self._session_warning_toast = frame
         lbl = tk.Label(
             frame,
             text=t("toast.session_expired"),
-            foreground=fg,
             font=("Segoe UI", 10, "bold"),
             cursor="hand2",
         )
         lbl.pack()
         # Colours applied POST-creation on purpose: ttkbootstrap hooks
         # the vanilla tk widget constructors and slaps the theme's
-        # background on top of whatever kwargs we passed (diag log
-        # showed '#1E1F1F' despite background='#84BD3A' in the call).
-        # A .configure() after __init__ wins because the hook only
-        # fires at construction time.
+        # background on top of whatever kwargs we passed. A .configure()
+        # after __init__ wins because the hook only fires at construction.
         frame.configure(background=bg)
         lbl.configure(background=bg, foreground=fg)
         # Click handler — both label + frame so the user can hit either.
@@ -1545,50 +1533,34 @@ class App(tb.Window):
             self._open_steam_login_dialog()
         for w in (frame, lbl):
             w.bind("<Button-1>", _on_click)
-        # Position under the user-widget. user_cluster is `place`d at
-        # `relx=1.0, x=-14, y=5, anchor=ne`, so absolute right edge ≈
-        # window-x + window-width − 14, and absolute top ≈ window-y + 5.
-        # We anchor toast's top-right to the SAME right edge but ~50 px
-        # below the widget. update_idletasks first so winfo_* values
-        # reflect the current geometry, not a stale one.
+        # Place top-right, just below the avatar cluster. relx=1.0 +
+        # anchor="ne" + x=-14 mirrors the cluster's own placement, so
+        # the toast's right edge lines up with the avatar's. y is the
+        # cluster's bottom + a small gap (cluster is place'd at y=5).
         self.update_idletasks()
-        try:
-            cluster = getattr(self, "user_cluster", None)
-            cluster_w = cluster.winfo_width() if cluster else 0
-            cluster_h = cluster.winfo_height() if cluster else 0
-            win_x = self.winfo_rootx()
-            win_y = self.winfo_rooty()
-            win_w = self.winfo_width()
-            top.update_idletasks()
-            toast_w = top.winfo_reqwidth()
-            toast_h = top.winfo_reqheight()
-            # Place toast so its right edge aligns with cluster's right
-            # edge, and its top sits cluster_h + 8 px below window-top.
-            x = win_x + win_w - 14 - toast_w
-            y = win_y + 5 + cluster_h + 8
-            top.geometry(f"{toast_w}x{toast_h}+{x}+{y}")
-        except tk.TclError:
-            pass
-        top.lift()
-        # Auto-dismiss after 12 seconds. Stored as an after-id on the
-        # toplevel so a manual dismiss can cancel it.
-        top._dismiss_job = top.after(
+        cluster = getattr(self, "user_cluster", None)
+        cluster_h = cluster.winfo_height() if cluster else 40
+        frame.place(relx=1.0, x=-14, y=5 + cluster_h + 4, anchor="ne")
+        frame.lift()
+        # Auto-dismiss after 12 seconds. Stored as an after-id so a
+        # manual dismiss can cancel it.
+        frame._dismiss_job = frame.after(
             12_000, self._dismiss_session_expired_toast,
         )
 
     def _dismiss_session_expired_toast(self) -> None:
         """Tear down the session-expired toast if it's up."""
-        top = self._session_warning_toast
+        frame = self._session_warning_toast
         self._session_warning_toast = None
-        if top is None:
+        if frame is None:
             return
         try:
-            if getattr(top, "_dismiss_job", None) is not None:
-                top.after_cancel(top._dismiss_job)
+            if getattr(frame, "_dismiss_job", None) is not None:
+                frame.after_cancel(frame._dismiss_job)
         except (tk.TclError, ValueError, AttributeError):
             pass
         try:
-            top.destroy()
+            frame.destroy()
         except tk.TclError:
             pass
 
