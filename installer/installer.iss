@@ -81,8 +81,8 @@ Source: "..\icon.ico";                DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\*";  DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\lang\*";    DestDir: "{app}\lang";   Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\themes\*";  DestDir: "{app}\themes"; Flags: ignoreversion recursesubdirs createallsubdirs
-; --- bundled Python installer (only extracted when Python is missing) ------
-Source: "python\{#PyInstaller}"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: PythonNeeded
+; --- bundled Python installer (extracted only if we're going to run it) ----
+Source: "python\{#PyInstaller}"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: ShouldInstallPython
 
 [Icons]
 ; Shortcut points straight at pythonw.exe in the venv (no console flash).
@@ -93,11 +93,12 @@ Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\.venv\Scripts\pythonw.exe";
     IconFilename: "{app}\icon.ico"; Tasks: desktopicon
 
 [Run]
-; 1) Install bundled Python silently, per-user, only if it's missing.
+; 1) Install bundled Python silently, per-user, when it's missing OR when
+;    the user ticked "update Python" on the custom page.
 Filename: "{tmp}\{#PyInstaller}"; \
     Parameters: "/quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1 Include_pip=1"; \
     StatusMsg: "Installing Python {#PyVersion}..."; \
-    Check: PythonNeeded
+    Check: ShouldInstallPython
 
 ; 2) Build/refresh the venv and install dependencies.
 Filename: "{app}\setup_env.bat"; WorkingDir: "{app}"; \
@@ -114,9 +115,13 @@ Type: files;          Name: "{app}\*.log"
 Type: files;          Name: "{app}\*.log.*"
 
 [Code]
-{ Returns True when no usable Python 3.13 is present, so the bundled one
-  should be installed. We probe the py launcher pinned to 3.13 - matching
-  what setup_env.bat looks for first, so the two stay in sync. }
+var
+  PythonInstalled: Boolean;   { True if a usable py -3.13 was found at startup }
+  UpdatePythonCheck: TNewCheckBox;
+
+{ Returns True when no usable Python 3.13 is present. We probe the py launcher
+  pinned to 3.13 - matching what setup_env.bat looks for first, so the two
+  stay in sync. }
 function PythonNeeded: Boolean;
 var
   rc: Integer;
@@ -126,6 +131,57 @@ begin
     Result := False
   else
     Result := True;
+end;
+
+{ Decision used by [Files]/[Run]: install the bundled Python when none is
+  present, OR when the user opted to update an existing one. }
+function ShouldInstallPython: Boolean;
+begin
+  Result := (not PythonInstalled)
+            or ((UpdatePythonCheck <> nil) and UpdatePythonCheck.Checked);
+end;
+
+{ Custom wizard page: explain the Python dependency, and - only when Python
+  is already on the system - offer to reinstall it with the bundled version. }
+procedure InitializeWizard;
+var
+  page: TWizardPage;
+  info: TNewStaticText;
+begin
+  PythonInstalled := not PythonNeeded();
+
+  page := CreateCustomPage(wpSelectDir,
+    'Python', 'Середовище виконання програми');
+
+  info := TNewStaticText.Create(page);
+  info.Parent := page.Surface;
+  info.Left := 0;
+  info.Top := 0;
+  info.Width := page.SurfaceWidth;
+  info.AutoSize := False;
+  info.Height := ScaleY(72);
+  info.WordWrap := True;
+  if PythonInstalled then
+    info.Caption :=
+      'Програма працює на Python 3.13. У системі вже знайдено відповідну '
+      + 'версію — повторне встановлення не потрібне.'
+  else
+    info.Caption :=
+      'Програма працює на Python 3.13. У системі його не знайдено, тому '
+      + 'Python {#PyVersion} буде встановлено автоматично під час інсталяції '
+      + '(тихо, без додаткових вікон).';
+
+  UpdatePythonCheck := TNewCheckBox.Create(page);
+  UpdatePythonCheck.Parent := page.Surface;
+  UpdatePythonCheck.Left := 0;
+  UpdatePythonCheck.Top := info.Top + info.Height + ScaleY(8);
+  UpdatePythonCheck.Width := page.SurfaceWidth;
+  UpdatePythonCheck.Caption :=
+    'Оновити / перевстановити Python версією {#PyVersion} з інсталятора';
+  UpdatePythonCheck.Checked := False;
+  { Pointless when Python is absent (it gets installed regardless), so the
+    checkbox only appears when there's an existing install to update. }
+  UpdatePythonCheck.Visible := PythonInstalled;
 end;
 
 { Find the per-user Python uninstall command in the registry, if our bundled
