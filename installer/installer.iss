@@ -118,6 +118,12 @@ Filename: "{app}\.venv\Scripts\pythonw.exe"; Parameters: """{app}\gui.pyw"""; \
     WorkingDir: "{app}"; Description: "Запустити {#MyAppName}"; \
     Flags: postinstall nowait skipifsilent
 
+; 4) Optional delete of the imported backup .zip — only shown when we
+;    actually unpacked one (WasZipUsed). Path comes from {code:GetZipPath}.
+Filename: "{cmd}"; Parameters: "/c del ""{code:GetZipPath}"""; \
+    Description: "Видалити архів даних після імпорту"; \
+    Flags: postinstall skipifsilent runhidden; Check: WasZipUsed
+
 [UninstallDelete]
 ; venv, caches and logs are created at runtime - not in the manifest - so
 ; remove them explicitly. User data (config.json, *.json) is left for the
@@ -152,6 +158,10 @@ var
   ModePage: TInputOptionWizardPage;
   InstallMode: Integer;            { 0 update, 1 clean reinstall, 2 del+keep, 3 del }
   RemovePythonCheck: TNewCheckBox; { on the maintenance page, for delete modes }
+  ImportPage: TWizardPage;         { restore-user-data page (fresh / clean reinstall) }
+  ImportDataCheck: TNewCheckBox;
+  ZipPathEdit: TNewEdit;           { chosen backup .zip, '' if none }
+  UsedZipImport: Boolean;          { set in post-install if we unpacked a zip }
 
 { Returns True when no usable Python 3.13 is present. Probes the py launcher
   pinned to 3.13 - matching what setup_env.bat looks for first. }
@@ -216,6 +226,68 @@ begin
   CopyDataFile(srcDir, dst, 'state.json');
   CopyDataMask(srcDir, dst, '*.log');
   CopyDataMask(srcDir, dst, '*.log.*');
+end;
+
+{ Copy the user-data files (config + state lists, no logs) src -> dst. }
+procedure ImportDataFiles(srcDir, dstDir: String);
+begin
+  CopyDataFile(srcDir, dstDir, 'config.json');
+  CopyDataFile(srcDir, dstDir, 'watchlist.json');
+  CopyDataFile(srcDir, dstDir, 'salelist.json');
+  CopyDataFile(srcDir, dstDir, 'gamelist.json');
+  CopyDataFile(srcDir, dstDir, 'gameblacklist.json');
+  CopyDataFile(srcDir, dstDir, 'purchases.json');
+  CopyDataFile(srcDir, dstDir, 'state.json');
+end;
+
+{ Restore user data into the freshly installed app, if the import checkbox
+  is on. Source priority:
+    1. Desktop\<AppName>  — the folder our "delete + keep data" mode makes
+       (or one the user dropped there). Copy it in.
+    2. data already at the install path — leave it untouched (no overwrite).
+    3. a .zip the user picked — unpack it into the install dir.
+  Runs at post-install (files are in place, before the app launches). }
+procedure ImportUserData(appDir: String);
+var
+  deskDir, zip: String;
+  rc: Integer;
+begin
+  if (ImportDataCheck = nil) or (not ImportDataCheck.Checked) then
+    Exit;
+  deskDir := ExpandConstant('{userdesktop}\{#MyAppName}');
+  if FileExists(deskDir + '\config.json') then
+  begin
+    ImportDataFiles(deskDir, appDir);
+    Exit;
+  end;
+  if FileExists(appDir + '\config.json') then
+    Exit;   { data already present at the install path — keep it }
+  zip := '';
+  if ZipPathEdit <> nil then
+    zip := Trim(ZipPathEdit.Text);
+  if (zip <> '') and FileExists(zip) then
+  begin
+    Exec('powershell.exe',
+         '-NoProfile -Command "Expand-Archive -Path ''' + zip
+         + ''' -DestinationPath ''' + appDir + ''' -Force"',
+         '', SW_HIDE, ewWaitUntilTerminated, rc);
+    UsedZipImport := True;
+  end;
+end;
+
+{ For the final-page "delete archive" task: shown only if we unpacked a
+  zip, and supplies its path to the del command. }
+function WasZipUsed: Boolean;
+begin
+  Result := UsedZipImport;
+end;
+
+function GetZipPath(Param: String): String;
+begin
+  if ZipPathEdit <> nil then
+    Result := Trim(ZipPathEdit.Text)
+  else
+    Result := '';
 end;
 
 { Remove the scheduled task created by the app's scheduler tab. }
@@ -304,8 +376,17 @@ begin
   begin
     pyCmd := FindPythonUninstall();
     if pyCmd <> '' then
+    begin
       Exec(ExpandConstant('{cmd}'), '/c ' + pyCmd, '',
            SW_HIDE, ewWaitUntilTerminated, rc);
+      { Python's per-user uninstaller leaves an empty Python313 tree
+        behind (site-packages etc. it didn't create), so sweep it. Only
+        touches the per-user bundled location - a system Python wouldn't
+        be in HKCU and pyCmd would've been empty. }
+      DelTree(ExpandConstant('{localappdata}\Programs\Python\Python313'),
+              True, True, True);
+      RemoveDir(ExpandConstant('{localappdata}\Programs\Python'));
+    end;
   end;
   if keepData then
     MsgBox('Програму видалено. Збережені дані скопійовано на Робочий стіл '
@@ -315,9 +396,23 @@ begin
   ExitProcessWin(0);
 end;
 
+{ "Choose .zip" button on the import page. }
+procedure BrowseZipClick(Sender: TObject);
+var
+  fn: String;
+begin
+  fn := '';
+  if GetOpenFileName('Оберіть архів із даними', fn,
+                     ExpandConstant('{userdesktop}'),
+                     'ZIP-архіви (*.zip)|*.zip|Усі файли (*.*)|*.*', 'zip') then
+    ZipPathEdit.Text := fn;
+end;
+
 procedure InitializeWizard;
 var
   info: TNewStaticText;
+  importInfo: TNewStaticText;
+  browseBtn: TNewButton;
 begin
   PythonInstalled := not PythonNeeded();
   ExistingInstall := RegQueryStringValue(HKCU, UNINSTALL_KEY,
@@ -382,6 +477,49 @@ begin
     'Оновити / перевстановити Python версією {#PyVersion} з інсталятора';
   UpdatePythonCheck.Checked := False;
   UpdatePythonCheck.Visible := PythonInstalled;
+
+  { Import-user-data page. Shown on a fresh install and on a clean
+    reinstall (see ShouldSkipPage); pointless on an update (data stays). }
+  ImportPage := CreateCustomPage(PythonPage.ID,
+    'Дані', 'Імпорт користувацьких даних');
+
+  ImportDataCheck := TNewCheckBox.Create(ImportPage);
+  ImportDataCheck.Parent := ImportPage.Surface;
+  ImportDataCheck.Left := 0;
+  ImportDataCheck.Top := 0;
+  ImportDataCheck.Width := ImportPage.SurfaceWidth;
+  ImportDataCheck.Caption :=
+    'Імпортувати користувацькі дані (config, списки, історія)';
+  ImportDataCheck.Checked := False;
+
+  importInfo := TNewStaticText.Create(ImportPage);
+  importInfo.Parent := ImportPage.Surface;
+  importInfo.Left := 0;
+  importInfo.Top := ImportDataCheck.Top + ImportDataCheck.Height + ScaleY(10);
+  importInfo.Width := ImportPage.SurfaceWidth;
+  importInfo.AutoSize := False;
+  importInfo.Height := ScaleY(64);
+  importInfo.WordWrap := True;
+  importInfo.Caption :=
+    'Джерело шукається у такому порядку: тека "{#MyAppName}" на Робочому '
+    + 'столі (її створює видалення «зі збереженням даних») → наявні дані '
+    + 'за шляхом встановлення (не перезаписуються) → інакше вкажіть '
+    + '.zip-архів нижче.';
+
+  ZipPathEdit := TNewEdit.Create(ImportPage);
+  ZipPathEdit.Parent := ImportPage.Surface;
+  ZipPathEdit.Left := 0;
+  ZipPathEdit.Top := importInfo.Top + importInfo.Height + ScaleY(6);
+  ZipPathEdit.Width := ImportPage.SurfaceWidth - ScaleX(110);
+  ZipPathEdit.ReadOnly := True;
+
+  browseBtn := TNewButton.Create(ImportPage);
+  browseBtn.Parent := ImportPage.Surface;
+  browseBtn.Left := ZipPathEdit.Left + ZipPathEdit.Width + ScaleX(10);
+  browseBtn.Top := ZipPathEdit.Top - ScaleY(1);
+  browseBtn.Width := ScaleX(100);
+  browseBtn.Caption := 'Обрати .zip…';
+  browseBtn.OnClick := @BrowseZipClick;
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;
@@ -394,6 +532,10 @@ begin
     (Uninstall modes exit before reaching it anyway.) }
   if (PageID = wpSelectDir) and ExistingInstall then
     Result := True;
+  { Import page: shown on a fresh install or a clean reinstall (mode 1).
+    On a plain update the data is already in place, so skip it. }
+  if (ImportPage <> nil) and (PageID = ImportPage.ID) then
+    Result := ExistingInstall and (InstallMode <> 1);
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -435,6 +577,12 @@ begin
     DelTree(ExistingDir + '\*.log', False, True, False);
     DelTree(ExistingDir + '\*.log.*', False, True, False);
   end;
+
+  { Restore user data after files are in place (fresh install or clean
+    reinstall — the import checkbox only exists there). No-op if the box
+    was left unchecked. }
+  if CurStep = ssPostInstall then
+    ImportUserData(ExpandConstant('{app}'));
 end;
 
 { ---- Fallback path: unins000.exe launched from Add/Remove Programs -------- }
