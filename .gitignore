@@ -13,3 +13,8 @@ cookie_helper.log
 
 # Шаблоны конфигов — коммитим
 !config.example.json
+
+# Артефакты сборки инсталлятора
+installer/python/        # скачанный bundled Python (~27 МБ)
+installer/dist/          # собранные Setup .exe
+*.png                    # скриншоты/мусор из preview и корня
