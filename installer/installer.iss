@@ -228,6 +228,28 @@ begin
        '', SW_HIDE, ewWaitUntilTerminated, rc);
 end;
 
+{ Kill any running instance of the app BEFORE deleting/overwriting files.
+  The GUI runs as <dir>\.venv\Scripts\pythonw.exe and holds a lock on the
+  venv, so DelTree/Inno can't remove or replace it while it's alive - that's
+  why an uninstall-while-running left .venv/config/log behind and the window
+  still up. We target only pythonw.exe whose executable path is inside the
+  install dir, so other Python apps are untouched. The short Sleep lets
+  Windows release the file handles before we proceed. }
+procedure KillRunningApp(appDir: String);
+var
+  rc: Integer;
+  ps: String;
+begin
+  ps := 'Get-CimInstance Win32_Process | Where-Object { '
+      + '$_.Name -eq ''pythonw.exe'' -and $_.ExecutablePath -and '
+      + '$_.ExecutablePath.StartsWith(''' + appDir + ''') } | '
+      + 'ForEach-Object { Stop-Process -Id $_.ProcessId -Force }';
+  Exec('powershell.exe',
+       '-NoProfile -WindowStyle Hidden -Command "' + ps + '"',
+       '', SW_HIDE, ewWaitUntilTerminated, rc);
+  Sleep(800);
+end;
+
 { Find the per-user Python uninstall command in the registry, if our bundled
   Python is still registered. Returns '' when not found. Declared here (above
   DoUninstall and InitializeWizard) since both use it. }
@@ -268,6 +290,7 @@ var
   rc: Integer;
   pyCmd: String;
 begin
+  KillRunningApp(ExistingDir);   { release file locks before deleting }
   DropScheduledTask;
   if keepData then
     BackupDataToDesktop(ExistingDir);
@@ -389,6 +412,12 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
+  if (CurStep = ssInstall) and ExistingInstall then
+    { Kill a running instance first - otherwise the locked venv blocks
+      both Inno's file copy and setup_env's venv rebuild (update mode),
+      and the wipe below (clean reinstall). }
+    KillRunningApp(ExistingDir);
+
   { Clean reinstall: wipe data + venv + task BEFORE files are copied, so the
     install proceeds onto a blank slate. Code is overwritten by Inno; the
     venv is rebuilt by setup_env.bat in [Run]. }
@@ -417,6 +446,7 @@ var
 begin
   if CurUninstallStep = usUninstall then
   begin
+    KillRunningApp(ExpandConstant('{app}'));   { free locks first }
     DropScheduledTask;
 
     if MsgBox('Видалити також збережені дані (config, списки, історія)?'
