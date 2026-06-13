@@ -41,12 +41,17 @@ def send_alert(token: str, chat_id: str, item: dict, template: str) -> None:
     """
     from steam import market_url, pretty_name
 
+    # Game alerts (the «Ігри» wishlist tab) point at the store page,
+    # not the market — the caller passes the ready URL in `alert_url`.
+    # Card alerts keep deriving the market listing URL from
+    # appid + market_hash_name as before.
+    browser_url = item.get("alert_url") or market_url(
+        item["appid"], item["market_hash_name"])
     # `?buy=1` on the listing URL only makes sense for BUY alerts —
     # Steam then opens the page with the buy dialog already up, so the
     # user goes click → confirm instead of click → click buy → confirm.
     # For SELL alerts the user is reviewing their own listing / the
     # market, not buying anything, so the plain URL is right.
-    browser_url = market_url(item["appid"], item["market_hash_name"])
     if item.get("operation") == "buy":
         browser_url += "?buy=1"
 
@@ -94,6 +99,11 @@ def send_alert(token: str, chat_id: str, item: dict, template: str) -> None:
     # the URL doesn't need to live in the caption too — the button covers
     # both clicking and long-press-copy. Keeping the caption clean.
     text = body
+    # Game alerts at the all-time low get an extra punch line under the
+    # user template — the flag is set by the games alert path, never by
+    # the card paths.
+    if item.get("at_historical_min"):
+        text += "\n" + t("tg.at_minimum")
 
     keyboard = {
         "inline_keyboard": [[
@@ -108,13 +118,23 @@ def send_alert(token: str, chat_id: str, item: dict, template: str) -> None:
         # preview heuristic is inconsistent — wide card art comes out big,
         # square card art comes out as a thumbnail, even with
         # prefer_large_media set). Caption mirrors the link-preview text.
-        _call(token, "sendPhoto",
-              chat_id=chat_id,
-              photo=image_url,
-              caption=text,
-              parse_mode="HTML",
-              reply_markup=keyboard)
-    else:
+        #
+        # Telegram rejects the whole call with HTTP 400 when the photo
+        # URL 404s (unreleased games have no header.jpg yet). Without a
+        # fallback the alert is LOST and — worse — the antispam state
+        # never records the send, so every poll retries and floods the
+        # log. Degrade to the plain-message path instead.
+        try:
+            _call(token, "sendPhoto",
+                  chat_id=chat_id,
+                  photo=image_url,
+                  caption=text,
+                  parse_mode="HTML",
+                  reply_markup=keyboard)
+            return
+        except Exception:
+            image_url = None  # fall through to sendMessage below
+    if not image_url:
         # No cached image (older watchlist entry or fetch failed) — fall
         # back to the link-preview path. Better than nothing.
         link_preview = {

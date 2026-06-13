@@ -64,17 +64,35 @@ def evaluate_and_alert(*, kind: str, info: dict, state: dict,
         return False, False, False, "no price or target"
 
     key = f"{kind}:{appid}:{name}"
-    hit_target = (lowest <= target) if kind == "buy" else (lowest < target)
+    # buy + game share the inclusive rule (price AT the threshold is
+    # already interesting: buy → "can buy at my price", game → "the
+    # discount reached the historical low"). Sell stays strict — an
+    # equal price doesn't undercut my listing.
+    hit_target = (lowest < target) if kind == "sell" else (lowest <= target)
     if not hit_target:
-        # Price rebounded above target. If we were holding an antispam
-        # entry from a previous alert, wipe it now — next drop should
-        # fire a fresh "first_alert" instead of being silently blocked by
-        # repeat_if_lower's strict-less comparison.
-        if state.pop(key, None) is not None:
+        # Price is above target right now (for sell: lowest >= target,
+        # because the rule is strict <). Two things to do:
+        #   1) If we were holding an antispam entry from a previous
+        #      alert, wipe it so the next dip fires a fresh "first_alert"
+        #      instead of being silently blocked by repeat_if_lower.
+        #   2) Always tell the caller `did_reset=True` so it can clear
+        #      any stale `status="alerted"` badge — even if the antispam
+        #      state was already empty (e.g. it got orphaned by a key
+        #      migration, or the row was originally imported with status
+        #      "alerted" set out-of-band).
+        #
+        # Earlier this used to gate `did_reset` on a real antispam pop,
+        # which left "alerted" badges stuck on imported rows whose
+        # state-key changed under them (the appid migration sweep was
+        # the canonical example).
+        state_dirty = state.pop(key, None) is not None
+        if state_dirty:
             log.info(f"clearing antispam for {pretty!r}: lowest={lowest} "
                      f"climbed back above target={target}")
-            return True, False, True, "rebounded above target → reset"
-        return False, False, False, "above target"
+            reason = "rebounded above target → reset"
+        else:
+            reason = "above target"
+        return state_dirty, False, True, reason
 
     entry = state.get(key, {})
     last_alerted_price = entry.get("last_alerted_price")

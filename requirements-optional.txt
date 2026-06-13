@@ -1,0 +1,12 @@
+# Optional, best-effort dependencies — installation must NOT fail the setup
+# if these don't build.
+#
+# rookiepy: Rust extension that decrypts Chrome/Edge/Opera v127+ App-Bound
+# Encryption cookies (the elevated-helper path). On Python versions without
+# a prebuilt wheel, pip compiles it from source, which needs a Rust toolchain
+# + the MSVC linker (link.exe) — absent on a clean PC, so the build fails.
+# browser_cookies.py imports it inside try/except (rookiepy = None on miss),
+# so the app runs fine without it; only ABE extraction for the newest browser
+# builds is unavailable. setup_env.bat installs this separately and ignores
+# failure.
+rookiepy>=0.5

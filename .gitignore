@@ -9,6 +9,13 @@ config.json
 state.json
 watch.log
 watch.log.*
+cookie_helper.log
 
 # Шаблоны конфигов — коммитим
 !config.example.json
+
+# Артефакты сборки инсталлятора
+installer/python/        # скачанный bundled Python (~27 МБ)
+installer/dist/          # собранные Setup .exe
+installer/*.exe          # любые собранные .exe в корне installer
+*.png                    # скриншоты/мусор из preview и корня
