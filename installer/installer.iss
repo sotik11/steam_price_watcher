@@ -376,13 +376,14 @@ begin
     begin
       Exec(ExpandConstant('{cmd}'), '/c ' + pyCmd, '',
            SW_HIDE, ewWaitUntilTerminated, rc);
-      { Python's per-user uninstaller leaves an empty Python313 tree
-        behind (site-packages etc. it didn't create), so sweep it. Only
-        touches the per-user bundled location - a system Python wouldn't
-        be in HKCU and pyCmd would've been empty. }
-      DelTree(ExpandConstant('{localappdata}\Programs\Python\Python313'),
+      { The per-user Python uninstaller leaves leftovers behind: the
+        Python313 tree (third-party site-packages it didn't create) AND
+        the separate Launcher folder (py.exe/pyw.exe — a distinct ARP
+        entry the core uninstaller doesn't touch). Sweep the whole
+        per-user Programs\Python tree. We only get here when our bundled
+        per-user Python was found in HKCU, so this is our install. }
+      DelTree(ExpandConstant('{localappdata}\Programs\Python'),
               True, True, True);
-      RemoveDir(ExpandConstant('{localappdata}\Programs\Python'));
     end;
   end;
   if keepData then
@@ -533,6 +534,27 @@ begin
     files — fresh, update (mode 0) and clean reinstall (mode 1). The two
     delete modes never reach it (they ExitProcess on the mode page). So:
     never skip it here. When the checkbox is left off it's a no-op anyway. }
+end;
+
+{ Add the data-import choice to the "Ready to install" summary, next to
+  the Desktop-shortcut task, so the user sees it's going to happen. }
+function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo,
+  MemoTypeInfo, MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
+begin
+  Result := '';
+  if MemoDirInfo <> '' then
+    Result := Result + MemoDirInfo + NewLine + NewLine;
+  if MemoTasksInfo <> '' then
+    Result := Result + MemoTasksInfo;
+  if (ImportDataCheck <> nil) and ImportDataCheck.Checked then
+  begin
+    if (ZipPathEdit <> nil) and (Trim(ZipPathEdit.Text) <> '') then
+      Result := Result + NewLine + Space
+                + 'Імпортувати користувацькі дані (з архіву)'
+    else
+      Result := Result + NewLine + Space
+                + 'Імпортувати користувацькі дані';
+  end;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
