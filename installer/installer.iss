@@ -100,10 +100,19 @@ Filename: "{tmp}\{#PyInstaller}"; \
     StatusMsg: "Installing Python {#PyVersion}..."; \
     Check: ShouldInstallPython
 
-; 2) Build/refresh the venv and install dependencies.
-Filename: "{app}\setup_env.bat"; WorkingDir: "{app}"; \
+; 2) Build/refresh the venv and install dependencies. Run via cmd /c -
+;    Inno's CreateProcess can't launch a .bat directly, which is why the
+;    venv was never built before. setup_env.bat writes setup_env.log next
+;    to itself for diagnosis.
+Filename: "{cmd}"; Parameters: "/c ""{app}\setup_env.bat"""; \
+    WorkingDir: "{app}"; \
     StatusMsg: "Setting up environment and dependencies..."; \
     Flags: runhidden waituntilterminated
+
+; 3) Optional launch from the final page (checkbox).
+Filename: "{app}\.venv\Scripts\pythonw.exe"; Parameters: """{app}\gui.pyw"""; \
+    WorkingDir: "{app}"; Description: "Запустити {#MyAppName}"; \
+    Flags: postinstall nowait skipifsilent
 
 [UninstallDelete]
 ; venv, caches and logs are created at runtime - not in the manifest - so
@@ -113,6 +122,7 @@ Type: filesandordirs; Name: "{app}\.venv"
 Type: filesandordirs; Name: "{app}\__pycache__"
 Type: files;          Name: "{app}\*.log"
 Type: files;          Name: "{app}\*.log.*"
+Type: files;          Name: "{app}\setup_env.log"
 
 [Code]
 { Inno's per-user uninstall registry key for this AppId (PrivilegesRequired=

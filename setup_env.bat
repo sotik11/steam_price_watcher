@@ -15,6 +15,11 @@ rem ============================================================================
 setlocal
 cd /d "%~dp0"
 
+rem  All progress goes to setup_env.log next to this script, so a failed
+rem  install (which runs hidden via the installer) leaves a trail to read.
+set "LOG=%~dp0setup_env.log"
+echo ==== setup_env %DATE% %TIME% ==== > "%LOG%"
+
 rem --- locate a Python interpreter ------------------------------------------
 rem  Priority: explicit arg (from the installer) > py -3.13 launcher >
 rem  plain python on PATH > common fixed install locations. We need a SYSTEM
@@ -49,32 +54,33 @@ if exist "C:\Python313\python.exe" (
 
 echo [ERROR] Python 3.13 not found. Install it from python.org or run the full
 echo         installer (it bundles Python).
+echo [ERROR] Python 3.13 not found.>> "%LOG%"
 exit /b 1
 
 :have_py
-echo [setup_env] Using Python: %PYEXE%
+echo [setup_env] Using Python: %PYEXE%>> "%LOG%"
 
 rem --- create venv if missing ------------------------------------------------
 if not exist ".venv\Scripts\python.exe" (
-    echo [setup_env] Creating virtual environment in .venv ...
-    %PYEXE% -m venv .venv
+    echo [setup_env] Creating virtual environment in .venv ...>> "%LOG%"
+    %PYEXE% -m venv .venv >> "%LOG%" 2>&1
     if errorlevel 1 (
-        echo [ERROR] venv creation failed.
+        echo [ERROR] venv creation failed.>> "%LOG%"
         exit /b 1
     )
 ) else (
-    echo [setup_env] Reusing existing .venv
+    echo [setup_env] Reusing existing .venv>> "%LOG%"
 )
 
 rem --- install / update dependencies ----------------------------------------
-echo [setup_env] Upgrading pip ...
-".venv\Scripts\python.exe" -m pip install --upgrade pip --disable-pip-version-check -q
-echo [setup_env] Installing requirements ...
-".venv\Scripts\python.exe" -m pip install -r requirements.txt --disable-pip-version-check
+echo [setup_env] Upgrading pip ...>> "%LOG%"
+".venv\Scripts\python.exe" -m pip install --upgrade pip --disable-pip-version-check -q >> "%LOG%" 2>&1
+echo [setup_env] Installing requirements ...>> "%LOG%"
+".venv\Scripts\python.exe" -m pip install -r requirements.txt --disable-pip-version-check >> "%LOG%" 2>&1
 if errorlevel 1 (
-    echo [ERROR] dependency installation failed.
+    echo [ERROR] dependency installation failed.>> "%LOG%"
     exit /b 1
 )
 
-echo [setup_env] Done.
+echo [setup_env] Done.>> "%LOG%"
 exit /b 0
