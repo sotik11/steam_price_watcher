@@ -158,6 +158,7 @@ var
   ModePage: TInputOptionWizardPage;
   InstallMode: Integer;            { 0 update, 1 clean reinstall, 2 del+keep, 3 del }
   RemovePythonCheck: TNewCheckBox; { on the maintenance page, for delete modes }
+  PythonRemovable: Boolean;        { our per-user Python is registered & removable }
   ImportPage: TWizardPage;         { restore-user-data page (fresh / clean reinstall) }
   ImportDataCheck: TNewCheckBox;
   ZipPathEdit: TNewEdit;           { chosen backup .zip, '' if none }
@@ -394,6 +395,16 @@ begin
   ExitProcessWin(0);
 end;
 
+{ Show "also remove Python" only for the two delete modes (index 2/3) and
+  only when our Python is actually removable. Fires on every click in the
+  mode list, so it tracks the selection live. }
+procedure ModeSelectionChanged(Sender: TObject);
+begin
+  if (RemovePythonCheck <> nil) and (ModePage <> nil) then
+    RemovePythonCheck.Visible :=
+      PythonRemovable and (ModePage.SelectedValueIndex >= 2);
+end;
+
 { "Choose .zip" button on the import page. }
 procedure BrowseZipClick(Sender: TObject);
 var
@@ -443,7 +454,11 @@ begin
   RemovePythonCheck.Caption :=
     'При видаленні: також видалити Python {#PyVersion}';
   RemovePythonCheck.Checked := False;
-  RemovePythonCheck.Visible := (FindPythonUninstall() <> '');
+  { Hidden until a delete mode (index 2/3) is picked; ModeSelectionChanged
+    toggles it live. Only meaningful when our Python is registered. }
+  PythonRemovable := (FindPythonUninstall() <> '');
+  RemovePythonCheck.Visible := False;
+  ModePage.CheckListBox.OnClickCheck := @ModeSelectionChanged;
 
   { Python info/update page. }
   PythonPage := CreateCustomPage(wpSelectDir,
