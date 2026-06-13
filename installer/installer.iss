@@ -147,6 +147,7 @@ var
   ExistingDir: String;             { ...and it lives here }
   ModePage: TInputOptionWizardPage;
   InstallMode: Integer;            { 0 update, 1 clean reinstall, 2 del+keep, 3 del }
+  RemovePythonCheck: TNewCheckBox; { on the maintenance page, for delete modes }
 
 { Returns True when no usable Python 3.13 is present. Probes the py launcher
   pinned to 3.13 - matching what setup_env.bat looks for first. }
@@ -223,11 +224,45 @@ begin
        '', SW_HIDE, ewWaitUntilTerminated, rc);
 end;
 
+{ Find the per-user Python uninstall command in the registry, if our bundled
+  Python is still registered. Returns '' when not found. Declared here (above
+  DoUninstall and InitializeWizard) since both use it. }
+function FindPythonUninstall(): String;
+var
+  rootKey: String;
+  names: TArrayOfString;
+  i: Integer;
+  disp, cmd: String;
+begin
+  Result := '';
+  rootKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall';
+  if not RegGetSubkeyNames(HKCU, rootKey, names) then
+    Exit;
+  for i := 0 to GetArrayLength(names) - 1 do
+  begin
+    if RegQueryStringValue(HKCU, rootKey + '\' + names[i], 'DisplayName', disp) then
+    begin
+      if Pos('Python 3.13', disp) > 0 then
+      begin
+        if RegQueryStringValue(HKCU, rootKey + '\' + names[i],
+                               'QuietUninstallString', cmd) then
+        begin
+          Result := cmd;
+          Exit;
+        end;
+      end;
+    end;
+  end;
+end;
+
 { In-installer uninstall for modes 2 (keep data) and 3 (full). Does the whole
   job itself - task, optional data backup, program tree, shortcut, registry -
   then exits the process so we never enter the install flow. The Inno-generated
   unins000.exe still exists as a fallback from Add/Remove Programs. }
 procedure DoUninstall(keepData: Boolean);
+var
+  rc: Integer;
+  pyCmd: String;
 begin
   DropScheduledTask;
   if keepData then
@@ -235,6 +270,16 @@ begin
   DeleteFile(ExpandConstant('{userdesktop}\{#MyAppName}.lnk'));
   DelTree(ExistingDir, True, True, True);
   RegDeleteKeyIncludingSubkeys(HKCU, UNINSTALL_KEY);
+  { Optional: remove the bundled Python too, if the user ticked the box and
+    we can find its uninstall command. Done last - the app dir is already
+    gone, and the venv inside it pointed at this Python. }
+  if (RemovePythonCheck <> nil) and RemovePythonCheck.Checked then
+  begin
+    pyCmd := FindPythonUninstall();
+    if pyCmd <> '' then
+      Exec(ExpandConstant('{cmd}'), '/c ' + pyCmd, '',
+           SW_HIDE, ewWaitUntilTerminated, rc);
+  end;
   if keepData then
     MsgBox('Програму видалено. Збережені дані скопійовано на Робочий стіл '
            + 'у теку "{#MyAppName}".', mbInformation, MB_OK)
@@ -263,6 +308,22 @@ begin
   ModePage.Add('Видалити, зберігши дані на Робочому столі');
   ModePage.Add('Повністю видалити');
   ModePage.SelectedValueIndex := 0;
+
+  { Extra checkbox under the radios, for the two delete modes: optionally
+    also uninstall the bundled Python. Shrink the radio list to make room.
+    Shown only when our Python is actually registered (nothing to remove
+    otherwise). At update/reinstall the box is simply ignored. }
+  ModePage.CheckListBox.Height := ScaleY(96);
+  RemovePythonCheck := TNewCheckBox.Create(ModePage);
+  RemovePythonCheck.Parent := ModePage.Surface;
+  RemovePythonCheck.Left := ModePage.CheckListBox.Left;
+  RemovePythonCheck.Top := ModePage.CheckListBox.Top
+                           + ModePage.CheckListBox.Height + ScaleY(12);
+  RemovePythonCheck.Width := ModePage.SurfaceWidth;
+  RemovePythonCheck.Caption :=
+    'При видаленні: також видалити Python {#PyVersion}';
+  RemovePythonCheck.Checked := False;
+  RemovePythonCheck.Visible := (FindPythonUninstall() <> '');
 
   { Python info/update page. }
   PythonPage := CreateCustomPage(wpSelectDir,
@@ -344,34 +405,6 @@ begin
 end;
 
 { ---- Fallback path: unins000.exe launched from Add/Remove Programs -------- }
-
-function FindPythonUninstall(): String;
-var
-  rootKey: String;
-  names: TArrayOfString;
-  i: Integer;
-  disp, cmd: String;
-begin
-  Result := '';
-  rootKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall';
-  if not RegGetSubkeyNames(HKCU, rootKey, names) then
-    Exit;
-  for i := 0 to GetArrayLength(names) - 1 do
-  begin
-    if RegQueryStringValue(HKCU, rootKey + '\' + names[i], 'DisplayName', disp) then
-    begin
-      if Pos('Python 3.13', disp) > 0 then
-      begin
-        if RegQueryStringValue(HKCU, rootKey + '\' + names[i],
-                               'QuietUninstallString', cmd) then
-        begin
-          Result := cmd;
-          Exit;
-        end;
-      end;
-    end;
-  end;
-end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var

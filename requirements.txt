@@ -2,7 +2,3 @@ requests>=2.31
 ttkbootstrap>=1.10
 pillow>=10.0
 browser-cookie3>=0.19
-# rookiepy provides admin-mode Chrome v127+ App-Bound Encryption decryption
-# that browser_cookie3 doesn't support. Required when extracting cookies
-# from Chrome/Edge/Opera v130+ via the elevated helper.
-rookiepy>=0.5

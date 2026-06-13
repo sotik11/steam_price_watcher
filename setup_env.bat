@@ -82,5 +82,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem  Optional deps (rookiepy) - best effort, must NOT fail the whole setup.
+rem  rookiepy is a Rust extension with no prebuilt wheel on some Python
+rem  versions; building from source needs Rust + the MSVC linker (link.exe),
+rem  absent on a clean PC - that's the 3-minute hang-then-crash we hit.
+rem  --only-binary=:all: tells pip to use a wheel or skip, never compile.
+rem  The app imports rookiepy inside try/except, so missing it is harmless
+rem  (only Chrome/Edge/Opera App-Bound cookie extraction is unavailable).
+if exist "requirements-optional.txt" (
+    echo [setup_env] Installing optional deps ^(best effort^) ...>> "%LOG%"
+    ".venv\Scripts\python.exe" -m pip install -r requirements-optional.txt --only-binary=:all: --disable-pip-version-check >> "%LOG%" 2>&1
+    if errorlevel 1 (
+        echo [setup_env] Optional deps skipped ^(no prebuilt wheel^) - OK.>> "%LOG%"
+    )
+)
+
 echo [setup_env] Done.>> "%LOG%"
 exit /b 0
