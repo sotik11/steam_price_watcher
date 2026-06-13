@@ -849,15 +849,19 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
                 if m_bal:
                     balance = m_bal.group(1).replace("\xa0", " ").strip()
                 else:
-                    # 200 OK but no header_wallet_balance element — Steam
-                    # served the login page in place of /account/. This
-                    # is the canonical expired-cookies signature.
-                    log.warning("wallet balance not found on account page "
-                                "(store session likely expired)")
-                    expired_signals += 1
+                    # 200 OK but no balance element. This is NOT a reliable
+                    # expired signal: the element is also absent when the
+                    # wallet is empty, or when Steam tweaks the /account/
+                    # layout (e.g. the "Утримується/on hold" row throws the
+                    # old regex off). Session liveness is judged from the
+                    # community page below, not from this. Just leave
+                    # balance=None; the widget keeps its placeholder.
+                    log.warning("wallet balance not parsed from account page "
+                                "(empty wallet or layout change) - ignoring "
+                                "for session check")
             else:
                 log.warning("wallet balance HTTP %s", resp.status_code)
-                # 401/403/302→login on /account/ → also expired.
+                # A hard 401/403 on /account/ IS a logout signal.
                 if resp.status_code in (401, 403):
                     expired_signals += 1
         except requests.RequestException as e:
@@ -909,19 +913,22 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
             log.warning("market page fetch failed: %s", e)
             domain_attempts -= 1
 
-    # Final expired verdict: only flag True if we actually tried at
-    # least one domain AND every successful attempt produced an
-    # "expired" signature. Mixed results (one fresh, one expired) =
-    # session is alive — Steam sometimes drops one cookie sooner than
-    # the other and the alive one is enough for our purposes.
-    # Verdict policy: ANY domain returning an expired signature flags
-    # the session as expired — even if the other domain is still alive.
-    # Earlier logic let store-side liveness mask community-side death,
-    # which is exactly how the user ended up with a working balance
-    # widget but a broken "Import from Steam" (mylistings/orders both
-    # 400 on a dead community session).
+    # Final expired verdict.
+    #   * community-alive (we got currency/country from /market/'s
+    #     g_rgWalletInfo, which only renders for a logged-in user) means
+    #     the session WORKS — that's the one that matters for the app
+    #     (market polling + listings import all hit the community domain).
+    #     A missing wallet balance does NOT count against it; the balance
+    #     can legitimately be absent (empty wallet / layout change) — that
+    #     was the false-positive that fired the expired toast on a healthy
+    #     login.
+    #   * otherwise fall back to the expired_signals tally (hard 401/403,
+    #     or the market page failing to yield g_rgWalletInfo).
+    community_alive = (currency is not None) or (country is not None)
     if domain_attempts == 0:
         session_expired = None
+    elif community_alive:
+        session_expired = False
     else:
         session_expired = (expired_signals > 0)
 
