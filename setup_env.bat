@@ -21,21 +21,23 @@ set "LOG=%~dp0setup_env.log"
 echo ==== setup_env %DATE% %TIME% ==== > "%LOG%"
 
 rem --- locate a Python interpreter ------------------------------------------
-rem  Priority: explicit arg (from the installer) > py -3.13 launcher >
-rem  plain python on PATH > common fixed install locations. We need a SYSTEM
-rem  Python here to build the venv from - not the venv's own python.
+rem  We need a SYSTEM Python here to build the venv from (not the venv's own).
+rem  Priority order matters:
+rem    1. explicit arg from the installer;
+rem    2. py -3.13 launcher (works when Python was already on PATH);
+rem    3. the FIXED bundled/known install paths - these come BEFORE
+rem       `where python` on purpose: right after the installer drops the
+rem       bundled Python, the process PATH isn't refreshed yet, and
+rem       `where python` would instead hit the Microsoft Store stub at
+rem       %LOCALAPPDATA%\Microsoft\WindowsApps\python.exe, which can't make
+rem       a venv (that was the "venv creation failed" bug);
+rem    4. `where python` LAST, and only a real one (skip the WindowsApps stub).
 set "PYEXE=%~1"
 if not "%PYEXE%"=="" goto have_py
 
 py -3.13 --version >nul 2>&1
 if %errorlevel%==0 (
     set "PYEXE=py -3.13"
-    goto have_py
-)
-
-where python >nul 2>&1
-if %errorlevel%==0 (
-    set "PYEXE=python"
     goto have_py
 )
 
@@ -51,6 +53,12 @@ if exist "C:\Python313\python.exe" (
     set "PYEXE=C:\Python313\python.exe"
     goto have_py
 )
+
+rem Real python on PATH, excluding the Store stub in WindowsApps.
+for /f "delims=" %%P in ('where python 2^>nul ^| findstr /v /i "WindowsApps"') do (
+    if not defined PYEXE set "PYEXE=%%P"
+)
+if defined PYEXE goto have_py
 
 echo [ERROR] Python 3.13 not found. Install it from python.org or run the full
 echo         installer (it bundles Python).
