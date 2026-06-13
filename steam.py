@@ -693,6 +693,13 @@ _WALLET_CURRENCY_RE = re.compile(
 _WALLET_COUNTRY_RE = re.compile(
     r'"wallet_country"\s*:\s*"([A-Z]{2})"',
 )
+# Balance straight from g_rgWalletInfo — integer minor units ("98317" =
+# 983.17). Far more robust than scraping /account/, which breaks on
+# wallets with funds on hold ("Утримується" row). wallet_delayed_balance
+# is the on-hold amount, kept separate.
+_WALLET_BALANCE_INT_RE = re.compile(
+    r'"wallet_balance"\s*:\s*"(\d+)"',
+)
 # (Account-page fallback regexes removed — the modern /account/ template
 # no longer embeds g_rgWalletInfo / g_AccountData, so we rely on
 # /market/ exclusively for currency + country.)
@@ -856,9 +863,11 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
                     # old regex off). Session liveness is judged from the
                     # community page below, not from this. Just leave
                     # balance=None; the widget keeps its placeholder.
-                    log.warning("wallet balance not parsed from account page "
-                                "(empty wallet or layout change) - ignoring "
-                                "for session check")
+                    # Debug, not warning: the real balance comes from the
+                    # community g_rgWalletInfo block below, so /account/
+                    # missing it is expected noise, not a problem.
+                    log.debug("wallet balance not on account page; using "
+                              "community block instead")
             else:
                 log.warning("wallet balance HTTP %s", resp.status_code)
                 # A hard 401/403 on /account/ IS a logout signal.
@@ -901,6 +910,14 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
                     m_cnt = _WALLET_COUNTRY_RE.search(block)
                     if m_cnt:
                         country = m_cnt.group(1)
+                    # Balance from the same block — authoritative, and it
+                    # works when /account/ scraping doesn't (funds on hold).
+                    # Overrides whatever /account/ produced above.
+                    m_bal_int = _WALLET_BALANCE_INT_RE.search(block)
+                    if m_bal_int and currency is not None:
+                        amount = int(m_bal_int.group(1)) / 100.0
+                        sym = _CURRENCY_SYMBOLS.get(currency, "")
+                        balance = f"{amount:.2f} {sym}".strip()
                 else:
                     log.warning("wallet info block missing on market page "
                                 "(community session likely expired)")
