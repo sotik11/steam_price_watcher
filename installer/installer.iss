@@ -115,13 +115,31 @@ Type: files;          Name: "{app}\*.log"
 Type: files;          Name: "{app}\*.log.*"
 
 [Code]
-var
-  PythonInstalled: Boolean;   { True if a usable py -3.13 was found at startup }
-  UpdatePythonCheck: TNewCheckBox;
+{ Inno's per-user uninstall registry key for this AppId (PrivilegesRequired=
+  lowest -> HKCU). InstallLocation under it tells us where a previous copy
+  lives, which is how we detect "already installed" and switch the wizard
+  into maintenance mode. }
+const
+  UNINSTALL_KEY =
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
+    '{457A4FF1-5DC2-4834-93F1-24403A15100D}_is1';
 
-{ Returns True when no usable Python 3.13 is present. We probe the py launcher
-  pinned to 3.13 - matching what setup_env.bat looks for first, so the two
-  stay in sync. }
+{ Win32 ExitProcess - used to terminate cleanly right after an in-installer
+  uninstall (modes 2/3), so we don't fall through into the install flow. }
+procedure ExitProcessWin(uExitCode: Cardinal);
+  external 'ExitProcess@kernel32.dll stdcall';
+
+var
+  PythonInstalled: Boolean;        { usable py -3.13 found at startup? }
+  UpdatePythonCheck: TNewCheckBox;
+  PythonPage: TWizardPage;
+  ExistingInstall: Boolean;        { a previous install was detected }
+  ExistingDir: String;             { ...and it lives here }
+  ModePage: TInputOptionWizardPage;
+  InstallMode: Integer;            { 0 update, 1 clean reinstall, 2 del+keep, 3 del }
+
+{ Returns True when no usable Python 3.13 is present. Probes the py launcher
+  pinned to 3.13 - matching what setup_env.bat looks for first. }
 function PythonNeeded: Boolean;
 var
   rc: Integer;
@@ -133,31 +151,117 @@ begin
     Result := True;
 end;
 
-{ Decision used by [Files]/[Run]: install the bundled Python when none is
-  present, OR when the user opted to update an existing one. }
+{ Install bundled Python when none is present, OR when the user opted to
+  update an existing one. }
 function ShouldInstallPython: Boolean;
 begin
   Result := (not PythonInstalled)
             or ((UpdatePythonCheck <> nil) and UpdatePythonCheck.Checked);
 end;
 
-{ Custom wizard page: explain the Python dependency, and - only when Python
-  is already on the system - offer to reinstall it with the bundled version. }
+{ Copy one user-data file if it exists. }
+procedure CopyDataFile(srcDir, dstDir, name: String);
+begin
+  if FileExists(srcDir + '\' + name) then
+    CopyFile(srcDir + '\' + name, dstDir + '\' + name, False);
+end;
+
+{ Copy everything matching a mask (used for rotating logs). }
+procedure CopyDataMask(srcDir, dstDir, mask: String);
+var
+  fr: TFindRec;
+begin
+  if FindFirst(srcDir + '\' + mask, fr) then
+  begin
+    try
+      repeat
+        if (fr.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+          CopyFile(srcDir + '\' + fr.Name, dstDir + '\' + fr.Name, False);
+      until not FindNext(fr);
+    finally
+      FindClose(fr);
+    end;
+  end;
+end;
+
+{ Back up user data (config + state files + logs) to a folder on the Desktop,
+  preserving names. Data here is flat, so a single folder mirrors it. }
+procedure BackupDataToDesktop(srcDir: String);
+var
+  dst: String;
+begin
+  dst := ExpandConstant('{userdesktop}\{#MyAppName}');
+  ForceDirectories(dst);
+  CopyDataFile(srcDir, dst, 'config.json');
+  CopyDataFile(srcDir, dst, 'watchlist.json');
+  CopyDataFile(srcDir, dst, 'salelist.json');
+  CopyDataFile(srcDir, dst, 'gamelist.json');
+  CopyDataFile(srcDir, dst, 'gameblacklist.json');
+  CopyDataFile(srcDir, dst, 'purchases.json');
+  CopyDataFile(srcDir, dst, 'state.json');
+  CopyDataMask(srcDir, dst, '*.log');
+  CopyDataMask(srcDir, dst, '*.log.*');
+end;
+
+{ Remove the scheduled task created by the app's scheduler tab. }
+procedure DropScheduledTask;
+var
+  rc: Integer;
+begin
+  Exec(ExpandConstant('{cmd}'),
+       '/c schtasks /Delete /TN SteamCardWatch /F',
+       '', SW_HIDE, ewWaitUntilTerminated, rc);
+end;
+
+{ In-installer uninstall for modes 2 (keep data) and 3 (full). Does the whole
+  job itself - task, optional data backup, program tree, shortcut, registry -
+  then exits the process so we never enter the install flow. The Inno-generated
+  unins000.exe still exists as a fallback from Add/Remove Programs. }
+procedure DoUninstall(keepData: Boolean);
+begin
+  DropScheduledTask;
+  if keepData then
+    BackupDataToDesktop(ExistingDir);
+  DeleteFile(ExpandConstant('{userdesktop}\{#MyAppName}.lnk'));
+  DelTree(ExistingDir, True, True, True);
+  RegDeleteKeyIncludingSubkeys(HKCU, UNINSTALL_KEY);
+  if keepData then
+    MsgBox('Програму видалено. Збережені дані скопійовано на Робочий стіл '
+           + 'у теку "{#MyAppName}".', mbInformation, MB_OK)
+  else
+    MsgBox('Програму повністю видалено.', mbInformation, MB_OK);
+  ExitProcessWin(0);
+end;
+
 procedure InitializeWizard;
 var
-  page: TWizardPage;
   info: TNewStaticText;
 begin
   PythonInstalled := not PythonNeeded();
+  ExistingInstall := RegQueryStringValue(HKCU, UNINSTALL_KEY,
+                                         'InstallLocation', ExistingDir)
+                     and (ExistingDir <> '');
+  InstallMode := 0;
 
-  page := CreateCustomPage(wpSelectDir,
+  { Maintenance page - shown only on a repeat run (see ShouldSkipPage). }
+  ModePage := CreateInputOptionPage(wpWelcome,
+    'Програму вже встановлено', 'Оберіть дію',
+    'Знайдено наявну інсталяцію {#MyAppName}. Що зробити?',
+    True, False);
+  ModePage.Add('Оновити (зберегти дані та задачу планувальника)');
+  ModePage.Add('Перевстановити з нуля (видалити дані + задачу, потім встановити)');
+  ModePage.Add('Видалити, зберігши дані на Робочому столі');
+  ModePage.Add('Повністю видалити');
+  ModePage.SelectedValueIndex := 0;
+
+  { Python info/update page. }
+  PythonPage := CreateCustomPage(wpSelectDir,
     'Python', 'Середовище виконання програми');
-
-  info := TNewStaticText.Create(page);
-  info.Parent := page.Surface;
+  info := TNewStaticText.Create(PythonPage);
+  info.Parent := PythonPage.Surface;
   info.Left := 0;
   info.Top := 0;
-  info.Width := page.SurfaceWidth;
+  info.Width := PythonPage.SurfaceWidth;
   info.AutoSize := False;
   info.Height := ScaleY(72);
   info.WordWrap := True;
@@ -171,21 +275,66 @@ begin
       + 'Python {#PyVersion} буде встановлено автоматично під час інсталяції '
       + '(тихо, без додаткових вікон).';
 
-  UpdatePythonCheck := TNewCheckBox.Create(page);
-  UpdatePythonCheck.Parent := page.Surface;
+  UpdatePythonCheck := TNewCheckBox.Create(PythonPage);
+  UpdatePythonCheck.Parent := PythonPage.Surface;
   UpdatePythonCheck.Left := 0;
   UpdatePythonCheck.Top := info.Top + info.Height + ScaleY(8);
-  UpdatePythonCheck.Width := page.SurfaceWidth;
+  UpdatePythonCheck.Width := PythonPage.SurfaceWidth;
   UpdatePythonCheck.Caption :=
     'Оновити / перевстановити Python версією {#PyVersion} з інсталятора';
   UpdatePythonCheck.Checked := False;
-  { Pointless when Python is absent (it gets installed regardless), so the
-    checkbox only appears when there's an existing install to update. }
   UpdatePythonCheck.Visible := PythonInstalled;
 end;
 
-{ Find the per-user Python uninstall command in the registry, if our bundled
-  Python is still registered. Returns '' when not found. }
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  { Mode page: only on a repeat run. }
+  if (ModePage <> nil) and (PageID = ModePage.ID) then
+    Result := not ExistingInstall;
+  { Directory page: skip when updating/reinstalling - the folder is known.
+    (Uninstall modes exit before reaching it anyway.) }
+  if (PageID = wpSelectDir) and ExistingInstall then
+    Result := True;
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if (ModePage <> nil) and (CurPageID = ModePage.ID) then
+  begin
+    InstallMode := ModePage.SelectedValueIndex;
+    case InstallMode of
+      2: DoUninstall(True);    { does not return - ExitProcessWin }
+      3: DoUninstall(False);   { does not return }
+    end;
+    { modes 0 (update) and 1 (clean reinstall) fall through to install }
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  { Clean reinstall: wipe data + venv + task BEFORE files are copied, so the
+    install proceeds onto a blank slate. Code is overwritten by Inno; the
+    venv is rebuilt by setup_env.bat in [Run]. }
+  if (CurStep = ssInstall) and ExistingInstall and (InstallMode = 1) then
+  begin
+    DropScheduledTask;
+    DeleteFile(ExistingDir + '\config.json');
+    DeleteFile(ExistingDir + '\watchlist.json');
+    DeleteFile(ExistingDir + '\salelist.json');
+    DeleteFile(ExistingDir + '\gamelist.json');
+    DeleteFile(ExistingDir + '\gameblacklist.json');
+    DeleteFile(ExistingDir + '\purchases.json');
+    DeleteFile(ExistingDir + '\state.json');
+    DelTree(ExistingDir + '\.venv', True, True, True);
+    DelTree(ExistingDir + '\*.log', False, True, False);
+    DelTree(ExistingDir + '\*.log.*', False, True, False);
+  end;
+end;
+
+{ ---- Fallback path: unins000.exe launched from Add/Remove Programs -------- }
+
 function FindPythonUninstall(): String;
 var
   rootKey: String;
@@ -221,30 +370,22 @@ var
 begin
   if CurUninstallStep = usUninstall then
   begin
-    { 1) Drop the scheduled task if it's still there. }
-    Exec(ExpandConstant('{cmd}'),
-         '/c schtasks /Delete /TN SteamCardWatch /F',
-         '', SW_HIDE, ewWaitUntilTerminated, rc);
+    DropScheduledTask;
 
-    { 2) Offer to delete the user data sitting next to the program. }
-    if MsgBox('Delete saved data too (config, watch/sale/game lists, history)?'
-              + #13#10 + 'Choose No to keep it for a future reinstall.',
+    if MsgBox('Видалити також збережені дані (config, списки, історія)?'
+              + #13#10 + 'Оберіть «Ні», щоб зберегти їх для майбутнього '
+              + 'перевстановлення.',
               mbConfirmation, MB_YESNO) = IDYES then
-    begin
       DelTree(ExpandConstant('{app}'), True, True, True);
-    end;
 
-    { 3) Offer to remove the bundled Python (only if we can find it). }
     pyUninstall := FindPythonUninstall();
     if pyUninstall <> '' then
     begin
-      if MsgBox('Also remove Python ' + '{#PyVersion}' + '?'
-                + #13#10 + 'If other programs use it, keep it.',
+      if MsgBox('Видалити також Python {#PyVersion}?'
+                + #13#10 + 'Якщо ним користуються інші програми — залиште.',
                 mbConfirmation, MB_YESNO) = IDYES then
-      begin
         Exec(ExpandConstant('{cmd}'), '/c ' + pyUninstall, '',
              SW_HIDE, ewWaitUntilTerminated, rc);
-      end;
     end;
   end;
 end;
