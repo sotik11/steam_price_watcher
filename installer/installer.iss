@@ -23,7 +23,7 @@
 ; ============================================================================
 
 #define MyAppName "Steam Card Price Watch"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "0.1.0.0"
 #define MyAppPublisher "sotik"
 #define PyVersion "3.13.7"
 #define PyInstaller "python-" + PyVersion + "-amd64.exe"
@@ -69,6 +69,8 @@ Source: "..\steam_login.py";          DestDir: "{app}"; Flags: ignoreversion
 Source: "..\telegram.py";             DestDir: "{app}"; Flags: ignoreversion
 Source: "..\watch.py";                DestDir: "{app}"; Flags: ignoreversion
 Source: "..\themes.py";               DestDir: "{app}"; Flags: ignoreversion
+Source: "..\version.py";              DestDir: "{app}"; Flags: ignoreversion
+Source: "..\CHANGELOG.*.txt";         DestDir: "{app}"; Flags: ignoreversion
 ; --- launchers + env bootstrap --------------------------------------------
 Source: "..\gui.bat";                 DestDir: "{app}"; Flags: ignoreversion
 Source: "..\gui_debug.bat";           DestDir: "{app}"; Flags: ignoreversion

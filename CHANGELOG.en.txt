@@ -1,0 +1,5 @@
+Steam Card Price Watch — Changelog
+===================================
+
+v0.1.0.0
+- First tracked release.

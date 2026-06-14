@@ -23,6 +23,7 @@ from ttkbootstrap.constants import *
 import i18n
 import themes as custom_themes
 from i18n import t
+from version import __version__, APP_NAME, APP_AUTHOR, APP_CONTACT
 
 BASE = Path(__file__).parent
 CONFIG_PATH = BASE / "config.json"
@@ -230,6 +231,15 @@ class App(tb.Window):
     }
 
     def __init__(self):
+        # Give Windows an explicit AppUserModelID BEFORE the window exists,
+        # so the taskbar shows our icon instead of the generic pythonw.exe
+        # one and groups the window under our own app identity.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "sotik.SteamCardPriceWatch")
+        except Exception:
+            pass
         # One-off bookkeeping before the window comes up:
         #   * create salelist.json if it doesn't exist (so load_json never
         #     returns None for it),
@@ -268,6 +278,20 @@ class App(tb.Window):
         # chosen theme below once Style exists and our custom themes are
         # loaded.
         super().__init__(title=t("app.title"), themename="superhero", size=(1100, 620))
+        # Show the version next to the app name in the (custom) title bar.
+        self.title(f"{t('app.title')}   v{__version__}")
+        # App icon in the title bar + taskbar. We use assets/app.ico, which
+        # contains only small BMP frames (16–64px) — Tk's iconbitmap reads
+        # those reliably, unlike the PNG-compressed 256px frame in icon.ico
+        # (that showed a blank icon) and unlike iconphoto (which the
+        # DWM-tinted title bar ignored). First call sets THIS window (and
+        # the taskbar); the default= call makes spawned dialogs inherit it.
+        _ico = str(BASE / "assets" / "app.ico")
+        try:
+            self.iconbitmap(_ico)              # this window + taskbar
+            self.iconbitmap(default=_ico)      # spawned Toplevel dialogs
+        except Exception as _exc:
+            log.debug("could not set window icon: %s", _exc)
         # Now that `self` is a real Tk root, we can hook
         # report_callback_exception. Logger levels can be done here too.
         self._apply_log_config(*self._pending_log_toggles)
@@ -1341,6 +1365,7 @@ class App(tb.Window):
         self.tab_scheduler = ttk.Frame(self.notebook)
         self.tab_log       = ttk.Frame(self.notebook)
         self.tab_settings  = _scrollable_tab()
+        self.tab_about     = ttk.Frame(self.notebook)
 
         for tab, key in [
             (self.tab_purchase,  "tab.purchase"),
@@ -1350,6 +1375,7 @@ class App(tb.Window):
             (self.tab_scheduler, "tab.scheduler"),
             (self.tab_log,       "tab.log"),
             (self.tab_settings,  "tab.settings"),
+            (self.tab_about,     "tab.about"),
         ]:
             # If `tab` is a ScrolledFrame, give the notebook its holder
             # frame (notebook only accepts plain ttk.Frame children).
@@ -1382,6 +1408,7 @@ class App(tb.Window):
         self._build_scheduler_tab()
         self._build_history_tab()
         self._build_log_tab()
+        self._build_about_tab()
 
         # Cap the minimum window size so the user can't crush it into
         # something that hides the last tab behind the user widget, or
@@ -7289,6 +7316,21 @@ class App(tb.Window):
         ttk.Label(tg_block, text=t("lbl.telegram_section")
                   ).pack(side=LEFT)
 
+        # ---- Backup / Restore — placeholder buttons for the upcoming
+        # export/import feature. Wired to a "coming soon" notice for now;
+        # the real backup-zip / restore logic lands in a later feature.
+        backup_row = ttk.Frame(outer)
+        backup_row.pack(pady=(30, 0))
+        ttk.Label(backup_row, text=t("lbl.backup_section")).pack(pady=(0, 6))
+        backup_btns = ttk.Frame(backup_row)
+        backup_btns.pack()
+        ttk.Button(backup_btns, text=t("btn.backup_export"),
+                   command=self._backup_export, bootstyle="secondary"
+                   ).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(backup_btns, text=t("btn.backup_import"),
+                   command=self._backup_import, bootstyle="secondary"
+                   ).pack(side=LEFT)
+
         # ---- Save / Reset — centred, well below the bottom services -
         # Big `pady` makes the destructive Reset button a deliberate
         # reach — you have to actively scroll your eye down past
@@ -7965,6 +8007,14 @@ class App(tb.Window):
         self._refresh_balance_placeholder(currency_val)
         self._refresh_wallet_balance()
         self._set_status(t("status.settings_saved"))
+
+    def _backup_export(self):
+        """Placeholder for the upcoming export/backup feature."""
+        messagebox.showinfo(t("dlg.backup.title"), t("dlg.backup.coming_soon"))
+
+    def _backup_import(self):
+        """Placeholder for the upcoming import/restore feature."""
+        messagebox.showinfo(t("dlg.backup.title"), t("dlg.backup.coming_soon"))
 
     def _reset_settings_to_defaults(self):
         """Wipe all settings back to config.example.json defaults.
@@ -9260,6 +9310,101 @@ class App(tb.Window):
 
         self.log_text.see(END)
         self.log_text.configure(state=DISABLED)
+
+    # ------------------------------------------------------------------
+    # About tab
+    # ------------------------------------------------------------------
+    def _open_changelog(self):
+        """Open the changelog txt for the current UI language.
+
+        Ukrainian locale → CHANGELOG.uk.txt; everything else → the English
+        CHANGELOG.en.txt (also the fallback if a localized file is missing).
+        """
+        fname = ("CHANGELOG.uk.txt" if i18n.get_language() == "uk"
+                 else "CHANGELOG.en.txt")
+        path = BASE / fname
+        if not path.exists():
+            path = BASE / "CHANGELOG.en.txt"
+        try:
+            os.startfile(str(path))  # Windows: open in the default editor
+        except Exception:
+            try:
+                webbrowser.open(path.as_uri())
+            except Exception as exc:
+                log.warning("could not open changelog: %s", exc)
+
+    def _build_about_tab(self):
+        """Last tab: logo, app name + version, description, author, links."""
+        outer = ttk.Frame(self.tab_about, padding=30)
+        outer.pack(fill=BOTH, expand=YES)
+        # A centered column.
+        col = ttk.Frame(outer)
+        col.place(relx=0.5, rely=0.0, anchor="n")
+
+        # Logo — reuse the bundled app icon, scaled up.
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(BASE / "assets" / "Steam Card Watcher.png").convert("RGBA")
+            img.thumbnail((96, 96), Image.LANCZOS)
+            self._about_logo = ImageTk.PhotoImage(img)
+            ttk.Label(col, image=self._about_logo).pack(pady=(0, 10))
+        except Exception as exc:
+            log.debug("about logo not loaded: %s", exc)
+
+        name_lbl = ttk.Label(col, text=APP_NAME, anchor=CENTER)
+        self._scaled_font(name_lbl, 16, "bold")
+        name_lbl.pack()
+
+        ver_lbl = ttk.Label(col, text=f"v{__version__}", anchor=CENTER,
+                            foreground="#888888")
+        self._scaled_font(ver_lbl, 10)
+        ver_lbl.pack(pady=(2, 6))
+
+        # Changelog link — opens the txt for the current UI language.
+        changelog = ttk.Label(col, text=t("about.changelog"),
+                              foreground="#4ea1ff", cursor="hand2",
+                              anchor=CENTER)
+        changelog.pack(pady=(0, 14))
+        changelog.bind("<Button-1>", lambda e: self._open_changelog())
+
+        ttk.Label(col, text=t("about.description"), anchor=CENTER,
+                  justify=CENTER, wraplength=460).pack(pady=(0, 16))
+
+        # Author + contact (contact opens the mail client).
+        meta = ttk.Frame(col)
+        meta.pack(pady=(0, 6))
+        ttk.Label(meta, text=t("about.author_label") + " ").grid(
+            row=0, column=0, sticky=E, pady=1)
+        ttk.Label(meta, text=APP_AUTHOR).grid(row=0, column=1, sticky=W, pady=1)
+        ttk.Label(meta, text=t("about.contact_label") + " ").grid(
+            row=1, column=0, sticky=E, pady=1)
+        contact = ttk.Label(meta, text=APP_CONTACT, foreground="#4ea1ff",
+                            cursor="hand2")
+        contact.grid(row=1, column=1, sticky=W, pady=1)
+        contact.bind("<Button-1>",
+                     lambda e: webbrowser.open(f"mailto:{APP_CONTACT}"))
+
+        # Links.
+        links = ttk.Frame(col)
+        links.pack(pady=(14, 0))
+        ttk.Label(links, text=t("about.links_label"), anchor=CENTER,
+                  foreground="#888888").pack(pady=(0, 4))
+        for label, url in (
+            ("Steam Community Market", "https://steamcommunity.com/market/"),
+            ("Augmented Steam", "https://augmented-steam.com/"),
+        ):
+            lk = ttk.Label(links, text=label, foreground="#4ea1ff",
+                           cursor="hand2")
+            lk.pack()
+            lk.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
+
+        # Tech credits — plain text, smaller.
+        tech = ttk.Label(
+            col, anchor=CENTER, justify=CENTER, foreground="#666666",
+            text=t("about.tech"),
+        )
+        self._scaled_font(tech, 8)
+        tech.pack(pady=(18, 0))
 
     def _clear_log(self):
         if not self._confirm(t("dlg.clear_log.title"), t("dlg.clear_log.body")):
