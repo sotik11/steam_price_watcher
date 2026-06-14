@@ -139,6 +139,68 @@ STEAM_COUNTRIES: list[tuple[str, str, int]] = [
 ]
 
 
+# ISO2 country code → representative IANA timezone, for stamping local
+# time on History records (sales/purchases) instead of UTC. One zone per
+# country — the capital / dominant zone for the few multi-zone countries
+# (US, RU, CA, AU, …); good enough since we only need the user's own
+# wall-clock time. DST is handled automatically by zoneinfo.
+COUNTRY_TIMEZONES: dict[str, str] = {
+    "AE": "Asia/Dubai",        "AR": "America/Argentina/Buenos_Aires",
+    "AT": "Europe/Vienna",     "AU": "Australia/Sydney",
+    "BE": "Europe/Brussels",   "BG": "Europe/Sofia",
+    "BR": "America/Sao_Paulo", "BY": "Europe/Minsk",
+    "CA": "America/Toronto",   "CH": "Europe/Zurich",
+    "CL": "America/Santiago",  "CN": "Asia/Shanghai",
+    "CO": "America/Bogota",    "CR": "America/Costa_Rica",
+    "CY": "Asia/Nicosia",      "CZ": "Europe/Prague",
+    "DE": "Europe/Berlin",     "DK": "Europe/Copenhagen",
+    "EE": "Europe/Tallinn",    "ES": "Europe/Madrid",
+    "FI": "Europe/Helsinki",   "FR": "Europe/Paris",
+    "GB": "Europe/London",     "GR": "Europe/Athens",
+    "HK": "Asia/Hong_Kong",    "HR": "Europe/Zagreb",
+    "HU": "Europe/Budapest",   "ID": "Asia/Jakarta",
+    "IE": "Europe/Dublin",     "IL": "Asia/Jerusalem",
+    "IN": "Asia/Kolkata",      "IS": "Atlantic/Reykjavik",
+    "IT": "Europe/Rome",       "JP": "Asia/Tokyo",
+    "KR": "Asia/Seoul",        "KW": "Asia/Kuwait",
+    "KZ": "Asia/Almaty",       "LT": "Europe/Vilnius",
+    "LU": "Europe/Luxembourg", "LV": "Europe/Riga",
+    "MT": "Europe/Malta",      "MX": "America/Mexico_City",
+    "MY": "Asia/Kuala_Lumpur", "NL": "Europe/Amsterdam",
+    "NO": "Europe/Oslo",       "NZ": "Pacific/Auckland",
+    "PE": "America/Lima",      "PH": "Asia/Manila",
+    "PL": "Europe/Warsaw",     "PT": "Europe/Lisbon",
+    "QA": "Asia/Qatar",        "RO": "Europe/Bucharest",
+    "RU": "Europe/Moscow",     "SA": "Asia/Riyadh",
+    "SE": "Europe/Stockholm",  "SG": "Asia/Singapore",
+    "SI": "Europe/Ljubljana",  "SK": "Europe/Bratislava",
+    "TH": "Asia/Bangkok",      "TR": "Europe/Istanbul",
+    "TW": "Asia/Taipei",       "UA": "Europe/Kyiv",
+    "US": "America/New_York",  "UY": "America/Montevideo",
+    "VN": "Asia/Ho_Chi_Minh",  "ZA": "Africa/Johannesburg",
+}
+
+
+def country_timezone(iso: str, fallback: str = "UTC") -> str:
+    """IANA timezone name for an ISO2 country code (fallback UTC)."""
+    return COUNTRY_TIMEZONES.get((iso or "").upper(), fallback)
+
+
+def local_now(iso: str):
+    """Timezone-aware `now()` in the profile country's local time.
+
+    DST is applied automatically. Falls back to UTC when the country is
+    unknown or the tz database is unavailable (zoneinfo needs the `tzdata`
+    package on Windows — it's in requirements.txt).
+    """
+    from datetime import datetime, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(country_timezone(iso)))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
 def currency_label(code: int) -> str:
     """Format a currency code for the Combobox: 'UAH (18)' / 'USD (1)'.
 

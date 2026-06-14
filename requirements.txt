@@ -2,3 +2,4 @@ requests>=2.31
 ttkbootstrap>=1.10
 pillow>=10.0
 browser-cookie3>=0.19
+tzdata>=2024.1

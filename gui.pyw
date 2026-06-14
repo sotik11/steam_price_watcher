@@ -2909,6 +2909,18 @@ class App(tb.Window):
         code = self.config_data.get("market", {}).get("currency", 18)
         return currency_symbol(code, fallback="")
 
+    def _local_now_iso(self) -> str:
+        """Now() as a naive ISO string in the profile country's local time.
+
+        History records (sales/purchases) used UTC, which showed up ~3 h
+        behind for a UA user. We stamp them in the wall-clock time of the
+        profile's Country (market.country) with DST, via regions.local_now.
+        Stored tz-naive (like before) so existing readers don't change.
+        """
+        from regions import local_now
+        country = (self.config_data.get("market") or {}).get("country", "UA")
+        return local_now(country).replace(tzinfo=None).isoformat()
+
     # ------------------------------------------------------------------
     # Native Windows title-bar tinting via DWM
     # ------------------------------------------------------------------
@@ -3382,8 +3394,17 @@ class App(tb.Window):
             if status == f"status.value.{raw_status}":  # i18n miss
                 status = raw_status
             last = item.get("last_seen", "—")
+            # Display "Поточна" with a dot decimal separator — Steam serves
+            # it with a comma for many locales ("20,00₴"); normalise to a dot
+            # so it matches the target/spread columns. (Parsing below still
+            # uses the raw `last`, which _try_parse_money handles either way.)
+            last_disp = str(last).replace(",", ".")
             target = item.get("target_price", "")
-            target_str = f"{target:.2f}" if isinstance(target, (int, float)) else str(target)
+            # Append the currency symbol to the target value (like the
+            # neighbouring "Поточна"/last column) now that the heading no
+            # longer carries it.
+            target_str = (f"{target:.2f}{self._currency_symbol()}"
+                          if isinstance(target, (int, float)) else str(target))
 
             # Spread = last_seen − target. "+" means above target (waiting),
             # "−" means below or equal (alert-worthy).
@@ -3392,7 +3413,7 @@ class App(tb.Window):
             target_num = target if isinstance(target, (int, float)) else None
             if last_num is not None and target_num is not None:
                 diff = last_num - target_num
-                spread_str = f"{diff:+.2f}"
+                spread_str = f"{diff:+.2f}{self._currency_symbol()}"
 
             # display_name and game_name are normally written by the metadata
             # fetcher (on add or in the background refresh). For rows that
@@ -3451,7 +3472,7 @@ class App(tb.Window):
                 values=(
                     row_index + 1,
                     display_name, item_type, game_name,
-                    target_str, last, spread_str, status,
+                    target_str, last_disp, spread_str, status,
                     t("col.link.open"),
                     imported_glyph,
                     "🚫" if item.get("no_check") else "",
@@ -4005,7 +4026,7 @@ class App(tb.Window):
         if not sel:
             return
         sym = self._currency_symbol()
-        ts = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        ts = self._local_now_iso()
         items = load_json(GAMELIST_PATH, []) or []
         by_id = {g.get("id"): g for g in items}
         state = load_json(STATE_PATH, {}) or {}
@@ -5706,7 +5727,7 @@ class App(tb.Window):
         path = self._kind_path(kind)
         sym = self._currency_symbol()
         closed_status = "bought" if kind == "buy" else "sold"
-        ts = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        ts = self._local_now_iso()
 
         # Group by card identity. Preserve insertion order so the dialog
         # sequence matches what the user expects from top-to-bottom.
