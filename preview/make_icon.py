@@ -1,4 +1,4 @@
-"""Generates icon.ico for the Steam Card Price Watch shortcut.
+"""Generates icon.ico for the Steam Price Watcher shortcut.
 
 Style: a stylised Steam trading card on a dark blue background, with a small
 green notification dot in the corner (the bell-equivalent — this app sends

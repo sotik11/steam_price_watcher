@@ -8,7 +8,7 @@ rem    1. checks for Python 3.13; if missing, downloads the official installer
 rem       from python.org and installs it silently (per-user, no admin);
 rem    2. creates the .venv and installs dependencies (delegates to
 rem       setup_env.bat - single source of truth for that step);
-rem    3. drops a "Steam Card Price Watch" shortcut on the current user's
+rem    3. drops a "Steam Price Watcher" shortcut on the current user's
 rem       Desktop pointing at the GUI.
 rem
 rem  Safe to re-run: every step is idempotent.
@@ -20,7 +20,7 @@ set "PYVER=3.13.7"
 set "PYURL=https://www.python.org/ftp/python/%PYVER%/python-%PYVER%-amd64.exe"
 
 echo ============================================================
-echo   Steam Card Price Watch - setup
+echo   Steam Price Watcher - setup
 echo ============================================================
 echo.
 
@@ -65,7 +65,7 @@ set "TARGET=%~dp0.venv\Scripts\pythonw.exe"
 set "GUISCRIPT=%~dp0gui.pyw"
 set "ICON=%~dp0icon.ico"
 powershell -NoProfile -Command ^
-  "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\Steam Card Price Watch.lnk');" ^
+  "$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\Steam Price Watcher.lnk');" ^
   "$s.TargetPath='%TARGET%';" ^
   "$s.Arguments='\"%GUISCRIPT%\"';" ^
   "$s.WorkingDirectory='%~dp0';" ^

@@ -4,7 +4,7 @@ import sys
 import time
 from pathlib import Path
 
-TASK_NAME = "SteamCardWatch"
+TASK_NAME = "SteamPriceWatcher"
 BASE = Path(__file__).parent
 PYTHON = sys.executable
 SCRIPT = BASE / "watch.py"

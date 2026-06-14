@@ -10,7 +10,7 @@ Bump exactly one part per release and reset the lower parts to 0.
 The About tab and (when synced) the installer read this value.
 """
 
-APP_NAME = "Steam Card Price Watch"
+APP_NAME = "Steam Price Watcher"
 __version__ = "0.1.0.0"
 
 # Author / contact shown on the About tab.

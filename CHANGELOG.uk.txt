@@ -1,4 +1,4 @@
-Steam Card Price Watch — Список змін
+Steam Price Watcher — Список змін
 ====================================
 
 v0.1.0.0

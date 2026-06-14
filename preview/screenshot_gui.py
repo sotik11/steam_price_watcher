@@ -1,4 +1,4 @@
-"""Grab a screenshot of the running Steam Card Price Watch window."""
+"""Grab a screenshot of the running Steam Price Watcher window."""
 import ctypes
 import time
 from pathlib import Path
@@ -8,9 +8,9 @@ from PIL import ImageGrab
 user32 = ctypes.windll.user32
 
 # FindWindowW(lpClassName, lpWindowName)
-hwnd = user32.FindWindowW(None, "Steam Card Price Watch")
+hwnd = user32.FindWindowW(None, "Steam Price Watcher")
 if not hwnd:
-    raise SystemExit("Steam Card Price Watch window not found")
+    raise SystemExit("Steam Price Watcher window not found")
 
 # SW_RESTORE then bring to top
 user32.ShowWindow(hwnd, 9)

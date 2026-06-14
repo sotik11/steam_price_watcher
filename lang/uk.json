@@ -4,7 +4,7 @@
     "name": "Українська"
   },
 
-  "app.title": "Steam Card Price Watch",
+  "app.title": "Steam Price Watcher",
 
   "tab.purchase":  "  Покупка  ",
   "tab.sales":     "  Продаж  ",
@@ -259,7 +259,7 @@
   "status.value.rate_limited": "rate-limited",
 
   "scheduler.not_created":   "Задача не створена",
-  "scheduler.status_line":   "Задача SteamCardWatch: {state}\nНаступний запуск: {next}",
+  "scheduler.status_line":   "Задача SteamPriceWatcher: {state}\nНаступний запуск: {next}",
   "scheduler.state_active":  "✅ активна",
   "scheduler.state_paused":  "⏸ вимкнена",
 
@@ -336,13 +336,13 @@
 
   "dlg.scheduler.title":           "Планувальник",
   "dlg.scheduler.confirm_delete.title": "Видалити задачу",
-  "dlg.scheduler.confirm_delete.body":  "Видалити SteamCardWatch із планувальника?",
+  "dlg.scheduler.confirm_delete.body":  "Видалити SteamPriceWatcher із планувальника?",
   "dlg.scheduler.success_generic": "Операцію виконано успішно.",
-  "dlg.scheduler.created":         "Задачу «SteamCardWatch» створено / оновлено.",
-  "dlg.scheduler.enabled":         "Задачу «SteamCardWatch» увімкнено.",
-  "dlg.scheduler.disabled":        "Задачу «SteamCardWatch» вимкнено.",
-  "dlg.scheduler.running":         "Запуск задачі «SteamCardWatch» розпочато.",
-  "dlg.scheduler.deleted":         "Задачу «SteamCardWatch» видалено.",
+  "dlg.scheduler.created":         "Задачу «SteamPriceWatcher» створено / оновлено.",
+  "dlg.scheduler.enabled":         "Задачу «SteamPriceWatcher» увімкнено.",
+  "dlg.scheduler.disabled":        "Задачу «SteamPriceWatcher» вимкнено.",
+  "dlg.scheduler.running":         "Запуск задачі «SteamPriceWatcher» розпочато.",
+  "dlg.scheduler.deleted":         "Задачу «SteamPriceWatcher» видалено.",
   "dlg.scheduler.error":           "Не вдалося виконати дію.\n\nДеталі: {err}",
   "dlg.scheduler.error_generic":   "Не вдалося виконати дію.",
 
@@ -392,7 +392,7 @@
   "log.batch_time":           "пакет з {count} карток зайняв {elapsed:.2f}с",
 
   "tg.btn.open_market":     "🌐 Відкрити на маркеті",
-  "tg.test_message":        "✅ Steam Card Price Watch — тест зв'язку",
+  "tg.test_message":        "✅ Steam Price Watcher — тест зв'язку",
   "tg.message.default":     "<b>{operation} • <u>{display_name}</u></b>\nПоточна ціна — <b>{price}</b>",
   "tg.operation.buy":       "покупка",
   "tg.operation.sell":      "продаж",

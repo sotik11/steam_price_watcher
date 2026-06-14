@@ -29,9 +29,9 @@ TABLE_X_LEFT, TABLE_X_RIGHT = 15, 1085
 
 user32 = ctypes.windll.user32
 
-hwnd = user32.FindWindowW(None, "Steam Card Price Watch")
+hwnd = user32.FindWindowW(None, "Steam Price Watcher")
 if not hwnd:
-    raise SystemExit("Steam Card Price Watch window not found")
+    raise SystemExit("Steam Price Watcher window not found")
 user32.ShowWindow(hwnd, 9)
 user32.SetForegroundWindow(hwnd)
 time.sleep(0.4)

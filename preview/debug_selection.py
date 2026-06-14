@@ -6,7 +6,7 @@ import time
 from PIL import ImageGrab
 
 user32 = ctypes.windll.user32
-hwnd = user32.FindWindowW(None, "Steam Card Price Watch")
+hwnd = user32.FindWindowW(None, "Steam Price Watcher")
 if not hwnd:
     raise SystemExit("GUI not running")
 user32.ShowWindow(hwnd, 9)

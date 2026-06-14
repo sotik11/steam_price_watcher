@@ -1,5 +1,5 @@
 ; ============================================================================
-;  Steam Card Price Watch - Inno Setup installer
+;  Steam Price Watcher - Inno Setup installer
 ;
 ;  Build with:  installer\build_installer.bat   (it downloads the bundled
 ;  Python installer into installer\python\ and invokes ISCC.exe on this file).
@@ -22,7 +22,7 @@
 ;      to remove the bundled Python.
 ; ============================================================================
 
-#define MyAppName "Steam Card Price Watch"
+#define MyAppName "Steam Price Watcher"
 #define MyAppVersion "0.1.0.0"
 #define MyAppPublisher "sotik"
 #define PyVersion "3.13.7"
@@ -35,12 +35,12 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 ; Per-user install: no admin, no UAC prompt.
 PrivilegesRequired=lowest
-DefaultDirName={localappdata}\Programs\SteamCardWatch
+DefaultDirName={localappdata}\Programs\SteamPriceWatcher
 DisableProgramGroupPage=yes
 ; Let the user pick the folder, but default to a writable per-user location.
 DisableDirPage=no
 OutputDir=dist
-OutputBaseFilename=SteamCardWatch-Setup-{#MyAppVersion}
+OutputBaseFilename=SteamPriceWatcher-Setup-{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -296,7 +296,7 @@ var
   rc: Integer;
 begin
   Exec(ExpandConstant('{cmd}'),
-       '/c schtasks /Delete /TN SteamCardWatch /F',
+       '/c schtasks /Delete /TN SteamPriceWatcher /F',
        '', SW_HIDE, ewWaitUntilTerminated, rc);
 end;
 

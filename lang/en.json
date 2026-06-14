@@ -4,7 +4,7 @@
     "name": "English"
   },
 
-  "app.title": "Steam Card Price Watch",
+  "app.title": "Steam Price Watcher",
 
   "tab.purchase":  "  Purchase  ",
   "tab.sales":     "  Sales  ",
@@ -259,7 +259,7 @@
   "status.value.rate_limited": "rate-limited",
 
   "scheduler.not_created":   "Task not created",
-  "scheduler.status_line":   "Task SteamCardWatch: {state}\nNext run: {next}",
+  "scheduler.status_line":   "Task SteamPriceWatcher: {state}\nNext run: {next}",
   "scheduler.state_active":  "✅ active",
   "scheduler.state_paused":  "⏸ disabled",
 
@@ -336,13 +336,13 @@
 
   "dlg.scheduler.title":           "Scheduler",
   "dlg.scheduler.confirm_delete.title": "Delete task",
-  "dlg.scheduler.confirm_delete.body":  "Remove SteamCardWatch from the scheduler?",
+  "dlg.scheduler.confirm_delete.body":  "Remove SteamPriceWatcher from the scheduler?",
   "dlg.scheduler.success_generic": "Action completed successfully.",
-  "dlg.scheduler.created":         "Task «SteamCardWatch» created / updated.",
-  "dlg.scheduler.enabled":         "Task «SteamCardWatch» enabled.",
-  "dlg.scheduler.disabled":        "Task «SteamCardWatch» disabled.",
-  "dlg.scheduler.running":         "Task «SteamCardWatch» run started.",
-  "dlg.scheduler.deleted":         "Task «SteamCardWatch» deleted.",
+  "dlg.scheduler.created":         "Task «SteamPriceWatcher» created / updated.",
+  "dlg.scheduler.enabled":         "Task «SteamPriceWatcher» enabled.",
+  "dlg.scheduler.disabled":        "Task «SteamPriceWatcher» disabled.",
+  "dlg.scheduler.running":         "Task «SteamPriceWatcher» run started.",
+  "dlg.scheduler.deleted":         "Task «SteamPriceWatcher» deleted.",
   "dlg.scheduler.error":           "Action failed.\n\nDetails: {err}",
   "dlg.scheduler.error_generic":   "Action failed.",
 
@@ -392,7 +392,7 @@
   "log.batch_time":           "batch of {count} card(s) took {elapsed:.2f}s",
 
   "tg.btn.open_market":     "🌐 Open on the market",
-  "tg.test_message":        "✅ Steam Card Price Watch — connection test",
+  "tg.test_message":        "✅ Steam Price Watcher — connection test",
   "tg.message.default":     "<b>{operation} • <u>{display_name}</u></b>\nCurrent price — <b>{price}</b>",
   "tg.operation.buy":       "buy",
   "tg.operation.sell":      "sell",

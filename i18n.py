@@ -5,7 +5,7 @@ describes the language for the picker:
 
     {
       "_meta": {"code": "uk", "name": "Українська"},
-      "app.title": "Steam Card Price Watch",
+      "app.title": "Steam Price Watcher",
       "log.checking": "Перевіряю {count} картку(и)",
       ...
     }

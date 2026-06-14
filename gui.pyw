@@ -1,4 +1,4 @@
-"""Steam Card Price Watch — GUI (ttkbootstrap, no console window)."""
+"""Steam Price Watcher — GUI (ttkbootstrap, no console window)."""
 import csv
 import json
 import logging
@@ -237,7 +237,7 @@ class App(tb.Window):
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "sotik.SteamCardPriceWatch")
+                "sotik.SteamPriceWatcher")
         except Exception:
             pass
         # One-off bookkeeping before the window comes up:

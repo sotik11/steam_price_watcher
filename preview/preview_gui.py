@@ -21,7 +21,7 @@ if USE_BOOTSTRAP:
 else:
     root = tk.Tk()
 
-root.title("Steam Card Price Watch")
+root.title("Steam Price Watcher")
 root.geometry("860x540")
 root.attributes("-topmost", True)
 root.lift()
