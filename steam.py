@@ -700,6 +700,14 @@ _WALLET_COUNTRY_RE = re.compile(
 _WALLET_BALANCE_INT_RE = re.compile(
     r'"wallet_balance"\s*:\s*"(\d+)"',
 )
+# Funds on hold — Steam's "Утримується/on hold" amount (recent market
+# sales not yet cleared into the spendable balance). Same minor-units
+# encoding as wallet_balance ("6908" = 69.08). Lives right next to it in
+# g_rgWalletInfo. Shown as a separate gray line under the balance, only
+# when > 0.
+_WALLET_DELAYED_RE = re.compile(
+    r'"wallet_delayed_balance"\s*:\s*"(\d+)"',
+)
 # (Account-page fallback regexes removed — the modern /account/ template
 # no longer embeds g_rgWalletInfo / g_AccountData, so we rely on
 # /market/ exclusively for currency + country.)
@@ -790,6 +798,7 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
 
         {
             "balance":  "5,46₴" | None,
+            "on_hold":  "69.08 ₴" | None,  # funds on hold, only when > 0
             "currency": 18 | None,        # Steam internal int code
             "country":  "UA" | None,      # ISO-2
             "session_expired": True | False | None,
@@ -827,6 +836,7 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
         return None
 
     balance: str | None = None
+    on_hold: str | None = None
     currency: int | None = None
     country: str | None = None
     # Tri-state: True/False once we get any response, None until then.
@@ -918,6 +928,15 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
                         amount = int(m_bal_int.group(1)) / 100.0
                         sym = _CURRENCY_SYMBOLS.get(currency, "")
                         balance = f"{amount:.2f} {sym}".strip()
+                    # Funds on hold, from the same block. Only surface it
+                    # when it's actually non-zero — an idle wallet reports
+                    # "0" and there's nothing to show then.
+                    m_hold = _WALLET_DELAYED_RE.search(block)
+                    if m_hold and currency is not None:
+                        hold_amt = int(m_hold.group(1)) / 100.0
+                        if hold_amt > 0:
+                            sym = _CURRENCY_SYMBOLS.get(currency, "")
+                            on_hold = f"{hold_amt:.2f} {sym}".strip()
                 else:
                     log.warning("wallet info block missing on market page "
                                 "(community session likely expired)")
@@ -949,10 +968,12 @@ def fetch_wallet_info(cookies: dict | None) -> dict | None:
     else:
         session_expired = (expired_signals > 0)
 
-    log.debug("wallet info: balance=%r currency=%r country=%r expired=%r",
-              balance, currency, country, session_expired)
+    log.debug("wallet info: balance=%r on_hold=%r currency=%r country=%r "
+              "expired=%r", balance, on_hold, currency, country,
+              session_expired)
     return {
         "balance": balance,
+        "on_hold": on_hold,
         "currency": currency,
         "country": country,
         "session_expired": session_expired,

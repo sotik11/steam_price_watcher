@@ -205,6 +205,7 @@
   "dlg.steam_login.status_not_found": "Профіль не знайдено.",
   "dlg.steam_login.status_network":   "Помилка мережі: {err}",
   "dlg.steam_login.status_disconnected": "Від'єднано від Steam.",
+  "widget.on_hold":                     "Утримується: {amount}",
   "toast.session_expired":              "Сесія Steam прострочена — увійдіть знову",
 
   "dlg.steam_browser.title":              "Імпорт cookies з браузера",

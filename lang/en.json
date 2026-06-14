@@ -205,6 +205,7 @@
   "dlg.steam_login.status_not_found": "Profile not found.",
   "dlg.steam_login.status_network":   "Network error: {err}",
   "dlg.steam_login.status_disconnected": "Disconnected from Steam.",
+  "widget.on_hold":                     "On hold: {amount}",
   "toast.session_expired":              "Steam session expired — please log in again",
 
   "dlg.steam_browser.title":              "Import cookies from browser",

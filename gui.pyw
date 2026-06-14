@@ -522,7 +522,7 @@ class App(tb.Window):
         if hasattr(self, "notebook"):
             try:
                 self.notebook.pack_configure(
-                    pady=(max(0, int(round(25 * mult))), 0)
+                    pady=(max(0, int(round(self._TOP_STRIP * mult))), 0)
                 )
             except tk.TclError:
                 pass
@@ -1032,10 +1032,11 @@ class App(tb.Window):
         )
 
         self.notebook = ttk.Notebook(self)
-        # pady=(25, 0) leaves a 25-px gap between the title bar and the
+        # pady=(_TOP_STRIP, 0) leaves a gap between the title bar and the
         # tab row. The Steam user widget floats into that gap via place(),
         # so it visually lives there without claiming a pack row of its own.
-        self.notebook.pack(fill=BOTH, expand=YES, padx=8, pady=(25, 0))
+        self.notebook.pack(fill=BOTH, expand=YES, padx=8,
+                           pady=(self._TOP_STRIP, 0))
 
         # Steam user widget — placed into the empty strip above the
         # notebook's tab row. Floats over `self`, anchored to top-right.
@@ -1236,9 +1237,19 @@ class App(tb.Window):
     # ------------------------------------------------------------------
 
     # Avatar canvas dimensions. Steam's site header uses ~32 px round
-    # avatars; we bump to 40 so the icon is comfortably readable inside
-    # the 25-px floating strip above the tab row.
-    _AVATAR_SIZE = 40
+    # avatars; we use a fixed 56 px so the icon is comfortably readable
+    # inside the floating strip above the tab row.
+    _AVATAR_SIZE = 56
+    # Height of the empty strip between the title bar and the notebook's
+    # tab row, where the floating Steam user cluster lives. Scaled with the
+    # font size in _apply_font_scale. Used by _build_ui (notebook pady),
+    # _apply_font_scale (scaled pady) and _apply_min_size (chrome height).
+    _TOP_STRIP = 40
+    # Sentinel for _update_user_widget kwargs: None means "set/clear this
+    # field", _UNSET means "leave it untouched". Needed for on_hold, where
+    # None legitimately means "hide the line" — a plain None default would
+    # blank it out on every username-only or avatar-only update.
+    _UNSET = object()
 
     def _build_user_widget(self) -> None:
         """Floating Steam user cluster in the strip above the tabs.
@@ -1259,18 +1270,23 @@ class App(tb.Window):
         # its width when computing the window's minsize.
         cluster = ttk.Frame(self)
         self.user_cluster = cluster
-        cluster.place(relx=1.0, x=-14, y=5, anchor="ne")
+        cluster.place(relx=1.0, x=-14, y=3, anchor="ne")
 
-        # Two-line text column (username on top, balance below). Right-aligned
+        # Three-line text column (username / balance / on-hold). Right-aligned
         # so longer nicknames push leftward, leaving the avatar pinned.
+        # anchor="n" pins the column to the TOP of the cluster so the
+        # username lines up with the top of the avatar instead of the
+        # whole stack centring (which pushed the on-hold line below the
+        # tab row). pady=0 everywhere kills the inter-line air so all
+        # three rows fit inside the avatar's height.
         text_col = ttk.Frame(cluster)
-        text_col.pack(side=LEFT, padx=(0, 8))
+        text_col.pack(side=LEFT, padx=(0, 8), anchor="n")
 
         self.lbl_username = ttk.Label(text_col, text="Username", anchor=E)
         # Registered for font scaling — non-default size so we can't rely
         # on the named-font path picking it up automatically.
         self._scaled_font(self.lbl_username, 10, "bold")
-        self.lbl_username.pack(side=TOP, anchor=E)
+        self.lbl_username.pack(side=TOP, anchor=E, pady=0)
         # Click → open the user's Steam Community profile. URL uses the
         # numeric steamID (works whether the account has a vanity URL or
         # not — Steam redirects /profiles/{id} → /id/{vanity} when one
@@ -1289,7 +1305,10 @@ class App(tb.Window):
             text_col, text=f"0.00 {sym}", anchor=E,
             foreground=muted_fg,
         )
-        self.lbl_balance.pack(side=TOP, anchor=E)
+        # Slightly smaller than the nickname; registered so it tracks the
+        # Settings font-scale like the other explicit-font labels.
+        self._scaled_font(self.lbl_balance, 9)
+        self.lbl_balance.pack(side=TOP, anchor=E, pady=0)
         # Click → Steam's store-transactions history page. This is where
         # the wallet balance actually breaks down (purchases, top-ups,
         # market sales credited as wallet funds).
@@ -1299,6 +1318,16 @@ class App(tb.Window):
                 "https://store.steampowered.com/account/store_transactions/"
             ),
         )
+
+        # Funds-on-hold line — smaller + muted, sits under the balance.
+        # Built but NOT packed: it only appears when the live wallet
+        # reports a non-zero on-hold amount (recent market sales not yet
+        # cleared). _update_user_widget packs/forgets it on demand.
+        self.lbl_on_hold = ttk.Label(
+            text_col, text="", anchor=E, foreground=muted_fg,
+        )
+        # Smallest of the three; registered for font-scale tracking.
+        self._scaled_font(self.lbl_on_hold, 7)
 
         # Round avatar canvas. By default carries the Steam logo from
         # assets/steam_icon.png (circular-masked); when login lands, the
@@ -1536,11 +1565,11 @@ class App(tb.Window):
         # Place top-right, just below the avatar cluster. relx=1.0 +
         # anchor="ne" + x=-14 mirrors the cluster's own placement, so
         # the toast's right edge lines up with the avatar's. y is the
-        # cluster's bottom + a small gap (cluster is place'd at y=5).
+        # cluster's bottom + a small gap (cluster is place'd at y=3).
         self.update_idletasks()
         cluster = getattr(self, "user_cluster", None)
         cluster_h = cluster.winfo_height() if cluster else 40
-        frame.place(relx=1.0, x=-14, y=5 + cluster_h + 4, anchor="ne")
+        frame.place(relx=1.0, x=-14, y=3 + cluster_h + 4, anchor="ne")
         frame.lift()
         # Auto-dismiss after 12 seconds. Stored as an after-id so a
         # manual dismiss can cancel it.
@@ -1653,7 +1682,7 @@ class App(tb.Window):
         # bar + top gap. Rough but reliable numbers that match what we
         # actually pack/place above and below the treeview.
         chrome_h = (
-            25   # title-bar gap (notebook.pack pady top)
+            self._TOP_STRIP   # title-bar gap (notebook.pack pady top)
             + 28 # notebook tab strip
             + 28 # treeview header row
             + 36 # row1 of buttons
@@ -1729,12 +1758,18 @@ class App(tb.Window):
 
     def _update_user_widget(self, *, username: str | None = None,
                             balance: str | None = None,
+                            on_hold=_UNSET,
                             avatar_image: tk.PhotoImage | None = None) -> None:
         """Public API for the Steam-login feature to plug real data in.
 
         Pass any subset — the others keep their current value. `avatar_image`
         should already be cropped to a circle and sized to _AVATAR_SIZE;
         passing None redraws the placeholder.
+
+        `on_hold` is tri-state via the _UNSET sentinel: a formatted string
+        ("69.08 ₴") shows the funds-on-hold line, None hides it, and the
+        default _UNSET leaves it as-is (so username/avatar-only updates
+        don't blank it).
         """
         if username is not None:
             self.lbl_username.configure(text=username)
@@ -1745,6 +1780,16 @@ class App(tb.Window):
             # at startup uses a regular space. _humanise_balance gives
             # us a single canonical look.
             self.lbl_balance.configure(text=self._humanise_balance(balance))
+        if on_hold is not self._UNSET:
+            if on_hold:
+                self.lbl_on_hold.configure(
+                    text=t("widget.on_hold",
+                           amount=self._humanise_balance(on_hold)))
+                # Pack just under the balance; idempotent — Tk ignores a
+                # repeat pack of an already-managed widget in the same spot.
+                self.lbl_on_hold.pack(side=TOP, anchor=E, pady=0)
+            else:
+                self.lbl_on_hold.pack_forget()
         if avatar_image is not None:
             # Keep a reference — Tk's image GC will collect it otherwise.
             self._user_avatar_ref = avatar_image
@@ -1864,6 +1909,7 @@ class App(tb.Window):
         pattern keeps us future-proof).
         """
         balance = info.get("balance")
+        on_hold = info.get("on_hold")
         currency = info.get("currency")
         country = info.get("country")
         expired = info.get("session_expired")
@@ -1879,6 +1925,9 @@ class App(tb.Window):
 
         if balance:
             self._update_user_widget(balance=balance)
+        # Always reconcile the on-hold line with the live wallet: a string
+        # shows/updates it, None hides it (the hold cleared since last poll).
+        self._update_user_widget(on_hold=on_hold)
 
         # Persist currency/country to config.market when they differ
         # from what's there now. Skip when fields are None — `fetch_wallet_info`
@@ -2280,7 +2329,8 @@ class App(tb.Window):
         sym = self._CURRENCY_SYMBOLS.get(
             (self.config_data.get("market") or {}).get("currency", 18), "₴",
         )
-        self._update_user_widget(username="Username", balance=f"0.00 {sym}")
+        self._update_user_widget(username="Username", balance=f"0.00 {sym}",
+                                 on_hold=None)
         self._draw_placeholder_avatar()
         self._user_avatar_ref = None
         # Disconnect explicitly resolves any lingering "session expired"
