@@ -512,18 +512,32 @@ class App(tb.Window):
                                  rowheight=max(1, int(round(self._original_row_height * mult))))
         except tk.TclError:
             pass
-        # The Steam user widget floats over the strip between title bar
-        # and the notebook's tab row (notebook.pack pady top). At higher
-        # font scales the widget grows taller and starts overlapping the
-        # tabs unless we also grow that strip — scale the top pady together
-        # with everything else. Guard with hasattr because _apply_font_scale
-        # is also called once from __init__ BEFORE _build_ui creates the
-        # notebook (so the very first paint already has the right size).
+        # Steam user cluster: fixed per-scale strip + avatar from the lookup
+        # tables. Strip is an absolute pixel value (NOT *mult). Avatar canvas
+        # is resized and repainted. Both guarded for the __init__ call that
+        # runs before _build_ui creates the notebook/canvas.
+        self._TOP_STRIP = self._TOP_STRIP_BY_SCALE.get(scale, 40)
+        self._AVATAR_SIZE = self._AVATAR_BY_SCALE.get(scale, 56)
         if hasattr(self, "notebook"):
             try:
-                self.notebook.pack_configure(
-                    pady=(max(0, int(round(self._TOP_STRIP * mult))), 0)
-                )
+                self.notebook.pack_configure(pady=(self._TOP_STRIP, 0))
+            except tk.TclError:
+                pass
+        canvas = getattr(self, "avatar_canvas", None)
+        if canvas is not None:
+            try:
+                canvas.configure(width=self._AVATAR_SIZE,
+                                 height=self._AVATAR_SIZE)
+                url = ((self.config_data.get("steam") or {})
+                       .get("avatar_url") or "").strip()
+                if url:
+                    # _fetch_avatar_async reads self._AVATAR_SIZE at call
+                    # time, so it re-crops to the new diameter.
+                    self._fetch_avatar_async(url)
+                else:
+                    self._draw_placeholder_avatar()
+                if getattr(self, "_session_warning_active", False):
+                    self._draw_session_badge()
             except tk.TclError:
                 pass
         # Force a full redraw — Entry / Spinbox widgets keep stale
@@ -1236,14 +1250,19 @@ class App(tb.Window):
     # Steam user widget (top-right)
     # ------------------------------------------------------------------
 
-    # Avatar canvas dimensions. Steam's site header uses ~32 px round
-    # avatars; we use a fixed 56 px so the icon is comfortably readable
-    # inside the floating strip above the tab row.
+    # Per-font-scale FIXED dimensions for the floating Steam user cluster.
+    # No formulas, no live measuring — just hand-tuned absolute pixels for
+    # each scale bucket (1..5), looked up in _apply_font_scale.
+    #   _AVATAR_BY_SCALE  — avatar diameter (px)
+    #   _TOP_STRIP_BY_SCALE — height of the strip above the tab row (px)
+    # x1/x4/x5 are provisional placeholders in the same ascending series;
+    # tune by eye like x2/x3.
+    _AVATAR_BY_SCALE    = {1: 48, 2: 64, 3: 72, 4: 80, 5: 96}
+    _TOP_STRIP_BY_SCALE = {1: 35, 2: 40, 3: 55, 4: 60, 5: 73}
+    # Live values (set by _apply_font_scale from the tables above). The
+    # class-level defaults are the pre-build fallback before the first
+    # _apply_font_scale call. self._AVATAR_SIZE is read in many places.
     _AVATAR_SIZE = 56
-    # Height of the empty strip between the title bar and the notebook's
-    # tab row, where the floating Steam user cluster lives. Scaled with the
-    # font size in _apply_font_scale. Used by _build_ui (notebook pady),
-    # _apply_font_scale (scaled pady) and _apply_min_size (chrome height).
     _TOP_STRIP = 40
     # Sentinel for _update_user_widget kwargs: None means "set/clear this
     # field", _UNSET means "leave it untouched". Needed for on_hold, where
@@ -1280,7 +1299,13 @@ class App(tb.Window):
         # tab row). pady=0 everywhere kills the inter-line air so all
         # three rows fit inside the avatar's height.
         text_col = ttk.Frame(cluster)
-        text_col.pack(side=LEFT, padx=(0, 8), anchor="n")
+        # Vertical alignment switches with the on-hold line: when it's
+        # hidden (2 lines) the stack centres against the avatar; when it's
+        # shown (3 lines) it pins to the top so it doesn't spill below.
+        # _update_user_widget flips this via pack_configure(anchor=...).
+        # Start centred — the widget paints with 2 lines (no on-hold yet).
+        self._user_text_col = text_col
+        text_col.pack(side=LEFT, padx=(0, 8), anchor="center")
 
         self.lbl_username = ttk.Label(text_col, text="Username", anchor=E)
         # Registered for font scaling — non-default size so we can't rely
@@ -1788,8 +1813,12 @@ class App(tb.Window):
                 # Pack just under the balance; idempotent — Tk ignores a
                 # repeat pack of an already-managed widget in the same spot.
                 self.lbl_on_hold.pack(side=TOP, anchor=E, pady=0)
+                # 3 lines — pin the stack to the top so it doesn't spill.
+                self._user_text_col.pack_configure(anchor="n")
             else:
                 self.lbl_on_hold.pack_forget()
+                # 2 lines — centre the stack against the avatar's height.
+                self._user_text_col.pack_configure(anchor="center")
         if avatar_image is not None:
             # Keep a reference — Tk's image GC will collect it otherwise.
             self._user_avatar_ref = avatar_image
