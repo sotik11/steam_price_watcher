@@ -469,10 +469,18 @@ def fetch_game_name(game_appid: str | int) -> str:
             name = entry["data"].get("name") or "—"
             _GAME_NAME_CACHE[key] = name
             return name
+        # Reached Steam, but no usable entry (success=false — e.g. a
+        # region-locked or delisted app). That's a stable answer, so cache
+        # the "—" to avoid hammering for something that won't resolve.
+        _GAME_NAME_CACHE[key] = "—"
+        return "—"
     except Exception as exc:
-        log.warning("fetch_game_name(%s) failed: %s", key, exc)
-    _GAME_NAME_CACHE[key] = "—"
-    return "—"
+        # Network error or HTTP 403 — Steam's appdetails throttles bursts
+        # with a 403 (not 429). This is transient, so log it quietly and
+        # DON'T cache the failure: a later call (after the throttle lifts)
+        # can still resolve the real name.
+        log.debug("fetch_game_name(%s) failed: %s", key, exc)
+        return "—"
 
 
 def fetch_card_image_url(appid: str | int, market_hash_name: str) -> str | None:
