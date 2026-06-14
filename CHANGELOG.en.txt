@@ -1,5 +1,32 @@
 Steam Price Watcher — Changelog
-===================================
+===============================
 
-v0.1.0.0
-- First tracked release.
+v0.1.0.0 (2026-06-14) — First tracked release
+- App renamed to "Steam Price Watcher".
+- "About" tab: version, author, changelog, links.
+- Custom window / taskbar icon; version module.
+
+v0.0.6.0 (2026-06-14)
+- Column widths persist across restarts + double-click a border to auto-fit.
+- Table keyboard shortcuts: Delete, Enter, Space, Esc.
+- Funds-on-hold line in the widget; History timestamps in local timezone.
+
+v0.0.5.0 (2026-06-13)
+- Installer (Inno Setup) + setup.bat: bundled Python, update /
+  reinstall / uninstall modes, user-data import.
+
+v0.0.4.0 (2026-06-11)
+- "Games" tab: wishlist price tracking with all-time-low alerts.
+- Steam session-expired detection.
+
+v0.0.3.0 (2026-06-08)
+- Steam login (manual ID + browser cookies) and wallet balance in the widget.
+- "History" tab with CSV export; import active listings & buy orders from Steam.
+
+v0.0.2.0 (2026-06-06)
+- Floating user widget; font scaling x1–x5; themes; window geometry
+  persistence; bilingual UI (uk/en).
+
+v0.0.1.0 (2026-06-05)
+- Core Steam Market card price monitoring; Telegram alerts (buy/sell);
+  semi-automatic buying; check scheduler.
