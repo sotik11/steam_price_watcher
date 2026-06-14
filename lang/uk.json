@@ -304,6 +304,8 @@
   "dlg.warn.cant_get_price":    "Не вдалося отримати ціну: {error}\nДодати все одно?",
   "dlg.already.title":          "Уже у списку",
   "dlg.already.body":           "«{name}» уже у списку.",
+  "dlg.confirm.yes":            "Так",
+  "dlg.confirm.no":             "Ні",
   "dlg.delete.title":           "Видалити",
   "dlg.delete.body":            "Видалити «{name}»?",
   "dlg.delete.body_multi":      "Видалити {count} карток?",

@@ -304,6 +304,8 @@
   "dlg.warn.cant_get_price":    "Failed to get price: {error}\nAdd anyway?",
   "dlg.already.title":          "Already on the list",
   "dlg.already.body":           "«{name}» is already on the watchlist.",
+  "dlg.confirm.yes":            "Yes",
+  "dlg.confirm.no":             "No",
   "dlg.delete.title":           "Remove",
   "dlg.delete.body":            "Remove «{name}»?",
   "dlg.delete.body_multi":      "Remove {count} cards?",

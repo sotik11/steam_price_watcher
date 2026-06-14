@@ -807,11 +807,105 @@ class App(tb.Window):
         """
         tree._sort_col: str | None = None
         tree._sort_desc: bool = False
-        for col in column_keys:
-            if col in self._UNSORTABLE_COLS:
-                continue
-            tree.heading(col,
-                         command=lambda c=col, tr=tree: self._sort_tree(tr, c))
+        # We DON'T use tree.heading(col, command=…): Tk fires that callback
+        # for a click anywhere on the heading, including the few px right at
+        # the column border — so double-clicking a separator to auto-fit
+        # also triggered a sort. Instead we record the region at PRESS time
+        # (a press on a separator is detected reliably — that's where Tk
+        # shows the resize cursor) and sort on release only when the press
+        # started in the "heading" region. (Auto-fit lives on
+        # <Double-Button-1> + separator.)
+        tree.bind("<Button-1>", self._record_press_region, add="+")
+        tree.bind("<ButtonRelease-1>", self._on_heading_sort_click, add="+")
+
+    def _record_press_region(self, event) -> None:
+        tree = event.widget
+        try:
+            tree._press_region = tree.identify_region(event.x, event.y)
+        except tk.TclError:
+            tree._press_region = ""
+
+    def _clear_tree_selection(self, event) -> None:
+        """Esc on a table → drop the current selection."""
+        tree = event.widget
+        try:
+            tree.selection_remove(*tree.get_children(""))
+        except tk.TclError:
+            pass
+
+    def _confirm(self, title: str, message: str, parent=None) -> bool:
+        """Modal Yes/No confirmation that accepts Enter as "Yes" and Esc
+        as "No".
+
+        Drop-in for messagebox.askyesno, whose native Yes/No box ignores
+        Esc (no Cancel button). Enter / KP_Enter / the focused default =
+        Yes; Esc, the × button, and the No button all return False.
+        `parent` overrides the owner window (e.g. a nested dialog).
+        """
+        owner = parent or self
+        dlg = tk.Toplevel(owner)
+        dlg.title(title)
+        dlg.transient(owner)
+        dlg.resizable(False, False)
+        result = {"v": False}
+
+        def _yes():
+            result["v"] = True
+            dlg.destroy()
+
+        def _no():
+            result["v"] = False
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", _no)
+        dlg.bind("<Escape>", lambda e: _no())
+        dlg.bind("<Return>", lambda e: _yes())
+        dlg.bind("<KP_Enter>", lambda e: _yes())
+
+        row = ttk.Frame(dlg, padding=(20, 18, 20, 8))
+        row.pack(fill=BOTH, expand=YES)
+        ttk.Label(row, text="❓", font=("", 22)).pack(
+            side=LEFT, padx=(0, 14), anchor=N)
+        ttk.Label(row, text=message, wraplength=380, justify=LEFT).pack(
+            side=LEFT, fill=X, expand=YES)
+
+        btns = ttk.Frame(dlg, padding=(0, 0, 16, 14))
+        btns.pack(anchor=E)
+        yes_btn = ttk.Button(btns, text=t("dlg.confirm.yes"),
+                             command=_yes, bootstyle="primary")
+        yes_btn.pack(side=LEFT, padx=6)
+        ttk.Button(btns, text=t("dlg.confirm.no"),
+                   command=_no).pack(side=LEFT)
+
+        dlg.update_idletasks()
+        x = owner.winfo_rootx() + (owner.winfo_width() - dlg.winfo_width()) // 2
+        y = owner.winfo_rooty() + (owner.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        yes_btn.focus_set()
+        dlg.grab_set()
+        dlg.wait_window()
+        return result["v"]
+
+    def _on_heading_sort_click(self, event) -> None:
+        """Sort on a header click — but only when the PRESS started in the
+        heading region, never on a separator (reserved for resize /
+        double-click auto-fit). No timing games: a separator press simply
+        never sorts, regardless of how fast the double-click is."""
+        tree = event.widget
+        if getattr(tree, "_press_region", None) != "heading":
+            return
+        col_id = tree.identify_column(event.x)
+        try:
+            idx = int(col_id.replace("#", "")) - 1
+        except (ValueError, AttributeError):
+            return
+        cols = tree["columns"]
+        if not (0 <= idx < len(cols)):
+            return
+        col = cols[idx]
+        if col in self._UNSORTABLE_COLS:
+            return
+        self._sort_tree(tree, col)
 
     def _sort_tree(self, tree: ttk.Treeview, col: str) -> None:
         """Re-order rows by a column. Toggles ascending/descending on
@@ -962,6 +1056,118 @@ class App(tb.Window):
         # `_sort_tree` itself re-saves to config; that's a no-op write
         # of the same value, so fine.
         self._sort_tree(tree, col)
+
+    # ------------------------------------------------------------------
+    # Column-width persistence + Excel-style double-click auto-fit
+    # ------------------------------------------------------------------
+    def _setup_column_widths(self, tree: ttk.Treeview) -> None:
+        """Restore saved widths and wire up resize-persist + auto-fit.
+
+        Call AFTER the tree is registered in list_trees / hist_tree /
+        games_tree (so _tree_sort_key can resolve its config key) and
+        after its columns + default widths are set.
+
+        * <ButtonRelease-1> → persist widths (covers dragging a header
+          separator). Cheap no-op when nothing changed.
+        * <Double-Button-1> on a separator → auto-fit the column to its
+          widest cell, like double-clicking a column border in Excel.
+        """
+        self._restore_column_widths(tree)
+        tree.bind("<ButtonRelease-1>",
+                  lambda e: self._persist_column_widths(e.widget), add="+")
+        tree.bind("<Double-Button-1>",
+                  self._on_column_separator_dblclick, add="+")
+
+    def _persist_column_widths(self, tree: ttk.Treeview) -> None:
+        """Save current per-column pixel widths to ui.column_widths.<key>.
+
+        Writes only when a width actually changed, so ordinary clicks
+        (which also fire <ButtonRelease-1>) don't churn config.json.
+        """
+        key = self._tree_sort_key(tree)
+        if key is None:
+            return
+        widths: dict[str, int] = {}
+        for col in tree["columns"]:
+            try:
+                widths[col] = int(tree.column(col, "width"))
+            except (tk.TclError, ValueError):
+                pass
+        if not widths:
+            return
+        cur = (self.config_data.get("ui", {})
+                               .get("column_widths", {}) or {}).get(key)
+        if cur == widths:
+            return  # unchanged — skip the disk write
+        self.config_data.setdefault("ui", {}).setdefault(
+            "column_widths", {})[key] = widths
+        try:
+            on_disk = load_json(CONFIG_PATH) or {}
+        except Exception:
+            on_disk = {}
+        on_disk.setdefault("ui", {}).setdefault(
+            "column_widths", {})[key] = widths
+        try:
+            save_json(CONFIG_PATH, on_disk)
+        except Exception as e:
+            log.warning("could not persist column widths: %s", e)
+
+    def _restore_column_widths(self, tree: ttk.Treeview) -> None:
+        """Apply saved per-column widths after the columns are created.
+
+        Safe no-op when nothing is saved or a saved column no longer
+        exists (schema change).
+        """
+        key = self._tree_sort_key(tree)
+        if key is None:
+            return
+        saved = (self.config_data.get("ui", {})
+                                 .get("column_widths", {}) or {}).get(key)
+        if not saved:
+            return
+        for col, width in saved.items():
+            if col in tree["columns"]:
+                try:
+                    tree.column(col, width=int(width))
+                except (tk.TclError, ValueError):
+                    pass
+
+    def _on_column_separator_dblclick(self, event) -> None:
+        """Excel-style auto-fit: double-click a column border to size the
+        column on its left to its widest cell (or heading)."""
+        tree = event.widget
+        if tree.identify_region(event.x, event.y) != "separator":
+            return
+        # Nudge a few px left of the separator so identify_column lands on
+        # the column whose RIGHT border was double-clicked (the one Excel
+        # would resize), not the one to the right.
+        col_id = tree.identify_column(max(0, event.x - 3))
+        cols = tree["columns"]
+        try:
+            idx = int(col_id.replace("#", "")) - 1
+        except (ValueError, AttributeError):
+            return
+        if not (0 <= idx < len(cols)):
+            return
+        self._autofit_column(tree, cols[idx])
+
+    def _autofit_column(self, tree: ttk.Treeview, col: str) -> None:
+        """Resize `col` to fit the widest of its heading + cell values."""
+        import tkinter.font as tkfont
+        try:
+            font = tkfont.nametofont("TkDefaultFont")
+        except tk.TclError:
+            return
+        widest = font.measure(str(tree.heading(col, "text") or ""))
+        for iid in tree.get_children(""):
+            w = font.measure(str(tree.set(iid, col)))
+            if w > widest:
+                widest = w
+        # Padding: cell internal margins + room for the sort indicator that
+        # sits in the heading. Clamp to a sane minimum so an empty column
+        # doesn't collapse to nothing.
+        tree.column(col, width=max(40, widest + 24))
+        self._persist_column_widths(tree)
 
     @staticmethod
     def _renumber_tree(tree: ttk.Treeview) -> None:
@@ -2171,6 +2377,7 @@ class App(tb.Window):
             self._steam_login_dlg = None
             dlg.destroy()
         dlg.protocol("WM_DELETE_WINDOW", _on_dialog_close)
+        dlg.bind("<Escape>", lambda e: _on_dialog_close())
 
         # Initial state — show "connected as" line if a profile was already
         # saved earlier, else leave the status blank.
@@ -2465,6 +2672,7 @@ class App(tb.Window):
             self._steam_browser_specs = []
             self._position_browser_dialog(dlg)
             dlg.protocol("WM_DELETE_WINDOW", self._close_browser_dialog)
+            dlg.bind("<Escape>", lambda e: self._close_browser_dialog())
             return
 
         self._steam_browser_specs = installed
@@ -2524,6 +2732,7 @@ class App(tb.Window):
         self._refresh_browser_dialog_labels()
 
         dlg.protocol("WM_DELETE_WINDOW", self._close_browser_dialog)
+        dlg.bind("<Escape>", lambda e: self._close_browser_dialog())
         self._position_browser_dialog(dlg)
 
     def _position_browser_dialog(self, dlg: tk.Toplevel) -> None:
@@ -3050,6 +3259,7 @@ class App(tb.Window):
         # Default close (×) is a "cancel".
         result: dict = {"value": None}
         dlg.protocol("WM_DELETE_WINDOW", lambda: dlg.destroy())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
 
         ttk.Label(
             dlg, text=t("dlg.choose_op.body", name=name), wraplength=360,
@@ -3142,7 +3352,16 @@ class App(tb.Window):
         self._setup_sortable_columns(tree, list(cols))
         # Click + motion handlers dispatch by event.widget — same code path
         # for both kinds.
-        tree.bind("<Button-1>", self._on_card_tree_click)
+        tree.bind("<Button-1>", self._on_card_tree_click, add="+")
+        # Keyboard shortcuts mirroring the toolbar buttons — same handlers,
+        # so the "selected (one/many/all) + confirmation" logic rides along.
+        # Delete → Видалити, Enter → Придбав/Продав (mark completed).
+        tree.bind("<Delete>", lambda e: self._remove_card(), add="+")
+        tree.bind("<Return>", lambda e: self._mark_completed(), add="+")
+        tree.bind("<KP_Enter>", lambda e: self._mark_completed(), add="+")
+        # Space → Змінити ціль; Esc → clear selection.
+        tree.bind("<space>", lambda e: self._edit_target(), add="+")
+        tree.bind("<Escape>", self._clear_tree_selection, add="+")
         tree.bind("<Motion>",   self._on_card_tree_motion)
         tree.bind("<<TreeviewSelect>>", self._on_card_tree_select)
         # Ctrl+A → select all rows. event.keycode is layout-independent
@@ -3173,6 +3392,9 @@ class App(tb.Window):
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
         self.list_trees[kind] = tree
+        # Now that the tree is registered (so its config key resolves),
+        # restore saved column widths + enable resize-persist / auto-fit.
+        self._setup_column_widths(tree)
 
         row1 = ttk.Frame(btn_frame)
         row1.pack(fill=X, pady=(0, 4))
@@ -3649,9 +3871,15 @@ class App(tb.Window):
         self._apply_row_tags(tree)
         self._setup_sortable_columns(tree, list(cols))
         self.games_tree = tree
+        self._setup_column_widths(tree)
 
         tree.bind("<<TreeviewSelect>>", self._on_games_select)
-        tree.bind("<Button-1>", self._on_games_click)
+        tree.bind("<Button-1>", self._on_games_click, add="+")
+        # Same keyboard shortcuts as the card tables.
+        tree.bind("<Delete>", lambda e: self._games_delete(), add="+")
+        tree.bind("<Return>", lambda e: self._games_mark_bought(), add="+")
+        tree.bind("<KP_Enter>", lambda e: self._games_mark_bought(), add="+")
+        tree.bind("<Escape>", self._clear_tree_selection, add="+")
         tree.bind("<Motion>", self._on_games_motion)
         tree.bind("<Control-KeyPress>", self._on_tree_ctrl_a)
         tree.bind("<Button-3>", self._show_games_context_menu)
@@ -3972,10 +4200,9 @@ class App(tb.Window):
         names = ", ".join((g.get("name") or "?")[:40] for g in sel[:5])
         if len(sel) > 5:
             names += " …"
-        if not messagebox.askyesno(
+        if not self._confirm(
                 t("dlg.games_remove.title"),
-                t("dlg.games_remove.body", count=len(sel), names=names),
-                parent=self):
+                t("dlg.games_remove.body", count=len(sel), names=names)):
             return
         sel_ids = {g["id"] for g in sel}
         items = load_json(GAMELIST_PATH, []) or []
@@ -4213,6 +4440,7 @@ class App(tb.Window):
         dlg.transient(self)
         dlg.grab_set()
         dlg.geometry("640x480")
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
 
         outer = ttk.Frame(dlg, padding=10)
         outer.pack(fill=BOTH, expand=YES)
@@ -5112,10 +5340,9 @@ class App(tb.Window):
                 parent=self,
             )
         except Exception as exc:
-            if not messagebox.askyesno(
+            if not self._confirm(
                 t("dlg.warn.title"),
                 t("dlg.warn.cant_get_price", error=str(exc)),
-                parent=self,
             ):
                 self._set_status(t("status.cancelled"))
                 return
@@ -5395,6 +5622,7 @@ class App(tb.Window):
         y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_reqheight()) // 3
         dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
         dlg.protocol("WM_DELETE_WINDOW", lambda: pick("cancel"))
+        dlg.bind("<Escape>", lambda e: pick("cancel"))
         dlg.wait_window()
         return result["choice"]
 
@@ -5411,7 +5639,7 @@ class App(tb.Window):
             body = t("dlg.delete.body", name=pretty_name(selected[0]))
         else:
             body = t("dlg.delete.body_multi", count=len(selected))
-        if not messagebox.askyesno(t("dlg.delete.title"), body, parent=self):
+        if not self._confirm(t("dlg.delete.title"), body):
             return
 
         sel_ids = {item["id"] for item in selected}
@@ -5944,6 +6172,7 @@ class App(tb.Window):
         self._import_content.pack(side=TOP, fill=BOTH, expand=YES)
 
         dlg.protocol("WM_DELETE_WINDOW", self._close_import_dialog)
+        dlg.bind("<Escape>", lambda e: self._close_import_dialog())
 
         # Centre over parent. update_idletasks first so reqsize is real.
         dlg.update_idletasks()
@@ -6315,7 +6544,7 @@ class App(tb.Window):
 
             if kind == "buy":
                 # Yes/No: replace the target or leave it alone.
-                if messagebox.askyesno(
+                if self._confirm(
                     t("dlg.import.conflict.title"),
                     t("dlg.import.conflict.buy_body",
                       name=name, old=old_fmt, new=new_fmt),
@@ -6437,6 +6666,7 @@ class App(tb.Window):
         y = py + (ph - dlg.winfo_reqheight()) // 3
         dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
         dlg.protocol("WM_DELETE_WINDOW", lambda: pick("cancel"))
+        dlg.bind("<Escape>", lambda e: pick("cancel"))
         dlg.wait_window()
         return result["choice"]
 
@@ -7751,7 +7981,7 @@ class App(tb.Window):
           * persist by reusing _save_settings — single source of truth for
             on-disk schema and post-save bookkeeping.
         """
-        if not messagebox.askyesno(t("dlg.reset.title"), t("dlg.reset.body")):
+        if not self._confirm(t("dlg.reset.title"), t("dlg.reset.body")):
             return
 
         # Capture current language so we can decide whether to prompt for
@@ -7996,9 +8226,8 @@ class App(tb.Window):
         self.after(6000, self._refresh_watchlist)
 
     def _sched_delete(self):
-        if not messagebox.askyesno(t("dlg.scheduler.confirm_delete.title"),
-                                   t("dlg.scheduler.confirm_delete.body"),
-                                   parent=self):
+        if not self._confirm(t("dlg.scheduler.confirm_delete.title"),
+                             t("dlg.scheduler.confirm_delete.body")):
             return
         import scheduler
         self._run_scheduler_action(
@@ -8053,12 +8282,20 @@ class App(tb.Window):
             self.hist_tree.column(col, width=width, anchor=anchor)
         self._apply_row_tags(self.hist_tree)
         self._setup_sortable_columns(self.hist_tree, list(cols))
+        self._setup_column_widths(self.hist_tree)
         # Selection handler is wired AFTER the action-button row builds —
         # see further down (it needs `self.btn_hist_delete` to exist so
         # the same callback can flip its enabled state). The
         # `_mark_selected_rows` part lives in the combined handler.
         # Click on the link column opens the market listing in a browser.
-        self.hist_tree.bind("<Button-1>", self._on_hist_tree_click)
+        self.hist_tree.bind("<Button-1>", self._on_hist_tree_click, add="+")
+        # Delete → Видалити запис; Enter → Знов до списку; Space → Редагувати
+        # ціну; Esc → clear selection.
+        self.hist_tree.bind("<Delete>", lambda e: self._hist_delete(), add="+")
+        self.hist_tree.bind("<Return>", lambda e: self._hist_readd(), add="+")
+        self.hist_tree.bind("<KP_Enter>", lambda e: self._hist_readd(), add="+")
+        self.hist_tree.bind("<space>", lambda e: self._hist_edit(), add="+")
+        self.hist_tree.bind("<Escape>", self._clear_tree_selection, add="+")
         self.hist_tree.bind("<Motion>", self._on_hist_tree_motion)
         # Same Ctrl+A toggle as the card-list trees.
         self.hist_tree.bind("<Control-KeyPress>", self._on_tree_ctrl_a)
@@ -8472,7 +8709,7 @@ class App(tb.Window):
             body = t("dlg.hist_delete.body", name=pretty_name(selected[0]))
         else:
             body = t("dlg.hist_delete.body_multi", count=len(selected))
-        if not messagebox.askyesno(t("dlg.hist_delete.title"), body, parent=self):
+        if not self._confirm(t("dlg.hist_delete.title"), body):
             return
         targets = {
             (p.get("timestamp"), p.get("market_hash_name"))
@@ -9025,7 +9262,7 @@ class App(tb.Window):
         self.log_text.configure(state=DISABLED)
 
     def _clear_log(self):
-        if not messagebox.askyesno(t("dlg.clear_log.title"), t("dlg.clear_log.body")):
+        if not self._confirm(t("dlg.clear_log.title"), t("dlg.clear_log.body")):
             return
         if LOG_PATH.exists():
             LOG_PATH.write_text("", encoding="utf-8")
