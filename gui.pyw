@@ -286,12 +286,18 @@ class App(tb.Window):
         # (that showed a blank icon) and unlike iconphoto (which the
         # DWM-tinted title bar ignored). First call sets THIS window (and
         # the taskbar); the default= call makes spawned dialogs inherit it.
-        _ico = str(BASE / "assets" / "app.ico")
-        try:
-            self.iconbitmap(_ico)              # this window + taskbar
-            self.iconbitmap(default=_ico)      # spawned Toplevel dialogs
-        except Exception as _exc:
-            log.debug("could not set window icon: %s", _exc)
+        # __app.ico is kept as a spare: used if app.ico is missing or
+        # corrupt (the first existing/valid one wins).
+        for _name in ("app.ico", "__app.ico"):
+            _ico = BASE / "assets" / _name
+            if not _ico.exists():
+                continue
+            try:
+                self.iconbitmap(str(_ico))            # this window + taskbar
+                self.iconbitmap(default=str(_ico))    # spawned dialogs inherit
+                break
+            except Exception as _exc:
+                log.debug("icon %s failed, trying spare: %s", _name, _exc)
         # Now that `self` is a real Tk root, we can hook
         # report_callback_exception. Logger levels can be done here too.
         self._apply_log_config(*self._pending_log_toggles)

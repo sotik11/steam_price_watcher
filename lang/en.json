@@ -372,6 +372,7 @@
   "dlg.lang_changed.body":      "Please restart the app for the language change to take effect.",
 
   "log.config_missing":   "config.json not found — copy config.example.json and fill in credentials",
+  "log.config_not_ready": "config.json not present yet — skipping run (app not configured yet)",
   "log.watchlist_empty":  "Watchlist is empty — nothing to do",
   "log.checking":         "Checking {count} card(s)",
   "log.fetch_error":      "Error fetching {name}: {err}",

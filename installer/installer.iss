@@ -23,7 +23,7 @@
 ; ============================================================================
 
 #define MyAppName "Steam Price Watcher"
-#define MyAppVersion "0.1.2.0"
+#define MyAppVersion "0.1.2.1"
 #define MyAppPublisher "sotik"
 #define PyVersion "3.13.7"
 #define PyInstaller "python-" + PyVersion + "-amd64.exe"
@@ -290,13 +290,20 @@ begin
     Result := '';
 end;
 
-{ Remove the scheduled task created by the app's scheduler tab. }
+{ Remove the scheduled task created by the app's scheduler tab. Also drops
+  the legacy "SteamCardWatch" task (the pre-rename name): an orphaned old
+  task keeps firing watch.py and, during a clean reinstall, could run it in
+  the window where config.json is wiped-but-not-yet-imported. /F so a
+  missing task isn't an error. }
 procedure DropScheduledTask;
 var
   rc: Integer;
 begin
   Exec(ExpandConstant('{cmd}'),
        '/c schtasks /Delete /TN SteamPriceWatcher /F',
+       '', SW_HIDE, ewWaitUntilTerminated, rc);
+  Exec(ExpandConstant('{cmd}'),
+       '/c schtasks /Delete /TN SteamCardWatch /F',
        '', SW_HIDE, ewWaitUntilTerminated, rc);
 end;
 

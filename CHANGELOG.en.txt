@@ -1,6 +1,12 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.2.1 (2026-06-15)
+- watch.py no longer logs ERROR when config.json isn't there yet (fresh /
+  clean install) — a calm log line instead of red.
+- Installer also drops the legacy scheduled task (SteamCardWatch).
+- Spare window icon (__app.ico) used if the primary one is missing/broken.
+
 v0.1.2.0 (2026-06-15)
 - Backup/restore: "Export" / "Import" buttons in Settings. Export saves
   config + all data into a .zip; import restores them (overwrite + restart).

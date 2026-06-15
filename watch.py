@@ -471,8 +471,13 @@ def _process_games(*, config, state, country,
 def main():
     config_path = BASE / "config.json"
     if not config_path.exists():
-        log.error(t("log.config_missing"))
-        sys.exit(1)
+        # Not an error: on a fresh/clean install config.json is created by
+        # the GUI on first launch (and restored by the installer's import
+        # on ssPostInstall). A scheduled run that fires in that brief window
+        # — or before the user has ever opened the app — just has nothing to
+        # do. Log calmly and exit 0 so the journal doesn't flash red.
+        log.info(t("log.config_not_ready"))
+        return
 
     config = load_json(config_path)
     state = load_json(BASE / "state.json") or {}

@@ -372,6 +372,7 @@
   "dlg.lang_changed.body":      "Перезапустіть програму, щоб мова змінилась.",
 
   "log.config_missing":   "config.json не знайдено — скопіюйте config.example.json та заповніть облікові дані",
+  "log.config_not_ready": "config.json ще немає — пропускаю запуск (програму ще не налаштовано)",
   "log.watchlist_empty":  "Список порожній — немає чого робити",
   "log.checking":         "Перевіряю {count} картку(и)",
   "log.fetch_error":      "Помилка отримання {name}: {err}",
