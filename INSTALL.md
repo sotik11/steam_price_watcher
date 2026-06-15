@@ -8,7 +8,7 @@
 
 ## Способ 1 — инсталлятор (рекомендуется)
 
-Готовый `SteamPriceWatcher-Setup-<версия>.exe` — это обычный мастер
+Готовый `Steam Price Watcher <версия>.exe` — это обычный мастер
 установки. Внутри него уже всё: код, ресурсы и оффлайн-установщик Python.
 
 1. Запусти `.exe`.
@@ -85,7 +85,7 @@ installer\build_installer.bat
 ```
 
 Скрипт скачает bundled-Python (кэшируется) и скомпилирует
-`installer\dist\SteamPriceWatcher-Setup-<версия>.exe`.
+`installer\dist\Steam Price Watcher <версия>.exe`.
 
 **При выпуске новой версии:** подними `PYVER` в `build_installer.bat` и
 `MyAppVersion` + `PyVersion` в `installer.iss` до актуальной

@@ -8108,6 +8108,28 @@ class App(tb.Window):
             if e.keysym in ("Left", "Right", "Home", "End", "Tab",
                             "ISO_Left_Tab"):
                 return  # let navigation through
+            is_digit = bool(e.char) and e.char.isdigit()
+            # Selection handling: a digit / Backspace / Delete acts on the
+            # SELECTED slots, not the cursor — clear them to "_", and for a
+            # digit also drop it into the first selected slot.
+            try:
+                sf, sl_ = entry.index("sel.first"), entry.index("sel.last")
+                has_sel = sf < sl_
+            except tk.TclError:
+                has_sel = False
+            if has_sel and (is_digit or e.keysym in ("BackSpace", "Delete")):
+                chars = list(entry.get())
+                for s in slots:
+                    if sf <= s < sl_:
+                        chars[s] = "_"
+                first = next((s for s in slots if sf <= s < sl_), None)
+                if is_digit and first is not None:
+                    chars[first] = e.char
+                    nxt = next((x for x in slots if x > first), first + 1)
+                    _set("".join(chars), nxt)
+                else:
+                    _set("".join(chars), first if first is not None else sf)
+                return "break"
             cur = entry.index("insert")
             if e.char and e.char.isdigit():
                 slot = next((s for s in slots if s >= cur), None)
@@ -8152,13 +8174,97 @@ class App(tb.Window):
             return None
         return {"from": f"{h1:02d}:{m1:02d}", "to": f"{h2:02d}:{m2:02d}"}
 
+    # Exactly the files the installer backs up / restores (flat names in
+    # the zip root), so an archive made here is interchangeable with the
+    # installer's import and vice versa. Keep in sync with installer.iss
+    # CopyDataFile lists.
+    _BACKUP_FILES = (
+        "config.json", "watchlist.json", "salelist.json", "gamelist.json",
+        "gameblacklist.json", "purchases.json", "state.json",
+    )
+
     def _backup_export(self):
-        """Placeholder for the upcoming export/backup feature."""
-        messagebox.showinfo(t("dlg.backup.title"), t("dlg.backup.coming_soon"))
+        """Save config + all data files into a flat .zip (installer-compatible)."""
+        from tkinter import filedialog
+        import zipfile
+        default = f"SteamPriceWatcher-backup-{datetime.now():%Y-%m-%d}.zip"
+        dest = filedialog.asksaveasfilename(
+            parent=self, title=t("dlg.backup.export_title"),
+            defaultextension=".zip", initialfile=default,
+            filetypes=[("ZIP", "*.zip")],
+        )
+        if not dest:
+            return
+        try:
+            count = 0
+            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+                for name in self._BACKUP_FILES:
+                    p = BASE / name
+                    if p.exists():
+                        z.write(p, name)   # arcname = bare filename (flat)
+                        count += 1
+        except Exception as e:
+            messagebox.showerror(t("dlg.backup.title"),
+                                 t("dlg.backup.export_err", err=str(e)),
+                                 parent=self)
+            return
+        # config.json carries the bot token + Steam cookies — warn so the
+        # user doesn't hand the archive to anyone.
+        messagebox.showinfo(t("dlg.backup.title"),
+                            t("dlg.backup.export_done", count=count, path=dest),
+                            parent=self)
 
     def _backup_import(self):
-        """Placeholder for the upcoming import/restore feature."""
-        messagebox.showinfo(t("dlg.backup.title"), t("dlg.backup.coming_soon"))
+        """Restore config + data from a flat .zip, overwriting current files."""
+        from tkinter import filedialog
+        import zipfile
+        src = filedialog.askopenfilename(
+            parent=self, title=t("dlg.backup.import_title"),
+            filetypes=[("ZIP", "*.zip")],
+        )
+        if not src:
+            return
+        # Whitelist by bare filename — never trust paths inside the zip
+        # (zip-slip guard): we only ever write BASE/<known-name>.
+        try:
+            with zipfile.ZipFile(src) as z:
+                members = {os.path.basename(n): n for n in z.namelist()
+                           if os.path.basename(n) in self._BACKUP_FILES}
+        except Exception as e:
+            messagebox.showerror(t("dlg.backup.title"),
+                                 t("dlg.backup.import_err", err=str(e)),
+                                 parent=self)
+            return
+        if not members:
+            messagebox.showerror(t("dlg.backup.title"),
+                                 t("dlg.backup.import_empty"), parent=self)
+            return
+        if not self._confirm(t("dlg.backup.title"),
+                             t("dlg.backup.import_confirm", count=len(members))):
+            return
+        try:
+            with zipfile.ZipFile(src) as z:
+                for name, member in members.items():
+                    (BASE / name).write_bytes(z.read(member))
+        except Exception as e:
+            messagebox.showerror(t("dlg.backup.title"),
+                                 t("dlg.backup.import_err", err=str(e)),
+                                 parent=self)
+            return
+        # Restart so config + lists are re-read cleanly from disk.
+        messagebox.showinfo(t("dlg.backup.title"),
+                            t("dlg.backup.import_done", count=len(members)),
+                            parent=self)
+        self._restart_app()
+
+    def _restart_app(self):
+        """Relaunch the GUI in a fresh process, then close this one."""
+        try:
+            subprocess.Popen([sys.executable, str(BASE / "gui.pyw")],
+                             cwd=str(BASE))
+        except Exception as e:
+            log.warning("could not relaunch after import: %s", e)
+        self._on_close()
 
     def _reset_settings_to_defaults(self):
         """Wipe all settings back to config.example.json defaults.

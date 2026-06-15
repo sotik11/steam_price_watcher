@@ -23,7 +23,7 @@
 ; ============================================================================
 
 #define MyAppName "Steam Price Watcher"
-#define MyAppVersion "0.1.1.0"
+#define MyAppVersion "0.1.2.0"
 #define MyAppPublisher "sotik"
 #define PyVersion "3.13.7"
 #define PyInstaller "python-" + PyVersion + "-amd64.exe"
@@ -40,7 +40,7 @@ DisableProgramGroupPage=yes
 ; Let the user pick the folder, but default to a writable per-user location.
 DisableDirPage=no
 OutputDir=dist
-OutputBaseFilename=SteamPriceWatcher-Setup-{#MyAppVersion}
+OutputBaseFilename={#MyAppName} {#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

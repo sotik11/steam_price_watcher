@@ -6,7 +6,7 @@ rem  Steps:
 rem    1. Download the official Python installer for PYVER (cached - skipped if
 rem       already present in installer\python\).
 rem    2. Run Inno Setup's ISCC.exe on installer.iss, producing
-rem       installer\dist\SteamPriceWatcher-Setup-<ver>.exe.
+rem       installer\dist\Steam Price Watcher <ver>.exe.
 rem
 rem  WHEN RELEASING A NEW VERSION: bump PYVER below to the latest compatible
 rem  Python 3.13.x (check https://www.python.org/downloads/), and bump

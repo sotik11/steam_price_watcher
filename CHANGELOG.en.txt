@@ -1,6 +1,11 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.2.0 (2026-06-15)
+- Backup/restore: "Export" / "Import" buttons in Settings. Export saves
+  config + all data into a .zip; import restores them (overwrite + restart).
+  Format is interchangeable with the installer.
+
 v0.1.1.0 (2026-06-15)
 - "Do not disturb" mode: a time window (__:__ - __:__) during which
   Telegram alerts are not sent (even when antispam has expired). Checked
