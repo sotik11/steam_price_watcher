@@ -23,7 +23,7 @@
 ; ============================================================================
 
 #define MyAppName "Steam Price Watcher"
-#define MyAppVersion "0.1.0.1"
+#define MyAppVersion "0.1.1.0"
 #define MyAppPublisher "sotik"
 #define PyVersion "3.13.7"
 #define PyInstaller "python-" + PyVersion + "-amd64.exe"

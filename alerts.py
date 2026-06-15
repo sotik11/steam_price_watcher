@@ -19,10 +19,40 @@ from i18n import t
 log = logging.getLogger("alerts")
 
 
+def is_dnd_now(dnd: dict | None, country: str, now_local=None) -> bool:
+    """Is the current local time inside the «Не турбувати» window?
+
+    `dnd` is `{"from": "HH:MM", "to": "HH:MM"}` or falsy (disabled). Time
+    is compared in the profile country's local timezone (regions.local_now),
+    so the window means what the user sees on their clock. A window where
+    `from > to` is treated as crossing midnight (e.g. 23:00–08:00). Equal
+    endpoints = disabled (zero-length).
+    """
+    if not dnd or not dnd.get("from") or not dnd.get("to"):
+        return False
+    try:
+        fh, fm = (int(x) for x in dnd["from"].split(":"))
+        th, tm = (int(x) for x in dnd["to"].split(":"))
+    except (ValueError, AttributeError):
+        return False
+    if now_local is None:
+        from regions import local_now
+        now_local = local_now(country)
+    cur = now_local.hour * 60 + now_local.minute
+    start, end = fh * 60 + fm, th * 60 + tm
+    if start == end:
+        return False
+    if start < end:
+        return start <= cur < end
+    # Crosses midnight: active from `start` to 24:00 and 00:00 to `end`.
+    return cur >= start or cur < end
+
+
 def evaluate_and_alert(*, kind: str, info: dict, state: dict,
                       token: str, chat_id: str, template: str,
                       repeat_if_lower: bool, remind_after_hours: int,
-                      now: datetime) -> tuple[bool, bool, bool, str]:
+                      now: datetime, dnd_active: bool = False
+                      ) -> tuple[bool, bool, bool, str]:
     """Decide whether to fire a Telegram alert for one polled card, and send it.
 
     Parameters:
@@ -121,6 +151,13 @@ def evaluate_and_alert(*, kind: str, info: dict, state: dict,
 
     if not should_alert:
         return False, False, False, "antispam"
+
+    # «Не турбувати»: the alert IS due (passed antispam), but we're inside
+    # the quiet window — suppress the send WITHOUT touching antispam state,
+    # so the message goes out on the next poll after the window ends.
+    if dnd_active:
+        log.info(t("log.dnd_suppressed", name=pretty))
+        return False, False, False, "do not disturb"
 
     log.info(t("log.sending_alert", name=pretty, reason=reason))
     # Lazy import — telegram.py loads requests + i18n, which is fine in

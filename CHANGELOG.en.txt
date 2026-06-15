@@ -1,6 +1,11 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.1.0 (2026-06-15)
+- "Do not disturb" mode: a time window (__:__ - __:__) during which
+  Telegram alerts are not sent (even when antispam has expired). Checked
+  in local time, works across midnight. Window start/end are logged.
+
 v0.1.0.1 (2026-06-14)
 - Fixed: "Save" in Settings no longer wipes "Bonus content" (the «Games»
   tab), sort order, or column widths.

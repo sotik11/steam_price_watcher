@@ -166,7 +166,12 @@ def _process_list(kind: str, list_path: Path, *,
     # telegram.send_alert is called inside alerts.evaluate_and_alert; the
     # import lives there. Keep the alerts import here so we don't pay for it
     # if the early "no active cards" return fires.
-    from alerts import evaluate_and_alert
+    from alerts import evaluate_and_alert, is_dnd_now
+
+    # «Не турбувати»: computed once per poll — suppresses sends while the
+    # local time is inside the quiet window (antispam state untouched).
+    dnd_active = is_dnd_now(
+        (config.get("notifications") or {}).get("dnd"), country)
 
     # Sell list may contain duplicate (appid, name) entries (the user is
     # selling multiple copies of the same card). De-dup before hitting
@@ -316,6 +321,7 @@ def _process_list(kind: str, list_path: Path, *,
             token=token, chat_id=chat_id, template=template,
             repeat_if_lower=repeat_if_lower,
             remind_after_hours=remind_after_hours, now=now,
+            dnd_active=dnd_active,
         )
         if sd:
             state_dirty = True
@@ -375,6 +381,9 @@ def _process_games(*, config, state, country,
 
     from steam import (fetch_game_info_batch, GAME_HEADER_IMAGE_URL,
                        GAME_STORE_URL)
+    from alerts import is_dnd_now
+    dnd_active = is_dnd_now(
+        (config.get("notifications") or {}).get("dnd"), country)
     from alerts import evaluate_and_alert
 
     log.info(t("log.checking", count=len(items)) + "  (games)")
@@ -443,6 +452,7 @@ def _process_games(*, config, state, country,
             token=token, chat_id=chat_id, template=template,
             repeat_if_lower=repeat_if_lower,
             remind_after_hours=remind_after_hours, now=now,
+            dnd_active=dnd_active,
         )
         if sd:
             state_dirty = True
@@ -484,6 +494,11 @@ def main():
     repeat_if_lower = antispam.get("repeat_if_lower", True)
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # NB: the «Не турбувати» window only SUPPRESSES sends here (per-list,
+    # via alerts.is_dnd_now). The journal "started/ended" log lives in the
+    # GUI on a short timer — watch.py runs every 5 min, so a short window
+    # could slip entirely between two polls and never be logged here.
 
     # Skip the whole run if Steam recently 429'd us — pounding the API
     # during the cooldown just gets us banned for longer (and floods the

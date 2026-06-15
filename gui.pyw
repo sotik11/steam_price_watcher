@@ -354,6 +354,36 @@ class App(tb.Window):
         # downloaded on a background thread so we don't block the first
         # paint while Steam's CDN responds.
         self._load_steam_user_widget()
+        # «Не турбувати»: poll the window on a short timer so the journal
+        # records start/end near real time (watch.py only sees it every
+        # 5 min — a short window could slip between polls).
+        self._dnd_was = None
+        self._dnd_watch_tick()
+
+    def _dnd_watch_tick(self) -> None:
+        """Log «Не турбувати» start/end transitions; reschedules itself."""
+        try:
+            from alerts import is_dnd_now
+            cfg = self.config_data
+            active = is_dnd_now(
+                (cfg.get("notifications") or {}).get("dnd"),
+                (cfg.get("market") or {}).get("country", "UA"))
+            if self._dnd_was is None:
+                # First tick after launch — adopt the state silently so we
+                # don't log a spurious "started" for a window already open.
+                self._dnd_was = active
+            elif active != self._dnd_was:
+                self._dnd_was = active
+                if active:
+                    dnd = (cfg.get("notifications") or {}).get("dnd") or {}
+                    log.info(t("log.dnd_started", until=dnd.get("to", "?")))
+                else:
+                    log.info(t("log.dnd_ended"))
+        except Exception as exc:
+            log.debug("dnd watch tick failed: %s", exc)
+        # 30 s cadence: fine-grained enough to catch a 1-minute window,
+        # cheap enough to ignore.
+        self.after(30_000, self._dnd_watch_tick)
 
     def _on_close(self) -> None:
         """Persist window geometry then destroy.
@@ -4032,7 +4062,7 @@ class App(tb.Window):
                     f"{regular:.2f}{sym}" if isinstance(regular, (int, float))
                     else "—",
                     f"-{disc}%" if disc else "—",
-                    g.get("price_str") or "—",
+                    (g.get("price_str") or "—").replace(",", "."),
                     f"{minimum:.2f}{sym}" if minimum is not None else "—",
                     status,
                     t("col.link.open"),
@@ -4777,7 +4807,7 @@ class App(tb.Window):
         was already alerted earlier under a plain-sale rule. One-shot
         per import click — the evaluation re-arms antispam right after.
         """
-        from alerts import evaluate_and_alert
+        from alerts import evaluate_and_alert, is_dnd_now
         from steam import GAME_HEADER_IMAGE_URL, GAME_STORE_URL
 
         items = load_json(GAMELIST_PATH, []) or []
@@ -4791,6 +4821,9 @@ class App(tb.Window):
         template = (cfg.get("message_template") or "").strip() \
             or t("tg.message.default")
         spam = cfg.get("antispam", {})
+        dnd_active = is_dnd_now(
+            (cfg.get("notifications") or {}).get("dnd"),
+            (cfg.get("market") or {}).get("country", "UA"))
         now_dt = datetime.now(timezone.utc).replace(tzinfo=None)
 
         for g in items:
@@ -4864,7 +4897,7 @@ class App(tb.Window):
                 token=token, chat_id=chat_id, template=template,
                 repeat_if_lower=spam.get("repeat_if_lower", True),
                 remind_after_hours=spam.get("remind_after_hours", 24),
-                now=now_dt,
+                now=now_dt, dnd_active=dnd_active,
             )
             if sd:
                 state_dirty = True
@@ -5728,12 +5761,14 @@ class App(tb.Window):
 
         def _work():
             from steam import get_price, RateLimitedError
-            from alerts import evaluate_and_alert
+            from alerts import evaluate_and_alert, is_dnd_now
             import time
             t_start = time.monotonic()
             cfg = self.config_data
             currency = cfg.get("market", {}).get("currency", 18)
             country = cfg.get("market", {}).get("country", "UA")
+            dnd_active = is_dnd_now(
+                (cfg.get("notifications") or {}).get("dnd"), country)
 
             results: dict[tuple, dict] = {}
             errors: list[str] = []
@@ -5877,7 +5912,7 @@ class App(tb.Window):
                         token=token, chat_id=chat_id, template=template,
                         repeat_if_lower=repeat_if_lower,
                         remind_after_hours=remind_after_hours,
-                        now=now_dt,
+                        now=now_dt, dnd_active=dnd_active,
                     )
                     if sd:
                         state_dirty = True
@@ -7155,14 +7190,28 @@ class App(tb.Window):
         ).grid(row=3, column=3, sticky=W, pady=4)
         right_label("lbl.poll_delay", 3)
 
+        # «Не турбувати» — masked __:__ - __:__ window. While the current
+        # local time is inside it, Telegram alerts are suppressed (see
+        # alerts.is_dnd_now). Fully-blank template = disabled. Crosses
+        # midnight when from > to. The field always shows the template;
+        # typed digits fill the slots left-to-right (see _install_time_mask).
+        dnd_cfg = ((cfg.get("notifications", {}) or {}).get("dnd") or {})
+        dnd_init = ""
+        if dnd_cfg.get("from") and dnd_cfg.get("to"):
+            dnd_init = f"{dnd_cfg['from']} - {dnd_cfg['to']}"
+        self.dnd_entry = ttk.Entry(cols, width=13, justify=CENTER)
+        self.dnd_entry.grid(row=4, column=3, sticky=W, pady=4)
+        self._install_time_mask(self.dnd_entry, dnd_init)
+        right_label("lbl.dnd", 4)
+
         self.var_remind_hours = tk.IntVar(
             value=spam.get("remind_after_hours", 24),
         )
         ttk.Spinbox(
             cols, from_=1, to=168, textvariable=self.var_remind_hours,
             width=4,
-        ).grid(row=4, column=3, sticky=W, pady=4)
-        right_label("lbl.antispam_hours", 4)
+        ).grid(row=5, column=3, sticky=W, pady=4)
+        right_label("lbl.antispam_hours", 5)
 
         # "Повторити, якщо нижче" — single row spanning both right
         # columns. The custom check exists because ttkbootstrap's
@@ -7172,7 +7221,7 @@ class App(tb.Window):
             value=spam.get("repeat_if_lower", True),
         )
         repeat_holder = ttk.Frame(cols)
-        repeat_holder.grid(row=5, column=3, columnspan=2,
+        repeat_holder.grid(row=6, column=3, columnspan=2,
                            sticky=W, pady=4, padx=(0, 0))
         self._make_scalable_check(repeat_holder,
                                   self.var_repeat_lower).pack(side=LEFT)
@@ -7188,13 +7237,16 @@ class App(tb.Window):
         self.var_bonus_content = tk.BooleanVar(
             value=bool(ui_cfg_now.get("bonus_content", False)),
         )
+        # Sits in the LEFT column, right under «Debug log» (row 7), styled
+        # like the other left-column checkboxes (label → check, right-aligned).
         bonus_holder = ttk.Frame(cols)
-        bonus_holder.grid(row=6, column=3, columnspan=2,
-                          sticky=W, pady=4, padx=(0, 0))
-        self._make_scalable_check(bonus_holder,
-                                  self.var_bonus_content).pack(side=LEFT)
+        bonus_holder.grid(row=7, column=0, columnspan=2,
+                          sticky=E, pady=4)
         ttk.Label(bonus_holder, text=t("lbl.bonus_content"),
-                  anchor=W).pack(side=LEFT, padx=(8, 0))
+                  anchor=E).pack(side=LEFT)
+        self._make_scalable_check(bonus_holder,
+                                  self.var_bonus_content).pack(
+            side=LEFT, padx=(8, 0))
         # Trace AFTER initial set so construction doesn't write config.
         self.var_bonus_content.trace_add(
             "write", lambda *_: self._on_bonus_content_toggle())
@@ -7991,6 +8043,12 @@ class App(tb.Window):
         merged_ui = dict(self.config_data.get("ui") or {})
         merged_ui.update(cfg["ui"])
         cfg["ui"] = merged_ui
+        # «Не турбувати» window. A valid HH:MM-HH:MM range enables it; any
+        # blank/incomplete input disables it (dnd=None). Merge into a
+        # preserved notifications block so future keys there survive too.
+        notif = dict(self.config_data.get("notifications") or {})
+        notif["dnd"] = self._parse_dnd_range(self.dnd_entry.get())
+        cfg["notifications"] = notif
         # Preserve the Steam-login section as-is. It's owned by a different
         # subsystem (steam_login.py + the login dialog) and the Settings
         # form has no fields for it, so a Settings "Save" must NOT wipe it.
@@ -8016,6 +8074,83 @@ class App(tb.Window):
         self._refresh_balance_placeholder(currency_val)
         self._refresh_wallet_balance()
         self._set_status(t("status.settings_saved"))
+
+    # Fixed template for the «Не турбувати» field + the character indices
+    # that hold digits (the rest are ":", spaces and "-").
+    _DND_MASK = "__:__ - __:__"
+    _DND_SLOTS = (0, 1, 3, 4, 8, 9, 11, 12)
+
+    def _install_time_mask(self, entry, initial: str = ""):
+        """Turn `entry` into a fixed __:__ - __:__ overwrite mask.
+
+        The field always displays the template; digits land in the slots
+        left-to-right, cursor advances itself, Backspace/Delete blank a
+        slot back to "_". Non-digits are ignored. Arrow/Home/End/Tab still
+        navigate. This avoids the cursor-jump that a reformat-on-write mask
+        caused (digits getting scrambled).
+        """
+        mask, slots = self._DND_MASK, self._DND_SLOTS
+        digits = re.sub(r"\D", "", initial)[:len(slots)]
+        chars = list(mask)
+        for i, pos in enumerate(slots):
+            chars[pos] = digits[i] if i < len(digits) else "_"
+        entry.delete(0, END)
+        entry.insert(0, "".join(chars))
+        entry.icursor(slots[len(digits)] if len(digits) < len(slots)
+                      else slots[-1] + 1)
+
+        def _set(s, cursor):
+            entry.delete(0, END)
+            entry.insert(0, s)
+            entry.icursor(cursor)
+
+        def on_key(e):
+            if e.keysym in ("Left", "Right", "Home", "End", "Tab",
+                            "ISO_Left_Tab"):
+                return  # let navigation through
+            cur = entry.index("insert")
+            if e.char and e.char.isdigit():
+                slot = next((s for s in slots if s >= cur), None)
+                if slot is None:
+                    return "break"
+                s = entry.get()
+                nxt = next((x for x in slots if x > slot), slot + 1)
+                _set(s[:slot] + e.char + s[slot + 1:], nxt)
+                return "break"
+            if e.keysym == "BackSpace":
+                slot = max((s for s in slots if s < cur), default=None)
+                if slot is not None:
+                    s = entry.get()
+                    _set(s[:slot] + "_" + s[slot + 1:], slot)
+                return "break"
+            if e.keysym == "Delete":
+                slot = next((s for s in slots if s >= cur), None)
+                if slot is not None:
+                    s = entry.get()
+                    _set(s[:slot] + "_" + s[slot + 1:], slot)
+                return "break"
+            # Block any other printable key (letters, punctuation, space).
+            if e.char and e.char.isprintable():
+                return "break"
+
+        entry.bind("<KeyPress>", on_key)
+
+    @staticmethod
+    def _parse_dnd_range(text: str):
+        """Parse "HH:MM - HH:MM" → {"from": "HH:MM", "to": "HH:MM"} or None.
+
+        Returns None for blank / incomplete / out-of-range input, so a
+        half-typed field simply disables Do-Not-Disturb rather than saving
+        garbage.
+        """
+        m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$",
+                     text or "")
+        if not m:
+            return None
+        h1, m1, h2, m2 = (int(x) for x in m.groups())
+        if not (0 <= h1 < 24 and 0 <= m1 < 60 and 0 <= h2 < 24 and 0 <= m2 < 60):
+            return None
+        return {"from": f"{h1:02d}:{m1:02d}", "to": f"{h2:02d}:{m2:02d}"}
 
     def _backup_export(self):
         """Placeholder for the upcoming export/backup feature."""
