@@ -1,6 +1,11 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.0.1 (2026-06-14)
+- Fixed: "Save" in Settings no longer wipes "Bonus content" (the «Games»
+  tab), sort order, or column widths.
+- Currency symbol in the "Price" and "Minimum" columns on the Games tab.
+
 v0.1.0.0 (2026-06-14) — First tracked release
 - App renamed to "Steam Price Watcher".
 - "About" tab: version, author, changelog, links.

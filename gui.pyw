@@ -3996,6 +3996,7 @@ class App(tb.Window):
         # leave the visible table — same contract as the card lists.
         items = [g for g in items
                  if g.get("status") not in CLOSED_STATUSES]
+        sym = self._currency_symbol()
         for i, g in enumerate(items):
             price = g.get("price")
             regular = g.get("regular")
@@ -4028,11 +4029,11 @@ class App(tb.Window):
                 values=(
                     i + 1,
                     g.get("name") or f"app {g.get('appid')}",
-                    f"{regular:.2f}" if isinstance(regular, (int, float))
+                    f"{regular:.2f}{sym}" if isinstance(regular, (int, float))
                     else "—",
                     f"-{disc}%" if disc else "—",
                     g.get("price_str") or "—",
-                    f"{minimum:.2f}" if minimum is not None else "—",
+                    f"{minimum:.2f}{sym}" if minimum is not None else "—",
                     status,
                     t("col.link.open"),
                     "📥" if g.get("imported") else "",
@@ -7982,6 +7983,14 @@ class App(tb.Window):
         # when the user switches language.
         if template_override and template_override != t("tg.message.default"):
             cfg["message_template"] = template_override
+        # Preserve UI keys the Settings form doesn't manage. The cfg["ui"]
+        # above is rebuilt from form fields only, so without this merge a
+        # "Save" wipes keys written elsewhere — bonus_content (the «Ігри»
+        # toggle), sort_state, column_widths, etc. Merge form values ON TOP
+        # of the existing ui block so those survive.
+        merged_ui = dict(self.config_data.get("ui") or {})
+        merged_ui.update(cfg["ui"])
+        cfg["ui"] = merged_ui
         # Preserve the Steam-login section as-is. It's owned by a different
         # subsystem (steam_login.py + the login dialog) and the Settings
         # form has no fields for it, so a Settings "Save" must NOT wipe it.
