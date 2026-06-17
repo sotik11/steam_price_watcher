@@ -2,6 +2,7 @@
 import csv
 import json
 import logging
+import html
 import os
 import re
 import shutil
@@ -4987,6 +4988,16 @@ class App(tb.Window):
         dirty = False
         for item in records:
             mhn = item.get("market_hash_name", "")
+            # Normalise HTML entities sitting in stored names from older
+            # imports (e.g. "Assassin&#x27;s Creed Shadows" → "...'s ...").
+            # Cheap, no network — just decode in place.
+            for _k in ("display_name", "game_name", "item_type"):
+                v = item.get(_k)
+                if isinstance(v, str) and "&" in v:
+                    dec = html.unescape(v)
+                    if dec != v:
+                        item[_k] = dec
+                        dirty = True
             # If game_name still contains a known type suffix, treat that
             # as "type needs extracting" — old rows have things like
             # "STAR WARS Jedi: Survivor™ Trading Card" sitting in game_name.
@@ -4998,6 +5009,16 @@ class App(tb.Window):
                     item["item_type"] = ty
                     dirty = True
                     type_missing = False
+            # Profile-background rarity that earlier splits left stuck in
+            # game_name ("Assassin's Creed Shadows Uncommon") — move it into
+            # the type so the game name is clean.
+            if item.get("game_name") and item.get("item_type"):
+                from steam import _split_rarity
+                g, ty = _split_rarity(item["game_name"], item["item_type"])
+                if g != item["game_name"]:
+                    item["game_name"] = g
+                    item["item_type"] = ty
+                    dirty = True
             needs = (
                 not item.get("display_name")
                 or item.get("display_name") == mhn

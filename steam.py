@@ -1,4 +1,5 @@
 """Steam Community Market API helpers."""
+import html
 import json
 import logging
 import re
@@ -404,7 +405,9 @@ def clean_card_name(market_hash_name: str) -> str:
     For game-native items it's just the title — we leave those untouched.
     """
     m = re.match(r"^\d+-(.+)$", market_hash_name)
-    return m.group(1) if m else market_hash_name
+    # html.unescape so names scraped from Steam HTML (e.g. "Assassin&#x27;s
+    # Creed Shadows") render with real punctuation, not raw entities.
+    return html.unescape(m.group(1) if m else market_hash_name)
 
 
 def pretty_name(item: dict) -> str:
@@ -428,7 +431,9 @@ def pretty_name(item: dict) -> str:
     mhn = item.get("market_hash_name") or item.get("name", "")
     stored = item.get("display_name")
     if stored and stored != mhn:
-        return stored
+        # Decode any HTML entities a stored name may still carry from
+        # older records (e.g. "&#x27;" → "'").
+        return html.unescape(stored)
     if mhn:
         return clean_card_name(mhn)
     return "?"
@@ -556,13 +561,14 @@ def fetch_card_metadata(appid: str | int, market_hash_name: str) -> dict:
     try:
         resp = requests.get(url, headers=_DEFAULT_HEADERS, timeout=_TIMEOUT)
         resp.raise_for_status()
-        html = resp.text
-        m_img = _LISTING_OG_IMAGE_RE.search(html)
+        page = resp.text   # not `html` — that shadows the html module
+        m_img = _LISTING_OG_IMAGE_RE.search(page)
         if m_img:
             image_url = m_img.group(1)
-        m_game = _LISTING_GAME_NAME_RE.search(html)
+        m_game = _LISTING_GAME_NAME_RE.search(page)
         if m_game:
-            game_name = m_game.group(1).strip()
+            # Decode entities: "Assassin&#x27;s Creed Shadows" → "...'s ..."
+            game_name = html.unescape(m_game.group(1).strip())
     except Exception as exc:
         log.warning("fetch_card_metadata listing fetch failed (%s): %s",
                     market_hash_name, exc)
@@ -1113,11 +1119,11 @@ def fetch_market_listings(cookies: dict | None) -> list[dict]:
         # Steam later starts mixing in other appids/contexts here.
         assets_753 = (data.get("assets") or {}).get("753", {}).get("6", {})
 
-        html = data.get("results_html", "") or ""
-        for block in _LISTING_BLOCK_RE.finditer(html):
+        page = data.get("results_html", "") or ""   # not `html` (module)
+        for block in _LISTING_BLOCK_RE.finditer(page):
             listingid = block.group("lid")
             price_raw = block.group("price").strip()
-            game_name = block.group("game").strip()
+            game_name = html.unescape(block.group("game").strip())
 
             assetid = lid_to_aid.get(listingid)
             asset = assets_753.get(assetid or "")
@@ -1128,8 +1134,9 @@ def fetch_market_listings(cookies: dict | None) -> list[dict]:
                 log.debug("mylistings: no asset for listing %s", listingid)
                 continue
 
-            mhn = asset.get("market_hash_name") or ""
-            display_name = asset.get("name") or asset.get("market_name") or ""
+            mhn = asset.get("market_hash_name") or ""   # raw — used for queries
+            display_name = html.unescape(
+                asset.get("name") or asset.get("market_name") or "")
 
             # IMPORTANT: `appid` here is what goes into the Steam Market
             # URL (and every subsequent get_price call), NOT the game's
@@ -1248,8 +1255,8 @@ def fetch_buy_orders(cookies: dict | None) -> list[dict]:
             )
         return []
 
-    html = resp.text
-    if "mybuyorder_" not in html:
+    page = resp.text   # not `html` — that shadows the html module
+    if "mybuyorder_" not in page:
         # Two cases land here: a real empty buy-orders list, OR a dead
         # session (Steam serves the login page with HTTP 200 instead of
         # refusing the request). We tell them apart by sniffing for a
@@ -1258,7 +1265,7 @@ def fetch_buy_orders(cookies: dict | None) -> list[dict]:
         # on the login page. Negative markers (login URL, openid, etc.)
         # gave false positives because Steam puts a "Sign in" link in
         # the header for logged-in users too.
-        m_id = re.search(r'g_steamID\s*=\s*"(\d+)"', html)
+        m_id = re.search(r'g_steamID\s*=\s*"(\d+)"', page)
         if not m_id or m_id.group(1) == "0":
             log.warning("buy orders returned login page — session expired")
             raise SteamSessionExpired(
@@ -1268,7 +1275,7 @@ def fetch_buy_orders(cookies: dict | None) -> list[dict]:
         return []
 
     out: list[dict] = []
-    for m in _BUYORDER_BLOCK_RE.finditer(html):
+    for m in _BUYORDER_BLOCK_RE.finditer(page):
         mhn = urllib.parse.unquote(m.group("mhn_enc"))
         # `appid` is the URL-side appid — for trading cards that's 753
         # (Steam Community Items), for game-native items it'd be the
@@ -1285,8 +1292,8 @@ def fetch_buy_orders(cookies: dict | None) -> list[dict]:
             "buy_orderid":      m.group("oid"),
             "appid":            appid,
             "market_hash_name": mhn,
-            "display_name":     m.group("display").strip(),
-            "game_name":        m.group("game").strip(),
+            "display_name":     html.unescape(m.group("display").strip()),
+            "game_name":        html.unescape(m.group("game").strip()),
             "price":            parse_price(m.group("price")),
             "price_raw":        m.group("price").strip(),
         })
@@ -1336,6 +1343,25 @@ _TYPE_SUFFIXES_PLAIN = [
 ]
 
 
+# Profile-background rarity words Steam appends after the game name and
+# before "Profile Background" (e.g. "Assassin's Creed Shadows Uncommon
+# Profile Background"). We pull the rarity off the game name and prepend it
+# to the item type, so the game stays clean and the type reads "Uncommon
+# Profile Background". English only — that's what Steam ships in the tag
+# even on localized stores.
+_RARITY_WORDS = ("Common", "Uncommon", "Rare")
+
+
+def _split_rarity(game: str, item_type: str) -> tuple[str, str]:
+    """Move a trailing rarity word out of `game` into `item_type`."""
+    for r in _RARITY_WORDS:
+        if game.endswith(" " + r):
+            game = game[: -(len(r) + 1)].rstrip()
+            item_type = (r + " " + item_type).strip() if item_type else r
+            break
+    return (game, item_type)
+
+
 def split_game_and_type(game_name_raw: str) -> tuple[str, str]:
     """Split Steam's combined "game — item-type" string into two parts.
 
@@ -1361,6 +1387,7 @@ def split_game_and_type(game_name_raw: str) -> tuple[str, str]:
         if raw.endswith(suffix):
             game = raw[: len(raw) - len(suffix)].rstrip(" —")
             item_type = suffix.lstrip(" —").strip()
+            game, item_type = _split_rarity(game, item_type)
             return (game, item_type)
 
     # Fallback for locales/games we don't have suffixes for: if the
