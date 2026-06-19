@@ -9,7 +9,8 @@
     "poll_delay_sec": 1.5
   },
   "schedule": {
-    "interval_minutes": 5
+    "interval_minutes": 5,
+    "games_interval_hours": 24
   },
   "ui": {
     "theme": "superhero",

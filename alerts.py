@@ -48,6 +48,66 @@ def is_dnd_now(dnd: dict | None, country: str, now_local=None) -> bool:
     return cur >= start or cur < end
 
 
+def maybe_alert_epic(*, game: dict, state: dict, token: str, chat_id: str,
+                     repeat_if_lower: bool, remind_after_hours: int,
+                     now: datetime, dnd_active: bool = False
+                     ) -> tuple[bool, bool]:
+    """Fire a Telegram alert when Epic undercuts Steam for one wishlist game.
+
+    Reuses `evaluate_and_alert` with kind="epic" so the antispam + DND
+    machinery (first_alert / repeat-if-lower / reminder) is shared, but in
+    its OWN state-key namespace (`epic:appid:name`) — independent of the
+    Steam sale alerts on the same game.
+
+    Fires ONLY when Epic is **strictly cheaper** than Steam (epic < steam,
+    epic > 0). Equal prices or a 0/no-price Epic offer are NOT a deal — we
+    skip the send AND clear any stale antispam entry so a genuine future
+    drop fires a fresh first-alert. No-op without both real prices + a
+    matched Epic url, or without Telegram creds.
+
+    Returns (state_dirty, did_alert).
+    """
+    from steam import GAME_HEADER_IMAGE_URL
+    epic_price = game.get("epic_price")
+    steam_price = game.get("price")
+    epic_url = game.get("epic_url")
+    if not (isinstance(epic_price, (int, float))
+            and isinstance(steam_price, (int, float)) and epic_url):
+        return False, False
+    if not token or not chat_id:
+        return False, False
+    appid = game.get("appid")
+    name = game.get("name") or str(appid)
+    # Strictly cheaper only. Otherwise wipe any stale antispam so the next
+    # real undercut alerts fresh (evaluate_and_alert's own reset path only
+    # runs when we call it — and we deliberately don't, on equal/pricier).
+    if not (epic_price > 0 and epic_price < steam_price):
+        key = f"epic:{appid}:{name}"
+        return (state.pop(key, None) is not None), False
+    target_raw = (game.get("price_str") or f"{steam_price:.2f}").replace(
+        ",", ".")
+    info = {
+        "name": name, "appid": appid,
+        "display_name": name, "game_name": name, "market_hash_name": name,
+        "image_url": GAME_HEADER_IMAGE_URL.format(appid=appid) if appid
+        else "",
+        "alert_url": epic_url,
+        "button_text": t("tg.btn.open_epic"),
+        "lowest_price": epic_price,
+        "lowest_price_raw": (game.get("epic_price_str")
+                             or f"{epic_price:.2f}").replace(",", "."),
+        "target_price": steam_price,
+        "target_raw": target_raw,
+    }
+    state_dirty, did_alert, _reset, _reason = evaluate_and_alert(
+        kind="epic", info=info, state=state, token=token, chat_id=chat_id,
+        template=t("tg.message.epic_cheaper"),
+        repeat_if_lower=repeat_if_lower, remind_after_hours=remind_after_hours,
+        now=now, dnd_active=dnd_active,
+    )
+    return state_dirty, did_alert
+
+
 def evaluate_and_alert(*, kind: str, info: dict, state: dict,
                       token: str, chat_id: str, template: str,
                       repeat_if_lower: bool, remind_after_hours: int,
