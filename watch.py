@@ -44,6 +44,12 @@ _CLOSED_STATUSES = {"bought", "sold"}
 # state.json). When the wall clock is past that, the lock is gone.
 _RATE_LIMIT_KEY = "__rate_limited_until"
 
+# Reserved state.json key — ISO naive-UTC timestamp of the last games poll.
+# Cards are polled every run; games are throttled to schedule.games_interval_hours
+# (default 24h) because wishlist prices move far slower than market cards.
+_GAMES_LAST_CHECK_KEY = "__last_games_check"
+_DEFAULT_GAMES_INTERVAL_HOURS = 24
+
 # Default cooldown when Steam doesn't send a Retry-After header. 30 min is
 # a sensible middle ground — Steam's IP bans on priceoverview tend to last
 # anywhere from a few minutes to about an hour, and 30 min lets us recover
@@ -381,7 +387,7 @@ def _process_games(*, config, state, country,
 
     from steam import (fetch_game_info_batch, GAME_HEADER_IMAGE_URL,
                        GAME_STORE_URL)
-    from alerts import is_dnd_now
+    from alerts import is_dnd_now, maybe_alert_epic
     dnd_active = is_dnd_now(
         (config.get("notifications") or {}).get("dnd"), country)
     from alerts import evaluate_and_alert
@@ -389,6 +395,26 @@ def _process_games(*, config, state, country,
     log.info(t("log.checking", count=len(items)) + "  (games)")
     info = fetch_game_info_batch([g["appid"] for g in items],
                                  country=country)
+    log.info(t("log.games_steam_updated", count=len(info)))
+
+    # Epic prices for the games we'll actually look at (skip no_check /
+    # closed) — best-effort, batched with a polite delay. `epic_titles`
+    # lets us tell "polled, no match" from "never polled" below.
+    epic_titles = {g.get("name") for g in items
+                   if not g.get("no_check")
+                   and g.get("status") not in _CLOSED_STATUSES
+                   and g.get("name")}
+    epic_matches = {}
+    if epic_titles:
+        try:
+            import epic
+            locale = "uk" if country == "UA" else "en-US"
+            epic_matches = epic.fetch_epic_prices(
+                list(epic_titles), country=country, locale=locale)
+            log.info(t("log.games_epic_updated",
+                       matched=len(epic_matches), total=len(epic_titles)))
+        except Exception as exc:
+            log.warning("epic price lookup failed: %s", exc)
 
     state_dirty = False
     list_dirty = False
@@ -407,6 +433,33 @@ def _process_games(*, config, state, country,
         if d["name"] and g.get("name") != d["name"]:
             g["name"] = d["name"]
             list_dirty = True
+
+        # Fold in the Epic result for this title + the Epic-cheaper alert —
+        # only for titles actually polled for Epic this round (match →
+        # store; queried-but-unmatched → None / «---»). The alert is
+        # independent of any Steam discount (Epic can undercut a full-price
+        # Steam game) and muted rows (no_alert) skip it.
+        name = g.get("name")
+        if name in epic_titles:
+            m = epic_matches.get(name)
+            new_ep = (m["price"] if m else None)
+            new_es = (m["price_str"] if m else "")
+            new_eu = (m["url"] if m else "")
+            if (g.get("epic_price") != new_ep
+                    or g.get("epic_price_str") != new_es
+                    or g.get("epic_url") != new_eu):
+                g["epic_price"] = new_ep
+                g["epic_price_str"] = new_es
+                g["epic_url"] = new_eu
+                list_dirty = True
+            if not g.get("no_alert"):
+                esd, _edid = maybe_alert_epic(
+                    game=g, state=state, token=token, chat_id=chat_id,
+                    repeat_if_lower=repeat_if_lower,
+                    remind_after_hours=remind_after_hours,
+                    now=now, dnd_active=dnd_active)
+                if esd:
+                    state_dirty = True
 
         # Alert rule: ANY active sale (знижка > 0). The historical
         # minimum is NOT a gate — it only powers the 🔥 punch line and
@@ -553,17 +606,39 @@ def main():
     # is on, and never during a rate-limit cooldown armed above. Uses
     # the store API (separate rate budget from the market endpoints),
     # but skipping during a 429 keeps the whole run's behaviour simple.
+    #
+    # Unlike cards, games are throttled: prices move slowly and the Epic
+    # batch is the slowest part of the run, so we poll them at most once
+    # per `schedule.games_interval_hours` (default 24h). The last-poll
+    # stamp lives in state.json (`__last_games_check`).
     if ((config.get("ui") or {}).get("bonus_content")
             and _RATE_LIMIT_KEY not in state):
-        sd, ld = _process_games(
-            config=config, state=state, country=country,
-            template=template, token=token, chat_id=chat_id,
-            repeat_if_lower=repeat_if_lower,
-            remind_after_hours=remind_after_hours, now=now,
-        )
-        if sd:
+        games_interval_hours = float((config.get("schedule") or {}).get(
+            "games_interval_hours", _DEFAULT_GAMES_INTERVAL_HOURS))
+        last_raw = state.get(_GAMES_LAST_CHECK_KEY)
+        games_due = True
+        if last_raw:
+            try:
+                last_games = datetime.fromisoformat(last_raw)
+                games_due = (now - last_games) >= timedelta(
+                    hours=games_interval_hours)
+            except (TypeError, ValueError):
+                games_due = True  # malformed stamp → poll, then re-stamp
+        if games_due:
+            sd, ld = _process_games(
+                config=config, state=state, country=country,
+                template=template, token=token, chat_id=chat_id,
+                repeat_if_lower=repeat_if_lower,
+                remind_after_hours=remind_after_hours, now=now,
+            )
+            if sd:
+                state_changed = True
+            any_processed = any_processed or ld
+            state[_GAMES_LAST_CHECK_KEY] = now.isoformat()
             state_changed = True
-        any_processed = any_processed or ld
+        else:
+            log.info(t("log.games_skip_interval",
+                       hours=games_interval_hours))
 
     if state_changed:
         save_json(BASE / "state.json", state)

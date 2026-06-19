@@ -59,7 +59,10 @@ def send_alert(token: str, chat_id: str, item: dict, template: str) -> None:
     display_name = pretty_name(item)
     game_name = item.get("game_name") or ""
     price = item.get("lowest_price_raw") or str(item.get("lowest_price", "?"))
-    target = item.get("target_price", "?")
+    # `target_raw` lets a caller show a pre-formatted comparison price
+    # (e.g. the Epic-cheaper alert puts Steam's "743.00₴" here) while
+    # `target_price` stays numeric for the alert decision upstream.
+    target = item.get("target_raw") or item.get("target_price", "?")
     volume = item.get("volume") or "—"
     # `operation` comes from alerts.py — "buy" or "sell". Telegram has its
     # own i18n keys (tg.operation.*) — separate from History's operation.*
@@ -87,27 +90,30 @@ def send_alert(token: str, chat_id: str, item: dict, template: str) -> None:
         "operation":    html.escape(str(operation_label)),
     }
 
+    # Games sitting at their all-time low get a dedicated full message
+    # («🔥 МІНІМАЛЬНА ЦІНА • …»), NOT the regular sale template — the flag
+    # is set only by the games alert path, never the card paths. Everything
+    # else uses the caller's template.
+    tpl = (t("tg.message.at_minimum") if item.get("at_historical_min")
+           else template)
     try:
-        body = template.format(**safe)
+        body = tpl.format(**safe)
     except (KeyError, IndexError, ValueError):
-        # Fall back to the language default if the user's custom template
-        # has an unknown placeholder or stray brace — better than crashing
-        # the whole watch.py run.
+        # Fall back to the language default if a template has an unknown
+        # placeholder or stray brace — better than crashing the run.
         body = t("tg.message.default").format(**safe)
 
     # With the poster image above and the "Open in market" button below,
     # the URL doesn't need to live in the caption too — the button covers
     # both clicking and long-press-copy. Keeping the caption clean.
     text = body
-    # Game alerts at the all-time low get an extra punch line under the
-    # user template — the flag is set by the games alert path, never by
-    # the card paths.
-    if item.get("at_historical_min"):
-        text += "\n" + t("tg.at_minimum")
 
+    # Button label can be overridden (the Epic-cheaper alert says
+    # "Open on Epic" while pointing at the EGS page); defaults to market.
+    btn_text = item.get("button_text") or t("tg.btn.open_market")
     keyboard = {
         "inline_keyboard": [[
-            {"text": t("tg.btn.open_market"), "url": browser_url},
+            {"text": btn_text, "url": browser_url},
         ]]
     }
 

@@ -226,6 +226,11 @@ class App(tb.Window):
         # and red (bad_match / error) — Steam just told us to back off,
         # the card isn't broken, we just couldn't poll it this round.
         "rate_limited": {"background": "#5D5119", "foreground": "#F5E9C0"},
+        # Epic is cheaper than Steam right now — the «Ігри» tab paints the
+        # whole row gold (Treeview can't tint a single cell) and the Epic
+        # cell carries a 🔻 so the signal reads even on a busy screen.
+        # Brighter than rate_limited's muted gold so the two don't blur.
+        "epic_cheaper": {"background": "#6b5410", "foreground": "#ffe9a8"},
         "even":     {},   # placeholder — filled in _configure_styles()
         "odd":      {},
         "selected": {},   # placeholder — appended last to win tag priority
@@ -1018,11 +1023,17 @@ class App(tb.Window):
                 return (group, val.casefold())
             pairs.sort(key=text_key, reverse=descending)
         else:
+            # "---" is the Epic "no confident match" placeholder; treat it
+            # like the em-dash empty marker so it never bunches mid-list.
+            _empties = ("", "—", "---", None)
+
             def key(pair):
                 val = pair[0]
-                if val is None or val in ("", "—"):
+                if val is None or val in _empties:
                     return (2, "")  # always at the end
-                num = _try_parse_money(val)
+                # 🔥 prefix marks an Epic-cheaper cell — strip it so the
+                # number still parses for the numeric sort.
+                num = _try_parse_money(val.lstrip("🔥 "))
                 if num is not None:
                     return (0, num)
                 return (1, str(val).lower())
@@ -1032,8 +1043,8 @@ class App(tb.Window):
             # The (2, "") tie-key already does that on the way up; on the way
             # down `reverse=True` would put them first, so we segregate.
             if descending:
-                empties = [p for p in pairs if p[0] in ("", "—", None)]
-                others = [p for p in pairs if p[0] not in ("", "—", None)]
+                empties = [p for p in pairs if p[0] in _empties]
+                others = [p for p in pairs if p[0] not in _empties]
                 pairs = others + empties
 
         for i, (_, iid) in enumerate(pairs):
@@ -3182,6 +3193,18 @@ class App(tb.Window):
         code = self.config_data.get("market", {}).get("currency", 18)
         return currency_symbol(code, fallback="")
 
+    def _fmt_money(self, value, *, signed: bool = False) -> str:
+        """Format a price the way Steam itself does — a (non-breaking) space
+        thousands separator + dot decimal + currency symbol: «2 999.00₴».
+        Used for every price cell across the tabs so they read uniformly.
+        Returns «—» for anything that isn't a number; `signed` keeps the
+        leading +/- for the spread column.
+        """
+        if not isinstance(value, (int, float)):
+            return "—"
+        fmt = f"{value:+,.2f}" if signed else f"{value:,.2f}"
+        return fmt.replace(",", " ") + self._currency_symbol()
+
     def _local_now_iso(self) -> str:
         """Now() as a naive ISO string in the profile country's local time.
 
@@ -3406,7 +3429,8 @@ class App(tb.Window):
         for col, text, width in headings:
             if col in ("target", "last", "spread"):
                 anchor = E
-            elif col in ("num", "link", "imported", "no_check", "no_alert"):
+            elif col in ("num", "status", "link", "imported",
+                         "no_check", "no_alert"):
                 anchor = CENTER
             else:
                 anchor = W
@@ -3689,7 +3713,7 @@ class App(tb.Window):
             # Append the currency symbol to the target value (like the
             # neighbouring "Поточна"/last column) now that the heading no
             # longer carries it.
-            target_str = (f"{target:.2f}{self._currency_symbol()}"
+            target_str = (self._fmt_money(target)
                           if isinstance(target, (int, float)) else str(target))
 
             # Spread = last_seen − target. "+" means above target (waiting),
@@ -3699,7 +3723,7 @@ class App(tb.Window):
             target_num = target if isinstance(target, (int, float)) else None
             if last_num is not None and target_num is not None:
                 diff = last_num - target_num
-                spread_str = f"{diff:+.2f}{self._currency_symbol()}"
+                spread_str = self._fmt_money(diff, signed=True)
 
             # display_name and game_name are normally written by the metadata
             # fetcher (on add or in the background refresh). For rows that
@@ -3895,19 +3919,25 @@ class App(tb.Window):
     # Lives behind the «Бонусний контент» Settings checkbox: hiding the
     # tab stops polling/alerts but keeps gamelist.json intact.
 
-    _GAMES_LINK_COL_ID = "#8"   # «Посилання» column in the games tree
+    # Column ids in the games tree (1-based "#n", order = `cols` below):
+    # num#1 name#2 regular#3 minimum#4 discount#5 price#6 epic#7 status#8
+    # link#9 imported#10 no_check#11 no_alert#12
+    _GAMES_LINK_COL_ID = "#9"   # «Посилання» («Steam | Epic», clickable)
 
     def _build_games_tab(self) -> None:
         parent = self.tab_games
-        cols = ("num", "name", "regular", "discount", "price", "minimum",
-                "status", "link", "imported", "no_check", "no_alert")
+        # Order per user spec: Ціна → Мінімальна → Знижка → Поточна Steam →
+        # Поточна Epic.
+        cols = ("num", "name", "regular", "minimum", "discount", "price",
+                "epic", "status", "link", "imported", "no_check", "no_alert")
         headings = [
             ("num",      "col.num",            40),
             ("name",     "col.games.name",    280),
             ("regular",  "col.games.regular", 90),
+            ("minimum",  "col.games.minimum", 100),
             ("discount", "col.games.discount", 80),
             ("price",    "col.games.price",   100),
-            ("minimum",  "col.games.minimum", 100),
+            ("epic",     "col.games.epic",    110),
             ("status",   "col.status",        110),
             ("link",     "col.link",          110),
             ("imported", "col.imported",       55),
@@ -3923,9 +3953,9 @@ class App(tb.Window):
         tree = ttk.Treeview(tree_frame, columns=cols, show="headings",
                             selectmode="extended")
         for col, key, width in headings:
-            if col in ("price", "minimum", "regular"):
+            if col in ("price", "minimum", "regular", "epic"):
                 anchor = E
-            elif col in ("num", "discount", "link", "imported",
+            elif col in ("num", "discount", "status", "link", "imported",
                          "no_check", "no_alert"):
                 anchor = CENTER
             else:
@@ -3969,6 +3999,9 @@ class App(tb.Window):
                    bootstyle="warning").pack(side=LEFT, padx=2)
         ttk.Button(row1, text=t("btn.games_import_lows"),
                    command=self._games_import_lows,
+                   bootstyle="warning").pack(side=LEFT, padx=2)
+        ttk.Button(row1, text=t("btn.games_import_epic"),
+                   command=self._games_import_epic,
                    bootstyle="warning").pack(side=LEFT, padx=2)
         ttk.Button(row1, text=t("btn.check_now"),
                    command=self._games_check_now).pack(side=LEFT, padx=2)
@@ -4048,11 +4081,31 @@ class App(tb.Window):
             if status == f"status.value.{raw_status}":
                 status = raw_status
             zebra = "even" if i % 2 == 0 else "odd"
-            # Row tint: RED when the price is at the all-time low (act
-            # now!), GREEN when any sale is on, zebra otherwise. The
-            # red check requires a real discount so never-discounted
-            # games (minimum == regular) don't light up.
-            if (disc > 0 and (g.get("lowest_cut") or 0) > 0
+            # Epic price cell + "is it cheaper than Steam?" check. Three
+            # states: key absent → never polled («—»); explicit None →
+            # polled but no confident match («---»); a number → show it
+            # with a dot decimal and our currency symbol (Epic's own
+            # string uses a comma + may differ in symbol).
+            epic_price = g.get("epic_price")
+            epic_cheaper = (isinstance(epic_price, (int, float))
+                            and isinstance(price, (int, float))
+                            and epic_price < price)
+            if "epic_price" not in g:
+                epic_cell = "—"
+            elif epic_price is None:
+                epic_cell = "---"
+            else:
+                epic_cell = self._fmt_money(epic_price)
+                if epic_cheaper:
+                    epic_cell = f"🔥 {epic_cell}"
+            # Row tint, highest priority first: GOLD when Epic undercuts
+            # Steam (the new actionable signal — buy it there), then RED
+            # at the all-time Steam low, GREEN on any sale, zebra otherwise.
+            # Red requires a real discount so never-discounted games don't
+            # light up.
+            if epic_cheaper:
+                row_tag = "epic_cheaper"
+            elif (disc > 0 and (g.get("lowest_cut") or 0) > 0
                     and isinstance(price, (int, float))
                     and isinstance(minimum, (int, float))
                     and price <= minimum):
@@ -4061,18 +4114,22 @@ class App(tb.Window):
                 row_tag = "good_match"
             else:
                 row_tag = zebra
+            # «Посилання» holds two clickable halves: «Steam | Epic».
+            # The Epic half only shows when we matched an EGS page — the
+            # click handler splits the cell by its midpoint.
+            link_cell = "Steam | Epic" if g.get("epic_url") else "Steam"
             tree.insert(
                 "", END, iid=g["id"],
                 values=(
                     i + 1,
                     g.get("name") or f"app {g.get('appid')}",
-                    f"{regular:.2f}{sym}" if isinstance(regular, (int, float))
-                    else "—",
+                    self._fmt_money(regular),
+                    self._fmt_money(minimum),
                     f"-{disc}%" if disc else "—",
                     (g.get("price_str") or "—").replace(",", "."),
-                    f"{minimum:.2f}{sym}" if minimum is not None else "—",
+                    epic_cell,
                     status,
-                    t("col.link.open"),
+                    link_cell,
                     "📥" if g.get("imported") else "",
                     "🚫" if g.get("no_check") else "",
                     "🔇" if g.get("no_alert") else "",
@@ -4118,23 +4175,38 @@ class App(tb.Window):
 
     def _on_games_click(self, event):
         tree = event.widget
-        if (tree.identify_region(event.x, event.y) == "cell"
-                and tree.identify_column(event.x) == self._GAMES_LINK_COL_ID):
-            iid = tree.identify_row(event.y)
-            if iid:
-                items = load_json(GAMELIST_PATH, []) or []
-                g = next((x for x in items if x.get("id") == iid), None)
-                if g:
-                    from steam import GAME_STORE_URL
-                    webbrowser.open(GAME_STORE_URL.format(appid=g["appid"]))
+        if tree.identify_region(event.x, event.y) != "cell":
+            return
+        col = tree.identify_column(event.x)
+        # Only «Посилання» is clickable — the Epic *price* cell is not a
+        # link (the Epic page lives in the «Steam | Epic» link column).
+        if col != self._GAMES_LINK_COL_ID:
+            return
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        items = load_json(GAMELIST_PATH, []) or []
+        g = next((x for x in items if x.get("id") == iid), None)
+        if not g:
+            return
+        # «Steam | Epic» — open Epic when the click lands on the right half
+        # AND we actually have an Epic page; otherwise Steam.
+        epic_url = g.get("epic_url")
+        bbox = tree.bbox(iid, col)
+        on_epic_half = (epic_url and bbox
+                        and (event.x - bbox[0]) > bbox[2] / 2)
+        if on_epic_half:
+            webbrowser.open(epic_url)
+        else:
+            from steam import GAME_STORE_URL
+            webbrowser.open(GAME_STORE_URL.format(appid=g["appid"]))
 
     def _on_games_motion(self, event):
         tree = event.widget
-        in_link = (
-            tree.identify_region(event.x, event.y) == "cell"
-            and tree.identify_column(event.x) == self._GAMES_LINK_COL_ID
-            and tree.identify_row(event.y)
-        )
+        col = (tree.identify_column(event.x)
+               if tree.identify_region(event.x, event.y) == "cell" else None)
+        iid = tree.identify_row(event.y)
+        in_link = bool(iid) and col == self._GAMES_LINK_COL_ID
         tree.configure(cursor="hand2" if in_link else "")
 
     def _show_games_context_menu(self, event) -> None:
@@ -4151,6 +4223,8 @@ class App(tb.Window):
                          command=self._games_check_now)
         menu.add_command(label=t("ctx.update_min"),
                          command=self._games_update_min_selected)
+        menu.add_command(label=t("btn.games_import_epic"),
+                         command=self._games_import_epic)
         menu.add_command(label=t("ctx.open_store"),
                          command=self._games_open_store)
         menu.add_separator()
@@ -4776,22 +4850,94 @@ class App(tb.Window):
             self._set_status(t("status.games_empty"))
             return
         appids = [g["appid"] for g in targets]
-        self._set_status(t("status.checking_multi", count=len(appids)))
+        # Epic is matched by name — gather the queried titles so the apply
+        # step can tell "polled, no match" («---») from "never polled" («—»).
+        epic_titles = [g.get("name") for g in targets if g.get("name")]
+        self._set_status(t("status.checking_games_multi", count=len(appids)))
 
         def worker():
             import steam as steam_mod
+            country = (self.config_data.get("market") or {}).get("country",
+                                                                 "UA")
             try:
-                info = steam_mod.fetch_game_info_batch(
-                    appids,
-                    country=(self.config_data.get("market") or {})
-                    .get("country", "UA"),
-                )
+                info = steam_mod.fetch_game_info_batch(appids, country=country)
             except Exception as e:
                 log.error("games price check failed: %s", e)
                 self.after(0, lambda err=str(e): self._set_status(
                     t("status.games_import_error", err=err)))
                 return
+            # Apply the Steam prices IMMEDIATELY — the Epic batch below is
+            # rate-paced (~0.8 s/title) and would otherwise hold the table
+            # frozen for minutes on a big selection. Steam shows now; Epic
+            # trickles in as a second pass. («Імпорт цін з Epic» is the
+            # same fetch on its own button, for when you want Epic alone.)
+            log.info(t("log.games_steam_updated", count=len(info)))
             self.after(0, lambda: self._games_apply_check(info))
+            epic_matches = {}
+            try:
+                import epic
+                locale = "uk" if country == "UA" else "en-US"
+                epic_matches = epic.fetch_epic_prices(
+                    epic_titles, country=country, locale=locale)
+            except Exception as e:
+                log.warning("epic price lookup failed: %s", e)
+            log.info(t("log.games_epic_updated",
+                       matched=len(epic_matches), total=len(epic_titles)))
+            self.after(0, lambda: self._games_apply_check(
+                {}, epic_matches=epic_matches,
+                epic_titles=set(epic_titles), quiet=True))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _games_import_epic(self) -> None:
+        """Fetch Epic prices for the selected games (or all when none picked).
+
+        Decoupled from the Steam refresh on purpose: the Epic batch is
+        rate-paced (~0.8 s/title) so on the full wishlist it takes minutes
+        — running it on its own button keeps «Перевірити зараз» snappy.
+        no_check rows are skipped. Writes the «Поточна Epic» column + fires
+        the Epic-cheaper Telegram alerts via the shared apply path.
+        """
+        sel = self._games_selected()
+        items_all = load_json(GAMELIST_PATH, []) or []
+        targets = [g for g in (sel or items_all)
+                   if not g.get("no_check")
+                   and g.get("status") not in CLOSED_STATUSES
+                   and g.get("name")]
+        if not targets:
+            self._set_status(t("status.games_empty"))
+            return
+        titles = [g["name"] for g in targets]
+        self._set_status(t("status.epic_checking", count=len(titles)))
+
+        def worker():
+            country = (self.config_data.get("market") or {}).get("country",
+                                                                 "UA")
+            epic_matches = {}
+            try:
+                import epic
+                locale = "uk" if country == "UA" else "en-US"
+                epic_matches = epic.fetch_epic_prices(
+                    titles, country=country, locale=locale)
+            except Exception as e:
+                log.warning("epic price lookup failed: %s", e)
+                self.after(0, lambda err=str(e): self._set_status(
+                    t("status.games_import_error", err=err)))
+                return
+            log.info(t("log.games_epic_updated",
+                       matched=len(epic_matches), total=len(titles)))
+
+            def finish():
+                # Empty `info` — prices already on record; this pass only
+                # folds in Epic + fires Epic-cheaper alerts. quiet=True so
+                # we own the status line below.
+                self._games_apply_check(
+                    {}, epic_matches=epic_matches,
+                    epic_titles=set(titles), quiet=True)
+                self._set_status(t("status.epic_done",
+                                   matched=len(epic_matches),
+                                   total=len(titles)))
+            self.after(0, finish)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -4799,7 +4945,9 @@ class App(tb.Window):
                            evaluate_stored: bool = False,
                            force_at_min: bool = False,
                            only_appids: set[int] | None = None,
-                           quiet: bool = False) -> None:
+                           quiet: bool = False,
+                           epic_matches: dict | None = None,
+                           epic_titles: set | None = None) -> None:
         """Apply freshly polled prices + run the alert evaluation.
 
         `evaluate_stored=True` runs the alert pass over rows that have
@@ -4814,7 +4962,7 @@ class App(tb.Window):
         was already alerted earlier under a plain-sale rule. One-shot
         per import click — the evaluation re-arms antispam right after.
         """
-        from alerts import evaluate_and_alert, is_dnd_now
+        from alerts import evaluate_and_alert, is_dnd_now, maybe_alert_epic
         from steam import GAME_HEADER_IMAGE_URL, GAME_STORE_URL
 
         items = load_json(GAMELIST_PATH, []) or []
@@ -4845,7 +4993,42 @@ class App(tb.Window):
                 g["price_str"] = d["price_str"]
                 g["regular"] = d["regular"]
                 g["discount_pct"] = d["discount_pct"]
-            elif not evaluate_stored:
+            # Fold in Epic results for titles we queried this round — and
+            # the Epic-cheaper alert — BEFORE the no-fresh-price skip below,
+            # so the second (Epic-only) pass of the manual refresh can fill
+            # these in even though `info` is empty. A match → store
+            # price/url; queried-but-unmatched → None (renders «---»);
+            # never-queried games keep whatever they had.
+            # Only for games actually polled for Epic THIS round — gating
+            # by name is what keeps a one-game «Оновити зараз» from firing
+            # Epic alerts for the whole list off stale stored prices.
+            if epic_titles is not None and g.get("name") in epic_titles:
+                name = g.get("name")
+                m = (epic_matches or {}).get(name)
+                if m:
+                    g["epic_price"] = m["price"]
+                    g["epic_price_str"] = m["price_str"]
+                    g["epic_url"] = m["url"]
+                else:
+                    g["epic_price"] = None
+                    g["epic_price_str"] = ""
+                    g["epic_url"] = ""
+                # Epic-cheaper alert (independent of any Steam discount —
+                # Epic can undercut a full-price Steam game). Fresh data
+                # only; muted rows (no_alert) skip it.
+                if not g.get("no_alert"):
+                    esd, edid = maybe_alert_epic(
+                        game=g, state=state, token=token, chat_id=chat_id,
+                        repeat_if_lower=spam.get("repeat_if_lower", True),
+                        remind_after_hours=spam.get("remind_after_hours", 24),
+                        now=now_dt, dnd_active=dnd_active)
+                    if esd:
+                        state_dirty = True
+                    if edid:
+                        alerted += 1
+            # No fresh Steam price this round and not re-evaluating stored
+            # ones → nothing left to do for this row (Epic, if any, done).
+            if not d and not evaluate_stored:
                 continue
             minimum = self._game_minimum(g)
             # Alert rule: ANY active sale (знижка > 0). The historical
@@ -7206,6 +7389,18 @@ class App(tb.Window):
         ).grid(row=2, column=3, sticky=W, pady=4)
         right_label("lbl.interval", 2)
 
+        # Games are polled far less often than cards — their prices move
+        # slowly and the Epic batch is heavy — so they get a SEPARATE
+        # interval in HOURS (default 24). watch.py gates the games poll
+        # on it via the __last_games_check stamp in state.json.
+        self.var_games_interval = tk.IntVar(
+            value=sched.get("games_interval_hours", 24))
+        ttk.Spinbox(
+            cols, from_=1, to=168, textvariable=self.var_games_interval,
+            width=4,
+        ).grid(row=3, column=3, sticky=W, pady=4)
+        right_label("lbl.games_interval", 3)
+
         # Pause between price-fetch requests inside one batch. Right
         # next to "Interval" — both knobs concern Steam-polling cadence.
         self.var_poll_delay = tk.DoubleVar(
@@ -7214,8 +7409,8 @@ class App(tb.Window):
         ttk.Spinbox(
             cols, from_=0.5, to=10.0, increment=0.1, format="%.1f",
             textvariable=self.var_poll_delay, width=4,
-        ).grid(row=3, column=3, sticky=W, pady=4)
-        right_label("lbl.poll_delay", 3)
+        ).grid(row=4, column=3, sticky=W, pady=4)
+        right_label("lbl.poll_delay", 4)
 
         # «Не турбувати» — masked __:__ - __:__ window. While the current
         # local time is inside it, Telegram alerts are suppressed (see
@@ -7227,9 +7422,9 @@ class App(tb.Window):
         if dnd_cfg.get("from") and dnd_cfg.get("to"):
             dnd_init = f"{dnd_cfg['from']} - {dnd_cfg['to']}"
         self.dnd_entry = ttk.Entry(cols, width=13, justify=CENTER)
-        self.dnd_entry.grid(row=4, column=3, sticky=W, pady=4)
+        self.dnd_entry.grid(row=5, column=3, sticky=W, pady=4)
         self._install_time_mask(self.dnd_entry, dnd_init)
-        right_label("lbl.dnd", 4)
+        right_label("lbl.dnd", 5)
 
         self.var_remind_hours = tk.IntVar(
             value=spam.get("remind_after_hours", 24),
@@ -7237,8 +7432,8 @@ class App(tb.Window):
         ttk.Spinbox(
             cols, from_=1, to=168, textvariable=self.var_remind_hours,
             width=4,
-        ).grid(row=5, column=3, sticky=W, pady=4)
-        right_label("lbl.antispam_hours", 5)
+        ).grid(row=6, column=3, sticky=W, pady=4)
+        right_label("lbl.antispam_hours", 6)
 
         # "Повторити, якщо нижче" — single row spanning both right
         # columns. The custom check exists because ttkbootstrap's
@@ -7248,7 +7443,7 @@ class App(tb.Window):
             value=spam.get("repeat_if_lower", True),
         )
         repeat_holder = ttk.Frame(cols)
-        repeat_holder.grid(row=6, column=3, columnspan=2,
+        repeat_holder.grid(row=7, column=3, columnspan=2,
                            sticky=W, pady=4, padx=(0, 0))
         self._make_scalable_check(repeat_holder,
                                   self.var_repeat_lower).pack(side=LEFT)
@@ -7266,6 +7461,8 @@ class App(tb.Window):
         )
         # Sits in the LEFT column, right under «Debug log» (row 7), styled
         # like the other left-column checkboxes (label → check, right-aligned).
+        # Same row as «Повторити, якщо нижче» (right column) — left col,
+        # so the two checkboxes share a line and the form stays compact.
         bonus_holder = ttk.Frame(cols)
         bonus_holder.grid(row=7, column=0, columnspan=2,
                           sticky=E, pady=4)
@@ -8032,6 +8229,7 @@ class App(tb.Window):
             },
             "schedule": {
                 "interval_minutes": self.var_interval.get(),
+                "games_interval_hours": self.var_games_interval.get(),
             },
             "ui": {
                 "theme": self.var_theme.get(),
@@ -8325,6 +8523,7 @@ class App(tb.Window):
             "country":           "UA",
             "poll_delay_sec":    1.5,
             "interval_minutes":  5,
+            "games_interval_hours": 24,
             "theme":             "superhero",
             "language":          "en",
             "font_scale":        1,
@@ -8349,6 +8548,7 @@ class App(tb.Window):
         )
         self.var_poll_delay.set(defaults["poll_delay_sec"])
         self.var_interval.set(defaults["interval_minutes"])
+        self.var_games_interval.set(defaults["games_interval_hours"])
         self.var_theme.set(defaults["theme"])
 
         # Language: var stores display name, not ISO code.
@@ -8910,7 +9110,12 @@ class App(tb.Window):
         purchases = load_json(PURCHASES_PATH, [])
         for row_index, p in enumerate(reversed(purchases)):
             ts = p.get("timestamp", "")[:19].replace("T", " ")
-            price_str = str(p.get("price", "—"))
+            # Stored as a formatted string ("63.00 ₴"); re-derive the number
+            # and re-render with the shared money format so the thousands
+            # space matches every other table.
+            _amt = _try_parse_money(p.get("price"))
+            price_str = (self._fmt_money(_amt) if _amt is not None
+                         else str(p.get("price", "—")))
             display_name = pretty_name(p)
             game_name = p.get("game_name") or "—"
             # Operation defaults to "buy" for legacy purchase records that
@@ -8962,9 +9167,8 @@ class App(tb.Window):
         spent = total_buy - total_sell
 
         if hasattr(self, "lbl_total_buy"):
-            sym = self._currency_symbol()
-            self.lbl_total_buy.configure(text=f"{total_buy:.2f} {sym}")
-            self.lbl_total_sell.configure(text=f"{total_sell:.2f} {sym}")
+            self.lbl_total_buy.configure(text=self._fmt_money(total_buy))
+            self.lbl_total_sell.configure(text=self._fmt_money(total_sell))
             # Spent: green-ish if positive (we earned more than spent? no —
             # actually spent = buy - sell, so negative means we earned).
             # Per the user's mock-up, negative goes red.
@@ -8973,7 +9177,7 @@ class App(tb.Window):
             # `−X` means lost. Colour matches: red on a loss, green on a
             # gain, neutral when even.
             display = -spent
-            self.lbl_spent.configure(text=f"{display:+.2f} {sym}")
+            self.lbl_spent.configure(text=self._fmt_money(display, signed=True))
             if spent > 0:        # purchases outweigh sales → loss
                 self.lbl_spent.configure(foreground="#FF6B6B")
             elif spent < 0:      # sales outweigh purchases → gain
