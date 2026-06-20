@@ -625,6 +625,17 @@ def main():
             except (TypeError, ValueError):
                 games_due = True  # malformed stamp → poll, then re-stamp
         if games_due:
+            # Stamp the "games checked now" marker and FLUSH it to disk
+            # BEFORE the (multi-minute) games poll, not after. The Epic
+            # batch makes a games run take far longer than the 5-minute
+            # scheduler interval, so without an up-front stamp the next
+            # overlapping run reads stale state, still sees games as "due",
+            # and re-alerts the whole list (observed: 3 overlapping runs
+            # flooded alerts 3× before the first finished). Claiming the
+            # slot first lets later runs skip cleanly.
+            state[_GAMES_LAST_CHECK_KEY] = now.isoformat()
+            save_json(BASE / "state.json", state)
+            state_changed = True
             sd, ld = _process_games(
                 config=config, state=state, country=country,
                 template=template, token=token, chat_id=chat_id,
@@ -634,8 +645,6 @@ def main():
             if sd:
                 state_changed = True
             any_processed = any_processed or ld
-            state[_GAMES_LAST_CHECK_KEY] = now.isoformat()
-            state_changed = True
         else:
             log.info(t("log.games_skip_interval",
                        hours=games_interval_hours))
