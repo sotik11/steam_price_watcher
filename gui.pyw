@@ -4227,6 +4227,8 @@ class App(tb.Window):
                          command=self._games_import_epic)
         menu.add_command(label=t("ctx.open_store"),
                          command=self._games_open_store)
+        menu.add_command(label=t("ctx.copy_link"),
+                         command=self._games_copy_link)
         menu.add_separator()
         menu.add_command(label=t("btn.no_check"),
                          command=lambda: self._toggle_flag("game", "no_check"))
@@ -4329,6 +4331,14 @@ class App(tb.Window):
         if sel:
             from steam import GAME_STORE_URL
             webbrowser.open(GAME_STORE_URL.format(appid=sel[0]["appid"]))
+
+    def _games_copy_link(self) -> None:
+        """Copy the first selected game's Steam Store URL to clipboard."""
+        sel = self._games_selected()
+        if not sel:
+            return
+        from steam import GAME_STORE_URL
+        self._copy_to_clipboard(GAME_STORE_URL.format(appid=sel[0]["appid"]))
 
     # ---- actions -----------------------------------------------------
 
@@ -5403,6 +5413,11 @@ class App(tb.Window):
             command=self._open_selected_market_link,
             state=_state_of("check"),  # same gate: needs a selection
         )
+        menu.add_command(
+            label=t("ctx.copy_link"),
+            command=self._copy_selected_market_link,
+            state=_state_of("check"),
+        )
         menu.add_separator()
         menu.add_command(
             label=t("btn.edit_target"),
@@ -5460,6 +5475,39 @@ class App(tb.Window):
             state=_state_of("remove"),
         )
         return menu
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        """Replace the clipboard with `text` and force Tk to publish it.
+
+        `clipboard_clear` + `clipboard_append` alone leaves the value in
+        Tk's internal buffer — it disappears when the app exits. The
+        `update()` flushes it to the OS clipboard so external programs
+        (browser, IDE) actually see it.
+        """
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            self._set_status(t("status.link_copied"))
+        except tk.TclError:
+            pass
+
+    def _copy_selected_market_link(self) -> None:
+        """Copy the first selected card's Steam Market URL to clipboard."""
+        tree = self._active_tree()
+        if tree is None:
+            return
+        sel = tree.selection()
+        if not sel:
+            return
+        kind = "buy" if tree is self.list_trees.get("buy") else "sell"
+        items = load_json(self._kind_path(kind), []) or []
+        item = next((x for x in items if x.get("id") == sel[0]), None)
+        if not item:
+            return
+        from steam import market_url
+        self._copy_to_clipboard(
+            market_url(item["appid"], item["market_hash_name"]))
 
     def _open_selected_market_link(self) -> None:
         """Open the first selected card's Steam Market listing URL.
@@ -5623,8 +5671,12 @@ class App(tb.Window):
         # that the card is already there so I don't accidentally add it
         # twice. The sell list intentionally allows duplicates: I might
         # be selling 3 copies of the same card and want to track each one.
+        # CLOSED (bought) rows don't count — they live in the file only for
+        # History lineage; the user is re-adding a finished card on purpose.
         if kind == "buy" and any(
-                x.get("market_hash_name") == market_hash_name for x in items):
+                x.get("market_hash_name") == market_hash_name
+                and x.get("status") not in CLOSED_STATUSES
+                for x in items):
             messagebox.showinfo(
                 t("dlg.already.title"),
                 t("dlg.already.body", name=pretty),
@@ -8791,10 +8843,10 @@ class App(tb.Window):
 
         self.hist_tree = ttk.Treeview(hist_frame, columns=cols, show="headings", selectmode="extended")
         for col, label_key, width in [
-            ("num",       "col.num",       40),
-            ("date",      "col.date",     140),
-            ("name",      "col.card",     220),
-            ("game",      "col.game",     170),
+            ("num",       "col.num",        40),
+            ("date",      "col.date",      140),
+            ("name",      "col.hist.card", 220),
+            ("game",      "col.hist.name", 170),
             ("operation", "col.operation", 90),
             ("price",     "col.price",     90),
             ("link",      "col.link",     110),
@@ -9287,6 +9339,22 @@ class App(tb.Window):
         from steam import market_url
         webbrowser.open(market_url(p["appid"], p.get("market_hash_name", p.get("name"))))
 
+    def _hist_copy_link(self) -> None:
+        """Copy the first selected history row's URL — market or store
+        (game purchases) depending on the record kind, same rule as the
+        click-on-link handler above."""
+        p = self._hist_selected()
+        if not p:
+            return
+        if p.get("kind") == "game":
+            from steam import GAME_STORE_URL
+            url = GAME_STORE_URL.format(appid=p["appid"])
+        else:
+            from steam import market_url
+            url = market_url(p["appid"],
+                             p.get("market_hash_name", p.get("name")))
+        self._copy_to_clipboard(url)
+
     def _on_hist_tree_motion(self, event):
         """Hand cursor when hovering the link column."""
         in_link = (
@@ -9446,6 +9514,8 @@ class App(tb.Window):
         menu = tk.Menu(self, tearoff=0, font=self._context_menu_font())
         menu.add_command(label=t("btn.history_market_log"),
                          command=self._open_market_history)
+        menu.add_command(label=t("ctx.copy_link"),
+                         command=self._hist_copy_link)
         menu.add_command(label=t("btn.history_export"),
                          command=self._hist_export_csv)
         menu.add_separator()

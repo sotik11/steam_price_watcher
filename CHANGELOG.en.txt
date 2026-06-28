@@ -1,6 +1,14 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.3.2 (2026-06-20)
+- Fixed: re-adding a card after buying/selling it — the program said
+  "already in the list" because it counted closed (bought) history rows
+  as active.
+- "Copy link" added to the right-click menu on Purchases, Sales and
+  History tabs.
+- History column rename: "Card" → "Card/Game", "Game name" → "Name".
+
 v0.1.3.1 (2026-06-20)
 - Fixed duplicate (triple) game notifications: a games run with the Epic
   batch takes longer than the 5-minute scheduler interval, so overlapping
