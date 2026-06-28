@@ -11,8 +11,19 @@ watch.log
 watch.log.*
 cookie_helper.log
 
+# Persönal runtime data (Steam wishlist / purchases / watchlists) — не публикуем
+gamelist.json
+gameblacklist.json
+purchases.json
+salelist.json
+watchlist.json
+
 # Шаблоны конфигов — коммитим
 !config.example.json
+
+# Internal docs — не для публичного репо
+CLAUDE.md
+DESIGN.md
 
 # Артефакты сборки инсталлятора
 installer/python/        # скачанный bundled Python (~27 МБ)
