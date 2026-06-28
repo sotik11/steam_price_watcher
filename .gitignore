@@ -25,8 +25,14 @@ watchlist.json
 CLAUDE.md
 DESIGN.md
 
-# Артефакты сборки инсталлятора
-installer/python/        # скачанный bundled Python (~27 МБ)
-installer/dist/          # собранные Setup .exe
-installer/*.exe          # любые собранные .exe в корне installer
-preview/                 # скриншоты и dev-утилиты, не для публикации
+# Артефакты сборки инсталлятора (.gitignore НЕ поддерживает inline-#
+# комментарии — комментарий должен быть на отдельной строке, иначе
+# пробелы+комментарий становятся частью паттерна и он не матчит).
+# installer/python/  — скачанный bundled Python (~27 МБ)
+# installer/dist/    — собранные Setup .exe
+# installer/*.exe    — любые собранные .exe в корне installer
+# preview/           — скриншоты и dev-утилиты, не для публикации
+installer/python/
+installer/dist/
+installer/*.exe
+preview/
