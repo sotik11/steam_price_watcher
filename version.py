@@ -15,4 +15,4 @@ __version__ = "0.1.3.2"
 
 # Author / contact shown on the About tab.
 APP_AUTHOR = "sotik + claude"
-APP_CONTACT = "sotik@sanwell.biz"
+APP_CONTACT = "sotik11@gmail.com"
