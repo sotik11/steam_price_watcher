@@ -402,6 +402,7 @@
   "log.reason.first_alert":   "first alert",
   "log.reason.price_dropped": "price dropped further: {now:.2f} < {prev:.2f}",
   "log.reason.reminder":      "reminder after {hours}h",
+  "log.reason.skip_reminder_same_price": "{name}: reminder skipped — price unchanged ({price:.2f})",
 
   "log.priceoverview_fail":   "priceoverview FAILED {name} after {elapsed:.2f}s: {err}",
   "log.priceoverview_ok":     "priceoverview {name:<40}  {elapsed:.2f}s  HTTP {status}  {bytes} bytes",

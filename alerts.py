@@ -201,8 +201,19 @@ def evaluate_and_alert(*, kind: str, info: dict, state: dict,
         try:
             last_time = datetime.fromisoformat(last_alert_time_str)
             if now - last_time > timedelta(hours=remind_after_hours):
-                should_alert = True
-                reason = t("log.reason.reminder", hours=remind_after_hours)
+                # For games (and their Epic-cheaper pass) sales stay live for
+                # ~a week with the SAME price — the reminder branch that's
+                # useful for card prices (which move intraday) just spams the
+                # user daily on an unchanged offer. Skip when nothing moved;
+                # first_alert / repeat_if_lower still fire on genuine changes.
+                if (kind in ("game", "epic")
+                        and lowest == last_alerted_price):
+                    log.info(t("log.reason.skip_reminder_same_price",
+                               name=pretty, price=lowest))
+                else:
+                    should_alert = True
+                    reason = t("log.reason.reminder",
+                               hours=remind_after_hours)
         except ValueError:
             # Malformed timestamp — treat as "no last alert", let next
             # branch's plain "first_alert" handle it next call. Don't

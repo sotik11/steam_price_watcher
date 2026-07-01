@@ -11,7 +11,7 @@ The About tab and (when synced) the installer read this value.
 """
 
 APP_NAME = "Steam Price Watcher"
-__version__ = "0.1.3.2"
+__version__ = "0.1.3.3"
 
 # Author / contact shown on the About tab.
 APP_AUTHOR = "sotik + claude"

@@ -402,6 +402,7 @@
   "log.reason.first_alert":   "перше сповіщення",
   "log.reason.price_dropped": "ціна знизилась далі: {now:.2f} < {prev:.2f}",
   "log.reason.reminder":      "нагадування через {hours} год",
+  "log.reason.skip_reminder_same_price": "{name}: пропущено нагадування — ціна не змінилася ({price:.2f})",
 
   "log.priceoverview_fail":   "priceoverview ЗБІЙ {name} через {elapsed:.2f}с: {err}",
   "log.priceoverview_ok":     "priceoverview {name:<40}  {elapsed:.2f}с  HTTP {status}  {bytes} байт",
