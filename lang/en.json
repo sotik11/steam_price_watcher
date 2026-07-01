@@ -291,7 +291,7 @@
   "hist.total_buy":  "Total purchases:",
   "hist.total_sell": "Total sales:",
   "hist.spent":      "Spent:",
-  "hist.balance":    "Balance:",
+  "hist.balance":    "Steam balance:",
   "hist.adjusted_note": "* adjusted as of: {date}",
 
   "dlg.hist_add.title":         "Add history record",

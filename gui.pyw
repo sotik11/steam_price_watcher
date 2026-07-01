@@ -2086,6 +2086,18 @@ class App(tb.Window):
             # at startup uses a regular space. _humanise_balance gives
             # us a single canonical look.
             self.lbl_balance.configure(text=self._humanise_balance(balance))
+            # Positive = green, negative = red, zero = default (theme's
+            # normal foreground). Parse the number back out of the display
+            # string; on locales that failed to parse we just leave the
+            # colour alone.
+            n = _try_parse_money(balance)
+            if n is not None:
+                if n > 0:
+                    self.lbl_balance.configure(foreground="#16A34A")
+                elif n < 0:
+                    self.lbl_balance.configure(foreground="#FF6B6B")
+                else:
+                    self.lbl_balance.configure(foreground="")
         if on_hold is not self._UNSET:
             if on_hold:
                 self.lbl_on_hold.configure(
@@ -2230,6 +2242,13 @@ class App(tb.Window):
         # warning theatre.
         if expired is True:
             self._set_session_warning(True)
+            # Wallet number can't be fetched → fall back to what we know
+            # from History (anchor.balance + operations since). Better a
+            # stale-but-informed number than a flat 0.00 next to the avatar.
+            if not balance:
+                fallback = self._history_wallet_estimate()
+                if fallback is not None:
+                    balance = self._fmt_money(fallback).strip()
         elif expired is False:
             self._set_session_warning(False)
 
@@ -4442,6 +4461,7 @@ class App(tb.Window):
                 "operation": "buy",
                 "kind": "game",
                 "timestamp": ts,
+                "_created": ts,
             })
             g["status"] = "bought"
             state.pop(f"game:{g.get('appid')}:{g.get('name')}", None)
@@ -6339,6 +6359,7 @@ class App(tb.Window):
                     "target": item.get("target_price"),
                     "operation": kind,
                     "timestamp": ts,
+                    "_created": ts,
                 })
 
         if not closed_ids:
@@ -8008,8 +8029,19 @@ class App(tb.Window):
         from regions import currency_symbol
         steam_cfg = self.config_data.get("steam") or {}
         cookies = steam_cfg.get("cookies") or {}
-        if (cookies.get("store.steampowered.com") or {}).get("steamLoginSecure"):
-            # Live session — leave Steam's formatted balance alone.
+        has_cookies = bool(
+            (cookies.get("store.steampowered.com") or {})
+            .get("steamLoginSecure"))
+        # Only skip when we have LIVE cookies (session not expired) —
+        # then Steam's own wallet fetch owns the label. If the session
+        # died, cookies still linger but we must not defer to them; the
+        # anchor-derived estimate is more truthful than a stale 0.00.
+        expired = getattr(self, "_session_warning_active", False)
+        if has_cookies and not expired:
+            return
+        est = self._history_wallet_estimate()
+        if est is not None:
+            self._update_user_widget(balance=self._fmt_money(est).strip())
             return
         sym = currency_symbol(currency_code, fallback="")
         self._update_user_widget(balance=f"0.00 {sym}")
@@ -8973,6 +9005,12 @@ class App(tb.Window):
         # Signature of last-applied layout for idempotency — prevents
         # Configure-event flap during drag resizes.
         self._hist_stats_signature = None
+        # Re-entry guard: destroying/packing row_frames triggers Configure
+        # events on `bottom`, which fires `_reflow_history_bottom`, which
+        # would call us again on half-built state → IndexError. We set
+        # this flag inside every `_apply_stats_layout*` call and the
+        # reflow returns early while it's up.
+        self._hist_stats_applying = False
         # Approximate width of "│" separator + 2×padx(10) — used in
         # _reflow's width math. Refined to a real measurement on the
         # first reflow that renders a sep (sep widgets are short-lived,
@@ -8998,15 +9036,21 @@ class App(tb.Window):
         self.btn_hist_anchor.grid(row=0, column=2, sticky="ne",
                                   padx=(8, 0))
 
-        # «* було відкореговано станом на: DD.MM.YYYY» — muted footnote
-        # below the stats block, only shown while the anchor is set.
-        # grid() / grid_remove() toggles visibility (see _refresh_stats).
+        # «* було відкореговано станом на: DD.MM.YYYY» — dedicated 3rd
+        # line INSIDE the stats block (so the whole block sits at ~= the
+        # two-rows-of-buttons height). Only visible when anchor is set;
+        # font is dropped a step so it reads as a footnote and doesn't
+        # push the block taller than the button column next to it.
+        # `fill=X + anchor="w"` stretches the label across the full width
+        # of the stats block and pins the text to the LEFT edge — the
+        # footnote should line up with "Сума покупок:" above it, not
+        # centre or jam against the right edge.
         self.lbl_anchor_note = ttk.Label(
-            bottom, text="", foreground="#888888",
+            stats, text="", foreground="#888888",
+            font=self._smaller_font(), anchor="w",
         )
-        self.lbl_anchor_note.grid(row=1, column=0, columnspan=3,
-                                  sticky="e", pady=(4, 0))
-        self.lbl_anchor_note.grid_remove()
+        self.lbl_anchor_note.pack(side=TOP, fill=X, pady=(2, 0))
+        self.lbl_anchor_note.pack_forget()
 
         # Re-flow on every resize: pick the widest layout that still
         # fits in the available space. Without this the stats either
@@ -9016,6 +9060,80 @@ class App(tb.Window):
         # Initial layout — schedule after current event loop tick so all
         # children have their reqsize computed by the time we measure.
         self.after_idle(self._reflow_history_bottom)
+
+    def _smaller_font(self) -> tuple:
+        """Return a `(family, size)` tuple one step smaller than the default
+        UI font — for footnote-style labels (anchor «було відкореговано»)
+        that shouldn't dominate the finance block visually. Falls back to
+        a sensible default if the running font can't be introspected.
+        """
+        try:
+            import tkinter.font as tkfont
+            f = tkfont.nametofont("TkDefaultFont")
+            size = max(7, int(f.cget("size")) - 1)
+            return (f.cget("family"), size)
+        except (tk.TclError, ValueError):
+            return ("TkDefaultFont", 8)
+
+    def _apply_stats_layout_grid(self, rows_spec) -> None:
+        """Rectangular layout using grid so cells align vertically across rows.
+
+        rows_spec must be a list of equal-length rows (2×2 for the anchor
+        case: [[buy_i, spent_i], [sale_i, balance_i]]). Column widths are
+        uniformed via `columnconfigure(..., uniform="stats")` so the "│"
+        separators between columns line up between rows — otherwise
+        different label widths make the separators jiggle vertically.
+        """
+        self._hist_stats_applying = True
+        try:
+            self._apply_stats_layout_grid_impl(rows_spec)
+        finally:
+            self._hist_stats_applying = False
+
+    def _apply_stats_layout_grid_impl(self, rows_spec) -> None:
+        for row in self._hist_stats_rows:
+            try:
+                row.destroy()
+            except tk.TclError:
+                pass
+        self._hist_stats_rows = []
+
+        stats = self._hist_stats
+        cells_def = self._hist_cells_def
+        # One outer frame holds the whole grid; pack it right-anchored
+        # so it hugs the same edge the pack-based mode would.
+        grid_frame = ttk.Frame(stats)
+        grid_frame.pack(side=TOP, anchor="e")
+        self._hist_stats_rows.append(grid_frame)
+
+        new_cells_by_idx = {}
+        n_cols = len(rows_spec[0])
+        # 2*n_cols columns in the grid: for each cell column we need a
+        # separator column BEFORE it (except the first). Cells go to
+        # even indices, seps to odd. columnconfigure `uniform` ties the
+        # cell columns together so a wide label in row-0 forces the
+        # row-1 column to the same width — this is what keeps "│" aligned.
+        for c in range(n_cols):
+            grid_frame.columnconfigure(c * 2, weight=1, uniform="stats_cell")
+        for r, indices in enumerate(rows_spec):
+            for c, cell_idx in enumerate(indices):
+                key, attr = cells_def[cell_idx]
+                cell = ttk.Frame(grid_frame)
+                ttk.Label(cell, text=t(key)).pack(side=LEFT, padx=(0, 4))
+                value_label = ttk.Label(cell, text="0.00")
+                value_label.pack(side=LEFT)
+                setattr(self, attr, value_label)
+                new_cells_by_idx[cell_idx] = cell
+                cell.grid(row=r, column=c * 2, sticky="w", pady=1,
+                          padx=(0, 8))
+                if c > 0:
+                    sep = ttk.Label(grid_frame, text="│",
+                                    foreground="#666666")
+                    sep.grid(row=r, column=c * 2 - 1, sticky="ns")
+
+        self._hist_stats_cells = [
+            new_cells_by_idx[i] for i in range(len(cells_def))
+        ]
 
     def _apply_stats_layout(self, rows_spec, anchor, use_seps) -> None:
         """Rebuild the stats panel for the given multi-row spec.
@@ -9038,6 +9156,13 @@ class App(tb.Window):
         _refresh_history_stats() after this to repopulate the new
         value-label texts.
         """
+        self._hist_stats_applying = True
+        try:
+            self._apply_stats_layout_impl(rows_spec, anchor, use_seps)
+        finally:
+            self._hist_stats_applying = False
+
+    def _apply_stats_layout_impl(self, rows_spec, anchor, use_seps) -> None:
         for row in self._hist_stats_rows:
             try:
                 row.destroy()
@@ -9144,10 +9269,29 @@ class App(tb.Window):
         cells = getattr(self, "_hist_stats_cells", None)
         if not bottom or not btn_f or not stats or not cells:
             return
+        # Re-entry guard: destroy/pack in _apply_stats_layout* triggers
+        # Configure events, which fire us again while cells are half-
+        # built. Skip until the current apply finishes — the caller
+        # invokes _refresh_history_stats() at the end anyway, keeping
+        # labels in sync.
+        if getattr(self, "_hist_stats_applying", False):
+            return
         try:
             avail = bottom.winfo_width()
             if avail <= 1:
                 return
+            # `_hist_stats_cells` may be stale — the anchor dialog updates
+            # `_hist_cells_def` (adds / removes «Баланс») and calls us right
+            # after, before the cells have been rebuilt. Force a fresh build
+            # with a default one-row layout so measurements below reflect
+            # the CURRENT cell count; a proper 2×2 or wrap layout is picked
+            # on the retry.
+            expected_n = len(self._hist_cells_def)
+            if len(cells) != expected_n:
+                self._apply_stats_layout(
+                    [list(range(expected_n))], "e", True)
+                cells = self._hist_stats_cells
+                self._hist_stats_signature = None  # force re-apply below
             cell_widths = [c.winfo_reqwidth() for c in cells]
             sep_w = self._hist_sep_width
             btn_w = btn_f.winfo_reqwidth()
@@ -9156,6 +9300,26 @@ class App(tb.Window):
             right_avail = avail - btn_w - 24
             inline_w = sum(cell_widths) + sep_w * (len(cell_widths) - 1)
             max_cell_w = max(cell_widths) if cell_widths else 0
+
+            # When the balance anchor is set, force the 2×2 layout the
+            # user asked for: row1 = [buys, spent], row2 = [sales, balance].
+            # Uses the grid-based layout so the "│" separator lines up
+            # vertically between the two rows (pack-based mode wouldn't).
+            if len(cell_widths) == 4:
+                rows_spec = [[0, 2], [1, 3]]
+                target_grid = {"row": 0, "column": 1,
+                               "sticky": "ne", "pady": 0}
+                sig = ("grid_2x2",
+                       target_grid["row"], target_grid["column"],
+                       target_grid["sticky"],
+                       tuple(tuple(r) for r in rows_spec))
+                if sig == self._hist_stats_signature:
+                    return
+                self._apply_stats_layout_grid(rows_spec)
+                stats.grid_configure(**target_grid)
+                self._hist_stats_signature = sig
+                self._refresh_history_stats()
+                return
 
             if right_avail >= inline_w:
                 rows_spec = [list(range(len(cell_widths)))]
@@ -9326,8 +9490,11 @@ class App(tb.Window):
                 messagebox.showerror(t("dlg.warn.title"),
                                      t("dlg.hist_add.err_date"), parent=dlg)
                 return
-            # Store time at 12:00 local so the timestamp lands solidly
-            # inside the chosen day (avoids TZ edge on 00:00 filtering).
+            # `timestamp` = operation date (what the user typed) at
+            # 12:00 — used for display/sorting in the history table.
+            # `created_at` (added below) is the anchor-filter cutoff — a
+            # back-dated record added AFTER the anchor still counts
+            # because its `_created` moment lands after the anchor's.
             ts = d.replace(hour=12, minute=0, second=0).isoformat()
             kind_val = var_type.get()
 
@@ -9335,6 +9502,12 @@ class App(tb.Window):
                 "price": f"{price_val:.2f} {sym}".rstrip(),
                 "operation": "sell" if kind_val == "card_sell" else "buy",
                 "timestamp": ts,
+                # Moment the record was PHYSICALLY added to the file —
+                # the anchor cutoff filter uses this, not `timestamp`,
+                # so back-dated entries added after an anchor still get
+                # counted. `timestamp` stays as the operation date for
+                # the table/sorting.
+                "_created": datetime.now().isoformat(timespec="seconds"),
             }
 
             if kind_val == "game_buy":
@@ -9404,6 +9577,14 @@ class App(tb.Window):
             save_json(PURCHASES_PATH, purchases)
             dlg.destroy()
             self._refresh_history()
+            # A new record shifts the History-derived wallet estimate,
+            # so keep the avatar label in sync on an expired session.
+            try:
+                cur = (self.config_data.get("market")
+                       or {}).get("currency", 18)
+                self._refresh_balance_placeholder(cur)
+            except Exception:
+                pass
 
         btns = ttk.Frame(outer)
         btns.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(12, 0))
@@ -9503,11 +9684,16 @@ class App(tb.Window):
                                      t("dlg.anchor.err_number"), parent=dlg)
                 return
             self.config_data.setdefault("balance_anchor", {})
+            # `created_at` — точный момент сохранения якоря; фильтр по
+            # timestamp'у операций опирается на него, не на «дату», чтобы
+            # запись, добавленная В ТОТ ЖЕ ДЕНЬ но после якоря, попала в
+            # подсчёт. Иначе «Додати» с датой якоря молча теряется.
             self.config_data["balance_anchor"] = {
                 "date": var_date.get().strip(),
                 "purchases": round(p, 2),
                 "sales":     round(s, 2),
                 "balance":   round(bal, 2),
+                "created_at": datetime.now().isoformat(timespec="seconds"),
             }
             save_json(CONFIG_PATH, self.config_data)
             result["action"] = "save"
@@ -9549,11 +9735,52 @@ class App(tb.Window):
 
         # Anchor state may have changed — rebuild the cell defs (adds or
         # removes the «Баланс» cell), reset signature to force a fresh
-        # layout, and repopulate all numbers.
+        # layout, and repopulate all numbers. Also refresh the avatar
+        # wallet label — its History-derived fallback keys off the
+        # anchor, so the header should update in the same beat.
         if result["action"] != "cancel":
             self._rebuild_hist_cells_def()
             self._reflow_history_bottom()
             self._refresh_history_stats()
+            try:
+                cur = (self.config_data.get("market")
+                       or {}).get("currency", 18)
+                self._refresh_balance_placeholder(cur)
+            except Exception:
+                pass
+
+    def _history_wallet_estimate(self) -> float | None:
+        """Best-effort wallet balance derived from the History block.
+
+        Returns `anchor.balance + Σ(sells − buys since anchor.date)` when
+        an anchor is set, else None. Used as a fallback for the avatar
+        wallet label when Steam's session cookie has expired and we can't
+        pull the live number — better a stale-but-informed figure than a
+        flat 0.00. Shape mirrors `_refresh_history_stats` — kept in a
+        separate helper because the label update runs on the wallet
+        refresh path, not the History-tab refresh path.
+        """
+        anchor = self._balance_anchor()
+        if anchor is None:
+            return None
+        anchor_cutoff = anchor["created_at"]
+        purchases = load_json(PURCHASES_PATH, []) or []
+        delta = 0.0
+        for p in purchases:
+            amount = _try_parse_money(p.get("price"))
+            if amount is None:
+                continue
+            # Same «moment added, not operation date» rule as
+            # _refresh_history_stats — back-dated entries logged after
+            # an anchor still count. Legacy rows fall back to timestamp.
+            ref = str(p.get("_created") or p.get("timestamp") or "")
+            if not ref or ref <= anchor_cutoff:
+                continue
+            if (p.get("operation") or "buy") == "sell":
+                delta += amount
+            else:
+                delta -= amount
+        return anchor["balance"] + delta
 
     def _balance_anchor(self) -> dict | None:
         """Return the current balance anchor from config, or None if unset.
@@ -9569,11 +9796,25 @@ class App(tb.Window):
             d = str(raw["date"])
             # sanity check the date shape early so downstream code trusts it
             datetime.strptime(d, "%Y-%m-%d")
+            # `created_at` — timestamp момент сохранения якоря. Для старых
+            # якорей (сохранённых до этой ревизии) — синтезируем 23:59:59
+            # даты якоря: все операции, добавленные ДО этой ревизии на
+            # anchor.date, считаются «уже включены в baseline».
+            created_raw = raw.get("created_at")
+            try:
+                if created_raw:
+                    datetime.fromisoformat(str(created_raw))
+                    created = str(created_raw)
+                else:
+                    raise ValueError
+            except (TypeError, ValueError):
+                created = f"{d}T23:59:59"
             return {
                 "date": d,
                 "purchases": float(raw.get("purchases", 0) or 0),
                 "sales":     float(raw.get("sales", 0) or 0),
                 "balance":   float(raw.get("balance", 0) or 0),
+                "created_at": created,
             }
         except (KeyError, ValueError, TypeError):
             return None
@@ -9591,7 +9832,11 @@ class App(tb.Window):
             ("hist.spent",      "lbl_spent"),
         ]
         if self._balance_anchor() is not None:
-            base.append(("hist.balance", "lbl_balance"))
+            # Attr name is deliberately distinct from the avatar-widget's
+            # `lbl_balance` — same short name collides via setattr and the
+            # avatar's balance label ends up being replaced by the History
+            # cell (avatar then stays stuck at "0.00").
+            base.append(("hist.balance", "lbl_hist_balance"))
         self._hist_cells_def = base
         # Force a fresh layout on next reflow — the signature check would
         # otherwise short-circuit us into keeping the stale cell list.
@@ -9612,10 +9857,7 @@ class App(tb.Window):
             purchases = load_json(PURCHASES_PATH, []) or []
 
         anchor = self._balance_anchor()
-        if anchor is not None:
-            anchor_date = datetime.strptime(anchor["date"], "%Y-%m-%d").date()
-        else:
-            anchor_date = None
+        anchor_cutoff = anchor["created_at"] if anchor else None
 
         add_buy = 0.0
         add_sell = 0.0
@@ -9623,14 +9865,15 @@ class App(tb.Window):
             amount = _try_parse_money(p.get("price"))
             if amount is None:
                 continue
-            if anchor_date is not None:
-                # Compare on the DATE part only — buys later on the anchor
-                # day are already counted in the baseline the user typed in.
-                ts = str(p.get("timestamp") or "")[:10]
-                try:
-                    if datetime.strptime(ts, "%Y-%m-%d").date() <= anchor_date:
-                        continue
-                except ValueError:
+            if anchor_cutoff is not None:
+                # Filter by the moment the record was ADDED (`_created`),
+                # not by its operation date (`timestamp`). This lets a
+                # back-dated entry — logged on the 6th for a purchase
+                # that happened on the 3rd — still count if the anchor
+                # itself was saved on the 1st. Legacy records without
+                # `_created` fall back to `timestamp` (best available).
+                ref = str(p.get("_created") or p.get("timestamp") or "")
+                if not ref or ref <= anchor_cutoff:
                     continue
             # Legacy entries without `operation` default to "buy".
             if (p.get("operation") or "buy") == "sell":
@@ -9652,8 +9895,17 @@ class App(tb.Window):
         spent = total_buy - total_sell
 
         if hasattr(self, "lbl_total_buy"):
-            self.lbl_total_buy.configure(text=self._fmt_money(total_buy))
-            self.lbl_total_sell.configure(text=self._fmt_money(total_sell))
+            # Blue for purchases (matches the primary-bootstyle buttons on
+            # the tab) and warning-yellow for sales — visual hint that
+            # matches the deal-direction language everywhere else.
+            self.lbl_total_buy.configure(
+                text=self._fmt_money(total_buy),
+                foreground=self.style.colors.primary,
+            )
+            self.lbl_total_sell.configure(
+                text=self._fmt_money(total_sell),
+                foreground=self.style.colors.warning,
+            )
             # Spent: green-ish if positive (we earned more than spent? no —
             # actually spent = buy - sell, so negative means we earned).
             # Per the user's mock-up, negative goes red.
@@ -9671,16 +9923,19 @@ class App(tb.Window):
                 self.lbl_spent.configure(foreground="")
 
         # Balance cell exists only when anchor is set (see _hist_cells_def).
-        if balance is not None and hasattr(self, "lbl_balance"):
-            self.lbl_balance.configure(text=self._fmt_money(balance))
-            # Colour code mirroring «Витрачено»: positive/зростання зелёный,
-            # negative (пішло в мінус) червоний. Нейтрал — коли рівно якір.
-            if balance > anchor["balance"]:
-                self.lbl_balance.configure(foreground="#16A34A")
-            elif balance < anchor["balance"]:
-                self.lbl_balance.configure(foreground="#FF6B6B")
+        # Distinct attr name — `lbl_balance` alone would collide with the
+        # avatar-widget balance label.
+        if balance is not None and hasattr(self, "lbl_hist_balance"):
+            self.lbl_hist_balance.configure(text=self._fmt_money(balance))
+            # Positive/negative sign of the wallet number itself (matches
+            # the avatar-widget colouring): green for money in the wallet,
+            # red if the balance ever went negative, neutral at zero.
+            if balance > 0:
+                self.lbl_hist_balance.configure(foreground="#16A34A")
+            elif balance < 0:
+                self.lbl_hist_balance.configure(foreground="#FF6B6B")
             else:
-                self.lbl_balance.configure(foreground="")
+                self.lbl_hist_balance.configure(foreground="")
 
         # «Було відкореговано станом на: dd.mm.yyyy» — helper строка под
         # блоком; показывается только когда anchor есть.
@@ -9693,9 +9948,15 @@ class App(tb.Window):
                 except ValueError:
                     stamp = anchor["date"]
                 note.configure(text=t("hist.adjusted_note", date=stamp))
-                note.grid()   # show
+                # Re-pack every refresh so it stays UNDER the row-frames
+                # that _apply_stats_layout re-creates on each reflow (pack
+                # order is insertion order — a note packed once at init
+                # would end up above the freshly-recreated cell rows).
+                note.pack_forget()
+                note.pack(side=TOP, fill=X, pady=(2, 0))
             else:
-                note.grid_remove()  # hide
+                if note.winfo_ismapped():
+                    note.pack_forget()
 
     def _hist_selected(self):
         """Return the first purchase record under the currently-selected row.
@@ -10292,9 +10553,61 @@ class App(tb.Window):
 
         ttk.Button(btn_f, text=t("btn.log_clear"),       command=self._clear_log).pack(side=LEFT, padx=2)
         ttk.Button(btn_f, text=t("btn.log_open_folder"), command=self._open_log_folder).pack(side=LEFT, padx=2)
-        ttk.Button(btn_f, text=t("btn.log_refresh"),     command=self._refresh_log).pack(side=LEFT, padx=2)
+        ttk.Button(btn_f, text=t("btn.log_refresh"),
+                   command=lambda: self._refresh_log(
+                       force=True, jump_to_end=True)
+                   ).pack(side=LEFT, padx=2)
 
-    def _refresh_log(self):
+    def _refresh_log(self, *, force: bool = False,
+                     jump_to_end: bool = False) -> None:
+        """Rebuild the Log tab from disk, preserving the user's scroll.
+
+        Called on tab-switch, on the every-2s auto-tick, and manually
+        from the «Оновити» button (`force=True`, ignores the mtime skip).
+
+        Two behaviours the previous version got wrong:
+          * The auto-tick ran a full delete+insert+see(END) every 2s
+            regardless of whether the file changed → any attempt to
+            scroll up snapped back to the bottom two seconds later.
+          * The user's scroll position was thrown away on every refresh
+            even when new content had actually arrived.
+
+        Now we:
+          * Skip entirely when the log file's mtime+size are unchanged
+            since the last refresh (nothing to redraw).
+          * Save `yview()` before rebuilding. If we WERE at the bottom
+            (typical live-tail case), scroll to bottom afterwards so
+            new entries stay in view. If we weren't, restore the
+            previous top-fraction so a mid-file read stays put.
+        """
+        # File-metadata skip. `force=True` overrides so «Оновити» always
+        # redraws, even when the user just wants to be sure.
+        mtime = size = None
+        if LOG_PATH.exists():
+            try:
+                st = LOG_PATH.stat()
+                mtime, size = st.st_mtime, st.st_size
+            except OSError:
+                pass
+        prev = getattr(self, "_log_file_sig", None)
+        sig = (mtime, size)
+        if not force and prev == sig:
+            return
+        self._log_file_sig = sig
+
+        # Was the user pinned to the bottom? yview()[1] == 1.0 means the
+        # last line is on screen — treat this as "live tail" and re-pin
+        # after the rebuild. A tiny epsilon guards against float noise.
+        # `jump_to_end` overrides — the «Оновити» button explicitly
+        # means "show me the newest", regardless of current position.
+        try:
+            top_before, bottom_before = self.log_text.yview()
+            at_bottom = bottom_before >= 0.9999
+        except tk.TclError:
+            top_before, at_bottom = 0.0, True
+        if jump_to_end:
+            at_bottom = True
+
         if not LOG_PATH.exists():
             lines = [t("log.file_missing") + "\n"]
         else:
@@ -10321,7 +10634,17 @@ class App(tb.Window):
                 tag = "INFO"
             self.log_text.insert(END, line, tag)
 
-        self.log_text.see(END)
+        if at_bottom:
+            self.log_text.see(END)
+        else:
+            # Restore the previous top fraction — the number of lines
+            # can change between refreshes, but `yview_moveto` scales
+            # to the new content so the visible chunk stays roughly
+            # anchored where the user left it.
+            try:
+                self.log_text.yview_moveto(top_before)
+            except tk.TclError:
+                pass
         self.log_text.configure(state=DISABLED)
 
     # ------------------------------------------------------------------

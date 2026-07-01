@@ -291,7 +291,7 @@
   "hist.total_buy":  "Сума покупок:",
   "hist.total_sell": "Сума продажів:",
   "hist.spent":      "Витрачено:",
-  "hist.balance":    "Баланс:",
+  "hist.balance":    "Баланс Steam:",
   "hist.adjusted_note": "* було відкореговано станом на: {date}",
 
   "dlg.hist_add.title":         "Додати запис до історії",
