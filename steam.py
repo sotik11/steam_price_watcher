@@ -591,6 +591,17 @@ def steam_url(appid: str | int, market_hash_name: str) -> str:
     return f"steam://openurl/{market_url(appid, market_hash_name)}"
 
 
+def parse_store_url(url: str) -> str | None:
+    """Extract `appid` from a Steam Store product URL.
+
+    Accepts both `/app/<appid>/…` and `/app/<appid>` (with or without a
+    trailing slug/query). Returns the appid as a string, or None if the
+    URL doesn't look like a Steam Store product page.
+    """
+    m = re.search(r"store\.steampowered\.com/app/(\d+)", url)
+    return m.group(1) if m else None
+
+
 def parse_market_url(url: str) -> tuple[str, str] | None:
     """Extract (appid, market_hash_name) from a Steam Market listing URL.
 

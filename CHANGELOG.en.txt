@@ -1,6 +1,20 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.4.0 (2026-07-01)
+- History now supports manual «Add» — a new button on the first row (also
+  in the context menu). Accepts Steam Market URLs (cards) or Steam Store
+  URLs (games); metadata is pulled automatically.
+- History buttons split into two rows: row 1 — «Purchase history / Export
+  CSV / Add», row 2 — «Re-add to watchlist / Edit price / Delete».
+- New «Balance» cell. A ⚙ button next to the finance block opens the
+  «balance anchor» dialog: enter your total purchases, total sales and
+  Steam wallet balance as of a given date — all subsequent operations
+  are added to those numbers automatically. A footnote «* adjusted as
+  of: DD.MM.YYYY» appears below the block. Reset via the same ⚙ button.
+  «Spent» is computed automatically; without an anchor the finance block
+  works exactly as before.
+
 v0.1.3.3 (2026-06-29)
 - Fixed daily-spam of "reminder" notifications for the same active game
   sale: previously the same alert arrived every day because the antispam
