@@ -84,6 +84,32 @@ LIST_PATHS = {"buy": WATCHLIST_PATH, "sell": SALELIST_PATH}
 # in older watchlist.json files; new sale-side rows use "sold".
 CLOSED_STATUSES = {"bought", "sold"}
 
+# Fields the backfill thread populates. Kept as a module constant so the
+# merge-save helper (see `_merge_backfill_save`) knows exactly which keys
+# to copy across without touching the ones the user might have edited.
+_META_FIELDS = ("display_name", "game_name", "image_url", "item_type")
+
+
+def _CARD_LIST_KEY(record: dict):
+    """Identity key for a watchlist/salelist row.
+
+    `id` is the stable UUID minted at add-time and never mutated after,
+    so it survives edits and moves between the two lists.
+    """
+    return record.get("id")
+
+
+def _PURCHASE_KEY(record: dict):
+    """Identity key for a purchases.json row.
+
+    `(timestamp, market_hash_name)` mirrors the `iid` used by the
+    History Treeview and is stable — nothing rewrites the timestamp
+    after the row is created.
+    """
+    ts = record.get("timestamp")
+    mhn = record.get("market_hash_name")
+    return (ts, mhn) if ts is not None else None
+
 
 def _migrate_state_keys(state: dict) -> bool:
     """Add a 'buy:' prefix to legacy state keys that pre-date multi-list.
@@ -231,6 +257,12 @@ class App(tb.Window):
         # cell carries a 🔻 so the signal reads even on a busy screen.
         # Brighter than rate_limited's muted gold so the two don't blur.
         "epic_cheaper": {"background": "#6b5410", "foreground": "#ffe9a8"},
+        # «Заморожено»: no_check (🚫 don't poll) or no_alert (🔇 don't
+        # notify) is set — row is inactive relative to the alert pipeline.
+        # Silvery-ice background with dark navy text so it reads as
+        # "cold storage" (paused) and stays legible on light bg (the
+        # default white foreground would disappear otherwise).
+        "frozen":       {"background": "#C7DAE6", "foreground": "#1E3A5F"},
         "even":     {},   # placeholder — filled in _configure_styles()
         "odd":      {},
         "selected": {},   # placeholder — appended last to win tag priority
@@ -3768,10 +3800,17 @@ class App(tb.Window):
             # Branching on raw status (not the localised string) so
             # row colours don't shift when the user changes language.
             zebra = "even" if row_index % 2 == 0 else "odd"
+            # «Заморожено» wins over everything except Steam-side errors.
+            # If the user has explicitly paused the row (no_check → we
+            # skip polling, no_alert → we skip the Telegram send) the
+            # deal-status green/red doesn't apply — the row is inactive.
+            frozen = item.get("no_check") or item.get("no_alert")
             if raw_status == "rate_limited":
                 row_tag = "rate_limited"
             elif raw_status == "error":
                 row_tag = "error"
+            elif frozen:
+                row_tag = "frozen"
             elif last_num is not None and target_num is not None:
                 if kind == "buy":
                     meets = last_num <= target_num
@@ -4117,12 +4156,17 @@ class App(tb.Window):
                 epic_cell = self._fmt_money(epic_price)
                 if epic_cheaper:
                     epic_cell = f"🔥 {epic_cell}"
-            # Row tint, highest priority first: GOLD when Epic undercuts
-            # Steam (the new actionable signal — buy it there), then RED
-            # at the all-time Steam low, GREEN on any sale, zebra otherwise.
-            # Red requires a real discount so never-discounted games don't
-            # light up.
-            if epic_cheaper:
+            # Row tint, highest priority first: FROZEN when the user has
+            # paused the row (no_check / no_alert — it's not driving the
+            # alert pipeline, deal state colours would be misleading);
+            # GOLD when Epic undercuts Steam (the new actionable signal —
+            # buy it there); RED at the all-time Steam low; GREEN on any
+            # sale; zebra otherwise. Red requires a real discount so
+            # never-discounted games don't light up.
+            frozen = g.get("no_check") or g.get("no_alert")
+            if frozen:
+                row_tag = "frozen"
+            elif epic_cheaper:
                 row_tag = "epic_cheaper"
             elif (disc > 0 and (g.get("lowest_cut") or 0) > 0
                     and isinstance(price, (int, float))
@@ -5151,6 +5195,14 @@ class App(tb.Window):
         watchlist.json and schedules a UI refresh only if something actually
         changed — keeping the disk and the screen calm when there's nothing
         to do.
+
+        Save-time is a **merge**, not an overwrite: we re-read the file
+        from disk right before writing and copy our backfilled metadata
+        ONTO the current on-disk records, keyed by identity. Overwriting
+        with the snapshot we loaded at thread start would silently drop
+        any «Придбав» / «Продав» / «Додати» / delete the user did while
+        we were fetching (15–30 s of network) — exactly the ghost-record
+        bug the user reported.
         """
         from steam import fetch_card_metadata
         try:
@@ -5159,10 +5211,12 @@ class App(tb.Window):
             buy_dirty = self._backfill_records(buy_list, fetch_card_metadata, other=sell_list)
             sell_dirty = self._backfill_records(sell_list, fetch_card_metadata, other=buy_list)
             if buy_dirty:
-                save_json(WATCHLIST_PATH, buy_list)
+                self._merge_backfill_save(
+                    WATCHLIST_PATH, buy_list, _CARD_LIST_KEY)
                 self.after(0, lambda: self._refresh_card_list("buy"))
             if sell_dirty:
-                save_json(SALELIST_PATH, sell_list)
+                self._merge_backfill_save(
+                    SALELIST_PATH, sell_list, _CARD_LIST_KEY)
                 self.after(0, lambda: self._refresh_card_list("sell"))
 
             # Same treatment for purchases.json — older entries (made before
@@ -5174,11 +5228,44 @@ class App(tb.Window):
                 other=(buy_list + sell_list),
             )
             if ph_dirty:
-                save_json(PURCHASES_PATH, purchases)
+                self._merge_backfill_save(
+                    PURCHASES_PATH, purchases, _PURCHASE_KEY)
                 self.after(0, self._refresh_history)
         except Exception:
             # Backfill is best-effort — never crash the UI thread over it.
             pass
+
+    @staticmethod
+    def _merge_backfill_save(path, snapshot: list, key_fn) -> None:
+        """Re-read the file and copy backfilled metadata onto CURRENT rows.
+
+        Records that no longer exist on disk (deleted while backfill ran)
+        stay gone; records added on disk after we started stay in place;
+        matching records get their empty metadata fields filled in. No
+        record is ever lost by the backfill save.
+
+        `key_fn(record)` returns a hashable identity; if it returns None
+        for a record, that record is skipped (nothing to key on).
+        `_META_FIELDS` — the four fields backfill actually populates.
+        """
+        current = load_json(path, []) or []
+        by_key: dict = {}
+        for r in current:
+            k = key_fn(r)
+            if k is not None:
+                by_key[k] = r
+        for src in snapshot:
+            k = key_fn(src)
+            if k is None:
+                continue
+            tgt = by_key.get(k)
+            if tgt is None:
+                continue  # user deleted this record while we fetched
+            for f in _META_FIELDS:
+                v = src.get(f)
+                if v and not tgt.get(f):
+                    tgt[f] = v
+        save_json(path, current)
 
     @staticmethod
     def _backfill_records(records: list, fetch_fn, other: list | None) -> bool:
@@ -9403,6 +9490,16 @@ class App(tb.Window):
         # stale if e.g. we just deleted the last selected row.
         self._update_hist_delete_state()
         self._refresh_history_stats(purchases)
+        # Any change to purchases.json shifts the History-derived wallet
+        # estimate — keep the avatar-widget label in sync too. On a live
+        # Steam session this is a no-op (the placeholder helper returns
+        # early); on an expired session it refreshes from the anchor.
+        try:
+            cur = (self.config_data.get("market")
+                   or {}).get("currency", 18)
+            self._refresh_balance_placeholder(cur)
+        except Exception:
+            pass
 
     def _hist_add_dialog(self) -> None:
         """Open the «Додати запис до історії» dialog.
@@ -9576,15 +9673,9 @@ class App(tb.Window):
             purchases.append(record)
             save_json(PURCHASES_PATH, purchases)
             dlg.destroy()
+            # `_refresh_history` now handles the avatar-balance sync too
+            # (see the finance-refresh at the end of it).
             self._refresh_history()
-            # A new record shifts the History-derived wallet estimate,
-            # so keep the avatar label in sync on an expired session.
-            try:
-                cur = (self.config_data.get("market")
-                       or {}).get("currency", 18)
-                self._refresh_balance_placeholder(cur)
-            except Exception:
-                pass
 
         btns = ttk.Frame(outer)
         btns.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(12, 0))
