@@ -1,6 +1,37 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.4.1 (2026-07-03)
+- Fixed «vanishing» of newly-added purchases 15–30 s after startup:
+  the background backfill thread was overwriting the files with its
+  own stale snapshot, wiping out any operations the user did while
+  it was running. It now merges instead of overwriting (purchases,
+  watchlist and salelist).
+- Fixed several finance-block bugs on the History tab:
+  * «Steam balance» only appeared after a GUI restart when the
+    anchor was configured;
+  * avatar-widget balance stayed at 0.00 on an expired session
+    instead of falling back to the anchor + operations since;
+  * balance colour was compared against the anchor instead of zero
+    (now: +green, −red, 0 neutral);
+  * add/delete/edit of a record didn't update the avatar-widget
+    balance until restart;
+  * IndexError in the block's layout from recursive Configure events.
+- The balance anchor now stores an exact `created_at` moment, and
+  records are filtered by their own `_created` timestamp (the moment
+  they were added) rather than the operation date. A back-dated entry
+  logged AFTER the anchor still counts.
+- The «Оновити» button on the Log tab now always jumps to the end
+  (previously it kept the current scroll); auto-refresh of the Log
+  is skipped when the file hasn't changed — reading mid-log no
+  longer snaps back to the bottom.
+- Cosmetic: rows with 🚫 «don't check» or 🔇 «don't notify» are now
+  tinted icy silver («frozen»). The finance block goes 2×2 when an
+  anchor is set with vertically-aligned «|» separators; total
+  purchases coloured blue (Buy tab button colour), total sales
+  yellow; the «Balance» cell is now «Steam balance»; the anchor
+  footnote is left-aligned.
+
 v0.1.4.0 (2026-07-01)
 - History now supports manual «Add» — a new button on the first row (also
   in the context menu). Accepts Steam Market URLs (cards) or Steam Store
