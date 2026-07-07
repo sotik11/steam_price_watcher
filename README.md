@@ -7,6 +7,21 @@ Polls the prices on a schedule (Windows Task Scheduler) and pings a
 Telegram chat when a card hits a target price, a wishlist game goes on
 sale, or the same game becomes cheaper on the Epic Games Store.
 
+![Steam Price Watcher](docs/screenshots/Screenshot_1.png)
+
+<details>
+<summary><strong>More screenshots (click to view)</strong></summary>
+
+![Screenshot 2](docs/screenshots/Screenshot_2.png)
+
+![Screenshot 3](docs/screenshots/Screenshot_3.png)
+
+![Screenshot 4](docs/screenshots/Screenshot_4.png)
+
+![Screenshot 5](docs/screenshots/Screenshot_5.png)
+
+</details>
+
 ## Features
 
 - **Buy / Sell card lists** — set a target buy/sell price per card,
@@ -33,13 +48,17 @@ sale, or the same game becomes cheaper on the Epic Games Store.
 - **Backup** — Export / Import a flat zip with config + all lists;
   the format is interchangeable with the installer's first-run import.
 
-## Requirements
+<details>
+<summary><strong>Requirements</strong></summary>
 
 - Windows 10 / 11
 - Python 3.13.x (the installer bundles 3.13.7)
 - Telegram bot (token + chat id) — used for alerts only
 
-## Quick start
+</details>
+
+<details>
+<summary><strong>Quick start</strong></summary>
 
 1. Install via the bundled installer (`installer/dist/Steam Price
    Watcher <version>.exe` after building) OR run from sources:
@@ -56,7 +75,10 @@ sale, or the same game becomes cheaper on the Epic Games Store.
 4. Use **Планувальник** tab to register the Windows Task Scheduler
    entry that polls prices in the background.
 
-## Building the installer
+</details>
+
+<details>
+<summary><strong>Building the installer</strong></summary>
 
 ```
 cd installer
@@ -65,7 +87,10 @@ build_installer.bat      :: downloads bundled Python, runs Inno Setup
 Output: `installer/dist/Steam Price Watcher <version>.exe`. Inno Setup
 6 is required (`winget install JRSoftware.InnoSetup`).
 
-## Project layout
+</details>
+
+<details>
+<summary><strong>Project layout</strong></summary>
 
 ```
 steam_price_watcher/
@@ -86,12 +111,20 @@ steam_price_watcher/
   installer/          # Inno Setup config (.iss + build script)
 ```
 
-## Configuration
+</details>
+
+<details>
+<summary><strong>Configuration</strong></summary>
 
 `config.json` (gitignored) holds the bot token, chat id and per-user
 settings. Use `config.example.json` as a starting template — the GUI
 writes a real `config.json` on first save.
 
-## License
+</details>
+
+<details>
+<summary><strong>License</strong></summary>
 
 Personal project, no license declared yet. Ask before reusing.
+
+</details>
