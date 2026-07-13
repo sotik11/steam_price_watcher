@@ -6737,6 +6737,11 @@ class App(tb.Window):
         Buy orders are unique-per-mhn in the watchlist, so the match
         rule is simple: any local entry with the same (appid, mhn)
         wins; price comparison gives us "same" vs "changed:<old>".
+
+        CLOSED (bought/sold) rows are ignored for match — they sit in
+        the file only for History lineage, don't render in the list,
+        and shouldn't intercept a fresh Steam listing whose local
+        counterpart is truly gone.
         """
         for s in steam_rows:
             appid, mhn = s["appid"], s["market_hash_name"]
@@ -6744,7 +6749,8 @@ class App(tb.Window):
             match = next(
                 (r for r in local_rows
                  if r.get("appid") == appid
-                 and (r.get("market_hash_name") or r.get("name")) == mhn),
+                 and (r.get("market_hash_name") or r.get("name")) == mhn
+                 and r.get("status") not in CLOSED_STATUSES),
                 None,
             )
             if match is None:
@@ -6776,8 +6782,14 @@ class App(tb.Window):
         # Build a working list per mhn we can pop from as matches consume.
         # `defaultdict(list)` would be cleaner but introducing the import
         # for one use site isn't worth the line.
+        # CLOSED (sold) copies are excluded — they exist in the file for
+        # History lineage only, don't render in the sales list, and
+        # shouldn't intercept a fresh Steam listing whose active local
+        # counterpart is truly gone (the STANDARD MUMMY ghost-import bug).
         avail: dict[tuple, list[dict]] = {}
         for r in local_rows:
+            if r.get("status") in CLOSED_STATUSES:
+                continue
             key = (r.get("appid"),
                    r.get("market_hash_name") or r.get("name"))
             avail.setdefault(key, []).append(r)
@@ -7158,8 +7170,14 @@ class App(tb.Window):
         mhn = src.get("market_hash_name") or ""
         new_price = src.get("price")
         for r in rows:
+            # Match ACTIVE rows only — sold/bought copies keep their
+            # historical target frozen (they live in the file for
+            # History lineage). Otherwise «Перезаписати» silently
+            # patched a closed row while the visible one kept its
+            # old target — the «update did nothing» bug.
             if r.get("appid") == appid and \
-                    (r.get("market_hash_name") or r.get("name")) == mhn:
+                    (r.get("market_hash_name") or r.get("name")) == mhn \
+                    and r.get("status") not in CLOSED_STATUSES:
                 r["target_price"] = new_price
                 r["imported"] = True
                 r["item_type"] = item_type

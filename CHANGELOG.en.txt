@@ -1,6 +1,17 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.4.2 (2026-07-08)
+- Fixed «Import from Steam» for cards that were closed at some point
+  (bought/sold): if salelist.json / watchlist.json still held an
+  archived row with status=sold/bought, it intercepted a fresh Steam
+  listing and the import silently added nothing («0 new + 0 updated»).
+  Archived rows are now ignored during dedup lookup.
+- Fixed the same bug in the «Replace» action on a price conflict:
+  previously the first row matching (appid, mhn) was updated — and
+  it was often the archived sold copy, so the visible active row
+  kept its old target. Now the visible active row is updated.
+
 v0.1.4.1 (2026-07-03)
 - Fixed «vanishing» of newly-added purchases 15–30 s after startup:
   the background backfill thread was overwriting the files with its
