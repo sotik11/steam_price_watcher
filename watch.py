@@ -13,8 +13,15 @@ from i18n import t
 
 BASE = Path(__file__).parent
 
+# Logs live in their own subfolder so they don't clutter the app root.
+# Created eagerly — the RotatingFileHandler below opens the file at import
+# time and would raise if the directory didn't exist yet.
+LOGS_DIR = BASE / "Logs"
+LOGS_DIR.mkdir(exist_ok=True)
+
 _log_handler = RotatingFileHandler(
-    BASE / "watch.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+    LOGS_DIR / "watch.log", maxBytes=1_000_000, backupCount=3,
+    encoding="utf-8",
 )
 logging.basicConfig(
     level=logging.INFO,

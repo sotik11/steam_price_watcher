@@ -23,7 +23,7 @@
 ; ============================================================================
 
 #define MyAppName "Steam Price Watcher"
-#define MyAppVersion "0.1.4.3"
+#define MyAppVersion "0.1.4.4"
 #define MyAppPublisher "sotik"
 #define PyVersion "3.13.7"
 #define PyInstaller "python-" + PyVersion + "-amd64.exe"
@@ -133,6 +133,7 @@ Filename: "{cmd}"; Parameters: "/c del ""{code:GetZipPath}"""; \
 ; CurUninstallStepChanged handler to confirm-delete.
 Type: filesandordirs; Name: "{app}\.venv"
 Type: filesandordirs; Name: "{app}\__pycache__"
+Type: filesandordirs; Name: "{app}\Logs"
 Type: files;          Name: "{app}\*.log"
 Type: files;          Name: "{app}\*.log.*"
 Type: files;          Name: "{app}\setup_env.log"

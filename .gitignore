@@ -7,6 +7,8 @@ venv/
 # Runtime state — содержит секреты и локальные данные
 config.json
 state.json
+Logs/
+# Legacy log locations (root) — держим в игноре на случай старых копий
 watch.log
 watch.log.*
 cookie_helper.log

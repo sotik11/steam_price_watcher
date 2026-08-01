@@ -46,7 +46,7 @@ def _is_admin() -> bool:
 
 
 def _log(msg: str) -> None:
-    """Append a diagnostic line to `cookie_helper.log` next to the helper.
+    """Append a diagnostic line to `Logs/cookie_helper.log`.
 
     The GUI never sees the helper's stdout/stderr (we run it via
     ShellExecuteW which doesn't capture either), so without this log
@@ -54,7 +54,9 @@ def _log(msg: str) -> None:
     here are swallowed — diagnostics must never bring the helper down.
     """
     try:
-        log_path = Path(__file__).parent / "cookie_helper.log"
+        logs_dir = Path(__file__).parent / "Logs"
+        logs_dir.mkdir(exist_ok=True)
+        log_path = logs_dir / "cookie_helper.log"
         with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(f"{datetime.now().isoformat()} {msg}\n")
     except OSError:

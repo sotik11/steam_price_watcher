@@ -39,7 +39,12 @@ GAMELIST_PATH = BASE / "gamelist.json"
 # GetItems can't resolve to a name (delisted / region-locked / bare
 # placeholders). Adding a game manually by URL un-blacklists it.
 GAMEBLACKLIST_PATH = BASE / "gameblacklist.json"
-LOG_PATH = BASE / "watch.log"
+
+# Logs live in their own subfolder (mirrors watch.py). Created eagerly —
+# the RotatingFileHandler opens the file at import and needs the dir.
+LOGS_DIR = BASE / "Logs"
+LOGS_DIR.mkdir(exist_ok=True)
+LOG_PATH = LOGS_DIR / "watch.log"
 
 # Shared logger writing to watch.log so user-initiated actions ("Оновити
 # зараз", "Запустити зараз") show up in the Журнал tab alongside what
@@ -10859,7 +10864,9 @@ class App(tb.Window):
         self._refresh_log()
 
     def _open_log_folder(self):
-        os.startfile(str(BASE))
+        # Open the Logs subfolder directly — that's where watch.log and
+        # its rotated copies live now.
+        os.startfile(str(LOGS_DIR))
 
     def _on_tab_changed(self, _event=None) -> None:
         """Refresh tab contents from disk when the user switches to them.

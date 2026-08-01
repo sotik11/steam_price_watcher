@@ -1,6 +1,11 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.4.4 (2026-08-01)
+- Logs now go into a dedicated «Logs» subfolder (watch.log and
+  cookie_helper.log) instead of the app root. The «Open logs folder»
+  button opens that subfolder; the Logs folder is removed on uninstall.
+
 v0.1.4.3 (2026-08-01)
 - Fixed daily Epic-alert spam (the same discount every day): the
   state.json key migration prepended «buy:» to every key except
