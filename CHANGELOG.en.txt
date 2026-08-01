@@ -1,6 +1,15 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.4.3 (2026-08-01)
+- Fixed daily Epic-alert spam (the same discount every day): the
+  state.json key migration prepended «buy:» to every key except
+  buy/sell/game — but «epic:» wasn't whitelisted. So each watch.py run
+  renamed the epic key to «buy:epic:…», the antispam entry was lost, and
+  the next check treated it as a first alert. «epic:» is now whitelisted,
+  and already-mangled «buy:epic:…» keys are healed on startup (antispam
+  history preserved). Same class of bug that hit «game:» keys earlier.
+
 v0.1.4.2 (2026-07-08)
 - Fixed «Import from Steam» for cards that were closed at some point
   (bought/sold): if salelist.json / watchlist.json still held an

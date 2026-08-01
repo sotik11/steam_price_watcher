@@ -67,17 +67,29 @@ def _migrate_state_keys(state: dict) -> bool:
     for k in list(state.keys()):
         if k.startswith("__"):
             continue
-        # "game:" must be in this list — without it the migration
-        # mangled every game-alert key into "buy:game:…" on each run,
-        # losing the antispam entry and re-alerting every 5 minutes
-        # (the 2026-06-11 duplicate-alert bug).
-        if not k.startswith(("buy:", "sell:", "game:")):
+        # "game:" and "epic:" MUST be in this list — without them the
+        # migration mangled every game-/epic-alert key into "buy:game:…"
+        # / "buy:epic:…" on each run, losing the antispam entry and
+        # re-alerting every run (the 2026-06-11 duplicate-alert bug for
+        # game:, and the 2026-08-01 daily-Epic-spam bug for epic:).
+        if not k.startswith(("buy:", "sell:", "game:", "epic:")):
             state["buy:" + k] = state.pop(k)
             changed = True
-        elif k.startswith("buy:game:"):
+        elif k.startswith(("buy:game:", "buy:epic:")):
             # Heal keys already mangled by the buggy version: strip the
-            # bogus prefix so the antispam history is preserved.
-            state[k[len("buy:"):]] = state.pop(k)
+            # bogus prefix so the antispam history is preserved. If a
+            # clean key already exists (both ran through), keep the newer
+            # timestamp so we don't resurrect an old alert window.
+            healed = k[len("buy:"):]
+            existing = state.get(healed)
+            mangled = state.pop(k)
+            if existing is None:
+                state[healed] = mangled
+            else:
+                # Prefer whichever entry alerted more recently.
+                e_t = str(existing.get("last_alert_time", ""))
+                m_t = str(mangled.get("last_alert_time", ""))
+                state[healed] = mangled if m_t > e_t else existing
             changed = True
     return changed
 
