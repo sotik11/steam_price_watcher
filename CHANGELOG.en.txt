@@ -1,6 +1,13 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.4.5 (2026-08-17)
+- Fixed the «API returned success=false» error when adding a card or
+  refreshing prices. Steam's market rewrite wrapped the orderbook response
+  in an extra «data» envelope, so «success» and the payload itself moved one
+  level deeper. We now unwrap the new nesting (the old flat shape is still
+  supported as a fallback).
+
 v0.1.4.4 (2026-08-01)
 - Logs now go into a dedicated «Logs» subfolder (watch.log and
   cookie_helper.log) instead of the app root. The «Open logs folder»

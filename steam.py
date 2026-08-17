@@ -257,6 +257,17 @@ def get_price_via_orderbook(appid: str | int, market_hash_name: str,
             t("log.priceoverview_html", name=short_name, head=head)
         ) from exc
 
+    # Steam's 2026 SPA rewrite wrapped the orderbook payload in an extra
+    # {"data": {...}} envelope, so `success` and the real body now live one
+    # level deeper:  {"data": {"success": true, "data": {"amtMinSellOrder": …}}}.
+    # Before, it was flat:  {"success": true, "data": {"amtMinSellOrder": …}}.
+    # Unwrap when we see the new nesting; keep the flat path as a fallback so
+    # we survive Steam reverting or A/B-testing the shape. Without this every
+    # fetch read success=None on the outer dict and raised "success=false".
+    inner = data.get("data")
+    if isinstance(inner, dict) and "success" in inner:
+        data = inner
+
     if not data.get("success"):
         # Surface the friendly card name (no "<appid>-" prefix) — this
         # exception bubbles into user-visible dialogs (_add_by_url warning,
