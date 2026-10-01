@@ -1320,16 +1320,28 @@ class App(tb.Window):
 
     @staticmethod
     def _renumber_tree(tree: ttk.Treeview) -> None:
-        """Refresh the "num" column to 1..N in the current visual order.
+        """Refresh the "num" column to 1..N in the current visual order,
+        and re-stripe the zebra to match it.
 
         Called after every sort or after row-reorder operations so the №
         column reads naturally regardless of the underlying file order.
+        The zebra alternates per top-level row; nested rows («Історія»
+        lists a receipt's extra games under it) take their parent's
+        stripe, so a receipt reads as one block. Rows carrying a state
+        colour instead of a stripe tag are left alone.
         """
+        stripes = ("even", "odd")
         for i, iid in enumerate(tree.get_children("")):
             vals = list(tree.item(iid, "values"))
             if vals:
                 vals[0] = i + 1
                 tree.item(iid, values=vals)
+            for row in (iid, *tree.get_children(iid)):
+                tags = tree.item(row, "tags")
+                if any(tag in stripes for tag in tags):
+                    tree.item(row, tags=tuple(
+                        stripes[i % 2] if tag in stripes else tag
+                        for tag in tags))
 
     def _update_sort_indicators(self, tree: ttk.Treeview) -> None:
         """Append ▲/▼ to the active column heading; strip from the rest."""
