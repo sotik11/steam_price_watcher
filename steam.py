@@ -26,6 +26,7 @@ class SteamSessionExpired(Exception):
 
 PRICE_OVERVIEW_URL = "https://steamcommunity.com/market/priceoverview/"
 ORDERBOOK_URL = "https://steamcommunity.com/market/orderbook"
+MARKET_SEARCH_URL = "https://steamcommunity.com/market/search"
 LISTINGS_URL = "https://steamcommunity.com/market/listings/{appid}/{name}"
 APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
 
@@ -628,6 +629,121 @@ def parse_market_url(url: str) -> tuple[str, str] | None:
         name = urllib.parse.unquote(m.group(2).split("?")[0])
         return appid, name
     return None
+
+
+def is_market_search_url(url: str) -> bool:
+    """True for a Steam Market *search* link (a filtered list of items),
+    as opposed to a single listing."""
+    parts = urllib.parse.urlsplit(url.strip())
+    return (parts.netloc.lower().endswith("steamcommunity.com")
+            and parts.path.rstrip("/") == "/market/search")
+
+
+# The search page is server-rendered: its data sits in the HTML as
+#   window.SSR.renderContext=JSON.parse("<js string>")
+# whose `queryData` is one more JSON string holding the React-Query cache;
+# the query keyed "market_search" carries the result pages. Reading that
+# is far sturdier than the markup, whose class names are hashed.
+_SEARCH_CONTEXT_MARKER = "window.SSR.renderContext=JSON.parse("
+_SEARCH_MAX_PAGES = 10
+_ECONOMY_IMAGE_URL = "https://community.steamstatic.com/economy/image/"
+
+
+def _search_results_page(page_html: str) -> dict:
+    """The {"start", "total_count", "results"} block embedded in a search page."""
+    try:
+        start = page_html.index(_SEARCH_CONTEXT_MARKER) + len(_SEARCH_CONTEXT_MARKER)
+        literal, _ = json.JSONDecoder().raw_decode(page_html, start)
+        queries = json.loads(json.loads(literal)["queryData"])["queries"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError("market search: page data not found") from exc
+    for query in queries:
+        key = query.get("queryKey") or []
+        data = (query.get("state") or {}).get("data")
+        if key[:1] == ["market_search"] and isinstance(data, dict):
+            pages = data.get("pages") or []
+            if pages and isinstance(pages[0], dict) and "results" in pages[0]:
+                return pages[0]
+    raise ValueError("market search: no results block in page data")
+
+
+def fetch_market_search(url: str, cookies: dict | None = None) -> dict:
+    """Read every item a Steam Market search link lists.
+
+    Returns {"items": [...], "total": n}; each item:
+        appid, market_hash_name, display_name, game_name, item_type,
+        image_url, sell_count, price_raw ("From" price as Steam formats
+        it), price (float | None), currency (Steam currency code).
+
+    With community `cookies` Steam prices the results in the account's
+    wallet currency; without them — in USD.
+
+    The search page is rate-limited much harder than listings (a handful
+    of requests in a row earns HTTP 429 for minutes), so this makes one
+    request per result page and nothing else. Raises RateLimitedError on
+    429 and ValueError when the page carries no result data.
+    """
+    community = (cookies or {}).get("steamcommunity.com") or {}
+    parts = urllib.parse.urlsplit(url.strip())
+    query = [(key, value)
+             for key, value in urllib.parse.parse_qsl(parts.query)
+             if key != "start"]
+
+    items: list[dict] = []
+    seen: set[str] = set()
+    total = 0
+    for page_index in range(_SEARCH_MAX_PAGES):
+        if page_index:
+            time.sleep(3.0)
+        page_query = query + ([("start", str(len(items)))] if items else [])
+        resp = requests.get(
+            MARKET_SEARCH_URL, params=page_query, cookies=community,
+            headers={"User-Agent": _UA}, timeout=(5, 40))
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After", "")
+            raise RateLimitedError(
+                "market search", int(retry_after) if retry_after.isdigit() else None)
+        resp.raise_for_status()
+        page = _search_results_page(resp.text)
+        total = int(page.get("total_count") or 0)
+        fresh = 0
+        for result in page.get("results") or []:
+            asset = result.get("asset_description") or {}
+            market_hash_name = result.get("strHash") or asset.get("market_hash_name")
+            if not market_hash_name or market_hash_name in seen:
+                continue
+            seen.add(market_hash_name)
+            fresh += 1
+            display_name = html.unescape(
+                asset.get("name") or asset.get("market_name")
+                or clean_card_name(market_hash_name))
+            asset_type = html.unescape(asset.get("type") or "")
+            game_name, item_type = split_game_and_type(asset_type)
+            if not item_type:
+                # Booster packs: the type is just "Booster Pack", the game
+                # is in the item name.
+                item_type = asset_type
+                game_name = display_name.removesuffix(" " + asset_type).strip()
+            price_raw = result.get("strMinSellSubtotal") or ""
+            icon = asset.get("icon_url") or ""
+            items.append({
+                "appid":            int(asset.get("appid") or 753),
+                "market_hash_name": market_hash_name,
+                "display_name":     display_name,
+                "game_name":        game_name,
+                "item_type":        item_type,
+                "image_url":        _ECONOMY_IMAGE_URL + icon if icon else None,
+                "sell_count":       int(result.get("cSellOrders") or 0),
+                "price_raw":        price_raw,
+                "price":            parse_price(price_raw),
+                "currency":         result.get("eCurrency"),
+            })
+        # Stop when everything is in, or when a "next page" brought nothing
+        # new (Steam ignored the offset) — never loop on the same page.
+        if len(items) >= total or not fresh:
+            break
+    log.info("market search: %d of %d items", len(items), total)
+    return {"items": items, "total": total}
 
 
 def fetch_prices_batch(items: list[dict], currency: int = 18, country: str = "UA",

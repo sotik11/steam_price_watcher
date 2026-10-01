@@ -6000,6 +6000,16 @@ class App(tb.Window):
         )
         if not url:
             return
+        # A market *search* link (a game's cards / backgrounds / …) adds
+        # the whole set at once — buy list only.
+        from steam import is_market_search_url
+        if is_market_search_url(url):
+            if kind != "buy":
+                messagebox.showinfo(t("dlg.bulk.title"),
+                                    t("dlg.bulk.buy_only"), parent=self)
+                return
+            self._open_bulk_add_dialog(url.strip())
+            return
         parsed = parse_market_url(url.strip())
         if not parsed:
             messagebox.showerror(t("dlg.error.title"), t("dlg.add_url.bad_url"),
@@ -6106,6 +6116,328 @@ class App(tb.Window):
         save_json(path, items)
         self._refresh_card_list(kind)
         self._set_status(t("status.added", name=meta["display_name"]))
+
+    # ------------------------------------------------------------------
+    # Bulk add from a Steam Market search link (Покупка only)
+    # ------------------------------------------------------------------
+
+    def _open_bulk_add_dialog(self, url: str) -> None:
+        """«Додати за URL» with a market *search* link: list everything the
+        link finds, let the user tick what to add, then ask a target for
+        each. Modelled on the Steam-import dialog."""
+        existing = getattr(self, "_bulk_dlg", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        dlg = tk.Toplevel(self)
+        self._bulk_dlg = dlg
+        dlg.title(t("dlg.bulk.title"))
+        dlg.transient(self)
+        dlg.grab_set()
+        # Sized off the main window, not in fixed pixels: the table has six
+        # columns and the UI font scales (x1..x5).
+        dlg.geometry(f"{max(860, int(self.winfo_width() * 0.82))}"
+                     f"x{max(520, int(self.winfo_height() * 0.7))}")
+
+        outer = ttk.Frame(dlg, padding=12)
+        outer.pack(fill=BOTH, expand=YES)
+
+        self._bulk_status = ttk.Label(outer, text=t("dlg.import.loading"),
+                                      wraplength=800, justify="left")
+        self._bulk_status.pack(side=TOP, anchor=W, pady=(0, 8), fill=X)
+        dlg.bind("<Configure>", lambda e: self._bulk_status.configure(
+            wraplength=max(200, dlg.winfo_width() - 40)))
+
+        # Buttons first (side=BOTTOM) so a tall list can't push them out.
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(side=BOTTOM, fill=X, pady=(10, 0))
+        ttk.Button(btn_row, text=t("dlg.import.btn_cancel"),
+                   bootstyle="danger",
+                   command=self._close_bulk_dialog).pack(side=LEFT)
+        self._bulk_apply_btn = ttk.Button(
+            btn_row, text=t("dlg.bulk.btn_add"), bootstyle="success",
+            state=DISABLED, command=self._apply_bulk_selection)
+        self._bulk_apply_btn.pack(side=RIGHT)
+
+        self._bulk_content = ttk.Frame(outer)
+        self._bulk_content.pack(side=TOP, fill=BOTH, expand=YES)
+        self._bulk_tree: ttk.Treeview | None = None
+        self._bulk_rows: dict[str, dict] = {}
+
+        dlg.protocol("WM_DELETE_WINDOW", self._close_bulk_dialog)
+        dlg.bind("<Escape>", lambda e: self._close_bulk_dialog())
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 4
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        cookies = (self.config_data.get("steam") or {}).get("cookies")
+
+        def worker() -> None:
+            import steam
+            found: dict | None = None
+            error: str | None = None
+            try:
+                found = steam.fetch_market_search(url, cookies)
+            except steam.RateLimitedError:
+                error = t("dlg.bulk.rate_limited")
+                log.warning("bulk add: market search rate-limited")
+            except Exception as exc:
+                error = t("dlg.import.network_error", err=str(exc))
+                log.exception("bulk add: market search failed")
+            self.after(0, lambda: self._bulk_render(found, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _close_bulk_dialog(self) -> None:
+        dlg = getattr(self, "_bulk_dlg", None)
+        if dlg is None:
+            return
+        self._bulk_dlg = None
+        try:
+            dlg.grab_release()
+            dlg.destroy()
+        except tk.TclError:
+            pass
+
+    def _bulk_render(self, found: dict | None, error: str | None) -> None:
+        """Tk-thread half of the dialog: show the fetched items."""
+        dlg = getattr(self, "_bulk_dlg", None)
+        if dlg is None or not dlg.winfo_exists():
+            return  # closed while loading
+        if error:
+            self._bulk_status.configure(text=error,
+                                        foreground=self.style.colors.danger)
+            return
+        items = found["items"]
+        if not items:
+            self._bulk_status.configure(text=t("dlg.bulk.nothing_found"),
+                                        foreground=self.style.colors.warning)
+            return
+
+        question = t("dlg.bulk.question", count=len(items))
+        if found["total"] > len(items):
+            question += "  " + t("dlg.bulk.partial", shown=len(items),
+                                 total=found["total"])
+        self._bulk_status.configure(text=question, foreground="")
+
+        # market_hash_name → target of the row already tracked (active only:
+        # closed rows live in the file for the archive and don't count).
+        tracked = {
+            row.get("market_hash_name"): row.get("target_price")
+            for row in load_json(WATCHLIST_PATH, []) or []
+            if row.get("status") not in CLOSED_STATUSES
+        }
+
+        frame = ttk.Frame(self._bulk_content)
+        frame.pack(fill=BOTH, expand=YES)
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill=X, pady=(0, 4))
+
+        cols = ("card", "game", "type", "count", "price", "status")
+        tree = ttk.Treeview(frame, columns=cols, show="headings",
+                            selectmode="extended",
+                            height=min(14, max(3, len(items))))
+        for col, heading, width, anchor in (
+            ("card",   t("dlg.import.col_card"),   260, W),
+            ("game",   t("dlg.import.col_game"),   200, W),
+            ("type",   t("col.type"),              170, W),
+            ("count",  t("dlg.bulk.col_count"),    110, E),
+            ("price",  t("dlg.bulk.col_price"),    110, E),
+            ("status", t("dlg.import.col_status"), 240, W),
+        ):
+            tree.heading(col, text=heading, anchor=anchor)
+            tree.column(col, width=width, minwidth=60, anchor=anchor)
+        scrollbar = ttk.Scrollbar(frame, orient=VERTICAL, command=tree.yview,
+                                  bootstyle="success")
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side=LEFT, fill=BOTH, expand=YES)
+        scrollbar.pack(side=RIGHT, fill=Y)
+
+        for item in items:
+            target = tracked.get(item["market_hash_name"])
+            in_list = item["market_hash_name"] in tracked
+            item["_tracked_target"] = target if in_list else None
+            item["_in_list"] = in_list
+            status = (t("dlg.bulk.status.listed", target=self._fmt_money(target))
+                      if in_list else t("dlg.import.status.new"))
+            iid = tree.insert("", END, values=(
+                item["display_name"], item["game_name"], item["item_type"],
+                item["sell_count"], item["price_raw"] or "—", status))
+            self._bulk_rows[iid] = item
+        # Everything ticked by default — the question is "add them all?".
+        tree.selection_set(*tree.get_children())
+        tree.bind("<Control-KeyPress>", self._on_tree_ctrl_a)
+        tree.bind("<<TreeviewSelect>>", self._on_bulk_selection_change)
+
+        ttk.Button(toolbar, text=t("dlg.import.toggle_all"), bootstyle="link",
+                   command=lambda: tree.selection_set(*tree.get_children())
+                   ).pack(side=LEFT)
+        ttk.Button(toolbar, text=t("dlg.import.toggle_none"), bootstyle="link",
+                   command=lambda: tree.selection_remove(*tree.get_children())
+                   ).pack(side=LEFT, padx=(8, 0))
+
+        self._bulk_tree = tree
+        self._on_bulk_selection_change()
+
+    def _on_bulk_selection_change(self, _event=None) -> None:
+        tree = self._bulk_tree
+        if tree is None:
+            return
+        count = len(tree.selection())
+        self._bulk_apply_btn.configure(
+            state=NORMAL if count else DISABLED,
+            text=(t("dlg.bulk.btn_add_count", count=count) if count
+                  else t("dlg.bulk.btn_add")))
+
+    def _apply_bulk_selection(self) -> None:
+        """Ask a target for every ticked item, in table order, then save.
+
+        Per item: set a target (adds it, or overwrites the target of an
+        item already in the list), skip it, or cancel the rest. Decisions
+        made before a cancel are kept.
+        """
+        tree = self._bulk_tree
+        if tree is None:
+            return
+        chosen = [self._bulk_rows[iid] for iid in tree.get_children()
+                  if iid in tree.selection()]
+        self._close_bulk_dialog()
+
+        rows = load_json(WATCHLIST_PATH, []) or []
+        currency = (self.config_data.get("market") or {}).get("currency", 18)
+        added = updated = 0
+        for position, item in enumerate(chosen, start=1):
+            action, target = self._ask_bulk_target(item, position, len(chosen))
+            if action == "cancel":
+                break
+            if action == "skip":
+                continue
+            active = next(
+                (row for row in rows
+                 if row.get("market_hash_name") == item["market_hash_name"]
+                 and row.get("status") not in CLOSED_STATUSES), None)
+            if active is not None:
+                active["target_price"] = target
+                updated += 1
+                continue
+            rows.append({
+                "id": str(uuid.uuid4()),
+                "name": item["market_hash_name"],
+                "appid": item["appid"],
+                "market_hash_name": item["market_hash_name"],
+                "display_name": item["display_name"],
+                "game_name": item["game_name"],
+                "item_type": item["item_type"],
+                "imported": False,
+                "image_url": item["image_url"],
+                "target_price": target,
+                "status": "",
+                # The search price is usable only in our own currency —
+                # without a session Steam answers in USD.
+                "last_seen": (item["price_raw"]
+                              if item.get("currency") == currency
+                              and item["price_raw"] else "—"),
+            })
+            added += 1
+
+        if added or updated:
+            save_json(WATCHLIST_PATH, rows)
+            self._refresh_card_list("buy")
+        self._set_status(t("status.bulk_done", added=added, updated=updated))
+
+    def _ask_bulk_target(self, item: dict, position: int,
+                         total: int) -> tuple[str, float | None]:
+        """Modal target prompt for one item of a bulk add.
+
+        Returns ("set", target), ("skip", None) or ("cancel", None).
+        Enter confirms, Esc skips this item, closing the window cancels
+        the rest.
+        """
+        dlg = tk.Toplevel(self)
+        dlg.title(t("dlg.bulk.target_title", position=position, total=total))
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        result: dict = {"action": "cancel", "target": None}
+
+        body = ttk.Frame(dlg, padding=14)
+        body.pack(fill=BOTH, expand=YES)
+        ttk.Label(body, text=item["display_name"],
+                  font=("", 0, "bold")).pack(anchor=W)
+        subtitle = " — ".join(part for part in
+                              (item["game_name"], item["item_type"]) if part)
+        if subtitle:
+            ttk.Label(body, text=subtitle,
+                      foreground=self.style.colors.secondary).pack(anchor=W)
+        ttk.Label(body, text=t("dlg.bulk.market_line",
+                               price=item["price_raw"] or "—",
+                               count=item["sell_count"])
+                  ).pack(anchor=W, pady=(8, 0))
+        in_list = item.get("_in_list")
+        if in_list:
+            ttk.Label(body,
+                      text=t("dlg.bulk.already_line",
+                             target=self._fmt_money(item.get("_tracked_target"))),
+                      foreground=self.style.colors.warning
+                      ).pack(anchor=W, pady=(4, 0))
+
+        entry_row = ttk.Frame(body)
+        entry_row.pack(fill=X, pady=(10, 0))
+        ttk.Label(entry_row, text=t("dlg.bulk.target_label",
+                                    sym=self._currency_symbol())
+                  ).pack(side=LEFT)
+        var = tk.StringVar()
+        tracked_target = item.get("_tracked_target")
+        if isinstance(tracked_target, (int, float)):
+            var.set(f"{tracked_target:g}")
+        entry = ttk.Entry(entry_row, textvariable=var, width=12)
+        entry.pack(side=LEFT, padx=(8, 0))
+        error_label = ttk.Label(body, text="",
+                                foreground=self.style.colors.danger)
+        error_label.pack(anchor=W)
+
+        def confirm(_event=None):
+            try:
+                target = float(var.get().strip().replace(",", "."))
+                if target <= 0:
+                    raise ValueError
+            except ValueError:
+                error_label.configure(text=t("dlg.bad_number"))
+                entry.focus_set()
+                entry.selection_range(0, END)
+                return
+            result.update(action="set", target=target)
+            dlg.destroy()
+
+        def skip(_event=None):
+            result.update(action="skip")
+            dlg.destroy()
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=X, pady=(8, 0))
+        ttk.Button(buttons, text=t("dlg.bulk.btn_cancel_rest"),
+                   bootstyle="danger", command=dlg.destroy).pack(side=LEFT)
+        ttk.Button(buttons,
+                   text=t("dlg.bulk.btn_overwrite" if in_list
+                          else "dlg.bulk.btn_set"),
+                   bootstyle="success", command=confirm).pack(side=RIGHT)
+        ttk.Button(buttons, text=t("dlg.bulk.btn_skip"),
+                   command=skip).pack(side=RIGHT, padx=(0, 6))
+
+        dlg.bind("<Return>", confirm)
+        dlg.bind("<KP_Enter>", confirm)
+        dlg.bind("<Escape>", skip)
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+        entry.focus_set()
+        entry.selection_range(0, END)
+        self.wait_window(dlg)
+        return result["action"], result["target"]
 
     def _edit_target(self):
         from steam import pretty_name

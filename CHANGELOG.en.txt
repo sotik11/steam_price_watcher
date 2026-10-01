@@ -2,6 +2,11 @@ Steam Price Watcher — Changelog
 ===============================
 
 UNRELEASED
+- «Add by URL» on the «Purchase» tab now also accepts a Market search link
+  (for example all foil cards or all backgrounds of one game): a window lists
+  every item found, you keep them all or untick some, then set a target for
+  each in turn. An item already in the list can have its target overwritten
+  or be skipped.
 - New «Slate» theme (now the default): flat tabs with an underlined active
   one, borderless table headers, quiet grey buttons — colour is kept only
   where it means something. A row's state (price is good / not) is shown by
