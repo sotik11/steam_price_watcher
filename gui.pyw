@@ -4307,23 +4307,23 @@ class App(tb.Window):
     # tab stops polling/alerts but keeps gamelist.json intact.
 
     # Column ids in the games tree (1-based "#n", order = `cols` below):
-    # num#1 name#2 regular#3 minimum#4 discount#5 price#6 epic#7 status#8
+    # num#1 name#2 price#3 discount#4 minimum#5 regular#6 epic#7 status#8
     # link#9 imported#10 no_check#11 no_alert#12
     _GAMES_LINK_COL_ID = "#9"   # «Посилання» («Steam | Epic», clickable)
 
     def _build_games_tab(self) -> None:
         parent = self.tab_games
-        # Order per user spec: Ціна → Мінімальна → Знижка → Поточна Steam →
-        # Поточна Epic.
-        cols = ("num", "name", "regular", "minimum", "discount", "price",
+        # Order per user spec: Ціна (current Steam) → Знижка → Min → Max
+        # (regular price) → Epic Store.
+        cols = ("num", "name", "price", "discount", "minimum", "regular",
                 "epic", "status", "link", "imported", "no_check", "no_alert")
         headings = [
             ("num",      "col.num",            40),
             ("name",     "col.games.name",    280),
-            ("regular",  "col.games.regular", 90),
-            ("minimum",  "col.games.minimum", 100),
-            ("discount", "col.games.discount", 80),
             ("price",    "col.games.price",   100),
+            ("discount", "col.games.discount", 80),
+            ("minimum",  "col.games.minimum", 100),
+            ("regular",  "col.games.regular", 90),
             ("epic",     "col.games.epic",    110),
             ("status",   "col.status",        110),
             ("link",     "col.link",          110),
@@ -4515,10 +4515,10 @@ class App(tb.Window):
                 values=(
                     i + 1,
                     g.get("name") or f"app {g.get('appid')}",
-                    self._fmt_money(regular),
-                    self._fmt_money(minimum),
-                    f"-{disc}%" if disc else "—",
                     (g.get("price_str") or "—").replace(",", "."),
+                    f"-{disc}%" if disc else "—",
+                    self._fmt_money(minimum),
+                    self._fmt_money(regular),
                     epic_cell,
                     status,
                     link_cell,
