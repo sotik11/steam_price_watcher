@@ -1,6 +1,22 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.2.0.0 (2026-10-01)
+- New «History» tab — operations imported straight from Steam with the
+  «Import from Steam» button: every Community Market purchase and sale
+  (exact time, price, and the «received after fees» amount for sales), plus
+  game purchases and refunds from the account history. The first import
+  takes everything, later ones only what is new; no duplicates.
+- The former «History» is now «Archive»: lots closed with «Already
+  purchased» / «Sold» land here. Cards no longer ask for a price — it comes
+  from the import. Archive keeps «Purchase history», «Export CSV» and
+  «Re-add to watchlist»; the manual «Add / Edit price / Delete» are gone.
+- The finance block moved to the new «History» and is computed from the
+  imported Market operations (games are not included in the sums). The
+  balance anchor and the ⚙ button are gone: «Steam balance» is the last
+  known wallet balance, stored on disk and shown next to the avatar when
+  the session has expired.
+
 v0.1.4.6 (2026-10-01)
 - Fixed: the app failed to start after a fresh install (seen on
   Windows 11) with «unknown option "-bootstyle"». The installer pulled the

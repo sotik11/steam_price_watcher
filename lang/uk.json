@@ -10,6 +10,7 @@
   "tab.sales":     "  Продаж  ",
   "tab.games":     "  Ігри  ",
   "tab.history":   "  Історія  ",
+  "tab.archive":   "  Архів  ",
   "tab.scheduler": "  Планувальник  ",
   "tab.log":       "  Журнал  ",
   "tab.settings":  "  Налаштування  ",
@@ -105,6 +106,7 @@
   "col.operation":      "Операція",
   "operation.buy":      "придбання",
   "operation.sell":     "продаж",
+  "operation.refund":   "повернення",
 
   "btn.add_by_url":      "Додати за URL…",
   "btn.edit_target":     "Змінити ціль",
@@ -282,6 +284,7 @@
 
   "btn.history_market_log": "Історія придбань 🔗",
   "btn.history_export":     "Експорт CSV",
+  "btn.history_import":     "📥 Імпорт зі Steam",
   "btn.history_add":        "Додати",
   "btn.history_edit":       "Редагувати ціну",
   "btn.history_readd":      "Знов до списку",
@@ -292,6 +295,12 @@
   "hist.total_sell": "Сума продажів:",
   "hist.spent":      "Витрачено:",
   "hist.balance":    "Баланс Steam:",
+  "hist.type.store": "Крамниця Steam",
+  "hist.import.running": "Імпорт…",
+  "hist.import.progress": "Імпорт… {done}/{total}",
+  "hist.import.done": "Імпорт завершено.\nНових операцій на ринку: {market}\nНових покупок у крамниці: {store}",
+  "hist.import.store_skipped": "Історію крамниці (ігри та баланс гаманця) оновити не вдалося — сесія крамниці Steam прострочена. Операції ринку імпортовано.",
+  "hist.import.rate_limited": "Steam тимчасово обмежив запити. Спробуйте імпорт пізніше.",
   "hist.adjusted_note": "* було відкореговано станом на: {date}",
 
   "dlg.hist_add.title":         "Додати запис до історії",

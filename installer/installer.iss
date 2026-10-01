@@ -23,7 +23,7 @@
 ; ============================================================================
 
 #define MyAppName "Steam Price Watcher"
-#define MyAppVersion "0.1.4.6"
+#define MyAppVersion "0.2.0.0"
 #define MyAppPublisher "sotik"
 #define PyVersion "3.13.7"
 #define PyInstaller "python-" + PyVersion + "-amd64.exe"
@@ -229,6 +229,7 @@ begin
   CopyDataFile(srcDir, dst, 'gamelist.json');
   CopyDataFile(srcDir, dst, 'gameblacklist.json');
   CopyDataFile(srcDir, dst, 'purchases.json');
+  CopyDataFile(srcDir, dst, 'steam_history.json');
   CopyDataFile(srcDir, dst, 'state.json');
   CopyDataMask(srcDir, dst, '*.log');
   CopyDataMask(srcDir, dst, '*.log.*');
@@ -243,6 +244,7 @@ begin
   CopyDataFile(srcDir, dstDir, 'gamelist.json');
   CopyDataFile(srcDir, dstDir, 'gameblacklist.json');
   CopyDataFile(srcDir, dstDir, 'purchases.json');
+  CopyDataFile(srcDir, dstDir, 'steam_history.json');
   CopyDataFile(srcDir, dstDir, 'state.json');
 end;
 
@@ -618,6 +620,7 @@ begin
     DeleteFile(ExistingDir + '\gamelist.json');
     DeleteFile(ExistingDir + '\gameblacklist.json');
     DeleteFile(ExistingDir + '\purchases.json');
+    DeleteFile(ExistingDir + '\steam_history.json');
     DeleteFile(ExistingDir + '\state.json');
     DelTree(ExistingDir + '\.venv', True, True, True);
     DelTree(ExistingDir + '\*.log', False, True, False);

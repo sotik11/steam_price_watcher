@@ -10,6 +10,7 @@
   "tab.sales":     "  Sales  ",
   "tab.games":     "  Games  ",
   "tab.history":   "  History  ",
+  "tab.archive":   "  Archive  ",
   "tab.scheduler": "  Scheduler  ",
   "tab.log":       "  Log  ",
   "tab.settings":  "  Settings  ",
@@ -105,6 +106,7 @@
   "col.operation":      "Operation",
   "operation.buy":      "purchase",
   "operation.sell":     "sale",
+  "operation.refund":   "refund",
 
   "btn.add_by_url":      "Add by URL…",
   "btn.edit_target":     "Edit target",
@@ -282,6 +284,7 @@
 
   "btn.history_market_log": "Purchase history 🔗",
   "btn.history_export":     "Export CSV",
+  "btn.history_import":     "📥 Import from Steam",
   "btn.history_add":        "Add",
   "btn.history_edit":       "Edit price",
   "btn.history_readd":      "Re-add to watchlist",
@@ -292,6 +295,12 @@
   "hist.total_sell": "Total sales:",
   "hist.spent":      "Spent:",
   "hist.balance":    "Steam balance:",
+  "hist.type.store": "Steam Store",
+  "hist.import.running": "Importing…",
+  "hist.import.progress": "Importing… {done}/{total}",
+  "hist.import.done": "Import finished.\nNew market operations: {market}\nNew store purchases: {store}",
+  "hist.import.store_skipped": "Store history (games and wallet balance) could not be refreshed — the Steam store session has expired. Market operations were imported.",
+  "hist.import.rate_limited": "Steam is rate-limiting requests. Try the import again later.",
   "hist.adjusted_note": "* adjusted as of: {date}",
 
   "dlg.hist_add.title":         "Add history record",

@@ -55,6 +55,7 @@ def _sf_thumb(scrolled_frame) -> float:
     return thumb
 
 import i18n
+import steam_history
 import themes as custom_themes
 from i18n import t
 from version import __version__, APP_NAME, APP_AUTHOR, APP_CONTACT
@@ -65,6 +66,7 @@ WATCHLIST_PATH = BASE / "watchlist.json"
 SALELIST_PATH = BASE / "salelist.json"
 STATE_PATH = BASE / "state.json"
 PURCHASES_PATH = BASE / "purchases.json"
+STEAM_HISTORY_PATH = BASE / steam_history.HISTORY_FILENAME
 # Wishlist-games tracking («Ігри» tab). Survives the bonus_content
 # checkbox being switched off — the tab hides, the data stays.
 GAMELIST_PATH = BASE / "gamelist.json"
@@ -428,6 +430,7 @@ class App(tb.Window):
         self._refresh_watchlist()
         self._refresh_scheduler_status()
         self._refresh_history()
+        self._refresh_archive()
         self._start_log_autoupdate()
         # Backfill display_name/game_name for any pre-existing entries that
         # were saved before the metadata fields existed. Runs once on a
@@ -1139,6 +1142,8 @@ class App(tb.Window):
             return "sell"
         if tree is getattr(self, "hist_tree", None):
             return "history"
+        if tree is getattr(self, "shist_tree", None):
+            return "steam_history"
         if tree is getattr(self, "games_tree", None):
             return "games"
         return None
@@ -1483,6 +1488,7 @@ class App(tb.Window):
         self.tab_sales     = _scrollable_tab()
         self.tab_games     = _scrollable_tab()
         self.tab_history   = _scrollable_tab()
+        self.tab_archive   = _scrollable_tab()
         self.tab_scheduler = ttk.Frame(self.notebook)
         self.tab_log       = ttk.Frame(self.notebook)
         self.tab_settings  = _scrollable_tab()
@@ -1493,6 +1499,7 @@ class App(tb.Window):
             (self.tab_sales,     "tab.sales"),
             (self.tab_games,     "tab.games"),
             (self.tab_history,   "tab.history"),
+            (self.tab_archive,   "tab.archive"),
             (self.tab_scheduler, "tab.scheduler"),
             (self.tab_log,       "tab.log"),
             (self.tab_settings,  "tab.settings"),
@@ -1528,6 +1535,7 @@ class App(tb.Window):
         self._build_settings_tab()
         self._build_scheduler_tab()
         self._build_history_tab()
+        self._build_archive_tab()
         self._build_log_tab()
         self._build_about_tab()
 
@@ -2309,15 +2317,19 @@ class App(tb.Window):
         country = info.get("country")
         expired = info.get("session_expired")
 
+        # Keep the last live balance on disk: the «Історія» finance block
+        # and the avatar widget read it back once the session dies.
+        if balance and expired is not True:
+            self._store_wallet_balance(balance)
+
         # Session-expired UX: only flip on a definitive True/False; None
         # means "couldn't tell" (network error etc.) — leave the
         # previous state alone so a flaky moment doesn't trigger the
         # warning theatre.
         if expired is True:
             self._set_session_warning(True)
-            # Wallet number can't be fetched → fall back to what we know
-            # from History (anchor.balance + operations since). Better a
-            # stale-but-informed number than a flat 0.00 next to the avatar.
+            # Wallet number can't be fetched → fall back to the last
+            # balance we saved. Better stale than a flat 0.00.
             if not balance:
                 fallback = self._history_wallet_estimate()
                 if fallback is not None:
@@ -2371,6 +2383,7 @@ class App(tb.Window):
         if changed and hasattr(self, "_refresh_history"):
             try:
                 self._refresh_history()
+                self._refresh_archive()
             except tk.TclError:
                 pass
 
@@ -3981,48 +3994,6 @@ class App(tb.Window):
                     state=NORMAL if sel_items else DISABLED,
                 )
 
-    def _update_hist_delete_state(self) -> None:
-        """Mirror card-list «Видалити» contract on the History tab.
-
-        Disabled + plain-style when nothing is selected; enabled with
-        the `danger` bootstyle the moment the click would do real work.
-        Bound to `hist_tree.<<TreeviewSelect>>` so the state tracks
-        whatever the user has highlighted, including multi-select.
-        """
-        btn = getattr(self, "btn_hist_delete", None)
-        tree = getattr(self, "hist_tree", None)
-        if btn is None or tree is None:
-            return
-        try:
-            has_sel = bool(tree.selection())
-        except tk.TclError:
-            return
-        if has_sel:
-            btn.configure(state=NORMAL, bootstyle="danger")
-        else:
-            btn.configure(state=DISABLED, bootstyle="")
-
-    # ------------------------------------------------------------------
-    # «Ігри» tab — wishlist game price tracking (bonus content)
-    # ------------------------------------------------------------------
-    #
-    # A third tracked list, but for store games instead of market cards:
-    #   * rows come from the user's Steam wishlist (one-click import);
-    #   * "Мінімум" is the historical-low price reconstructed from the
-    #     deepest recorded discount (Augmented Steam / ITAD data — the
-    #     same number SteamDB shows as "Lowest Recorded Price") applied
-    #     to Steam's regular price in the user's currency;
-    #   * alert rule: current price <= minimum → the discount matched
-    #     (or beat) the all-time low. kind="game" in the shared
-    #     antispam state.
-    # Lives behind the «Бонусний контент» Settings checkbox: hiding the
-    # tab stops polling/alerts but keeps gamelist.json intact.
-
-    # Column ids in the games tree (1-based "#n", order = `cols` below):
-    # num#1 name#2 regular#3 minimum#4 discount#5 price#6 epic#7 status#8
-    # link#9 imported#10 no_check#11 no_alert#12
-    _GAMES_LINK_COL_ID = "#9"   # «Посилання» («Steam | Epic», clickable)
-
     def _build_games_tab(self) -> None:
         parent = self.tab_games
         # Order per user spec: Ціна → Мінімальна → Знижка → Поточна Steam →
@@ -4559,7 +4530,7 @@ class App(tb.Window):
         save_json(PURCHASES_PATH, purchases)
         save_json(STATE_PATH, state)
         self._refresh_games_list()
-        self._refresh_history()
+        self._refresh_archive()
 
     def _games_import_wishlist(self) -> None:
         """Import / refresh from the Steam wishlist.
@@ -6410,17 +6381,11 @@ class App(tb.Window):
         threading.Thread(target=_work, daemon=True).start()
 
     def _mark_completed(self):
-        """User confirms the transaction(s) — buy or sell, depending on tab.
+        """Move the selected lot(s) to «Архів» — buy or sell, depending on tab.
 
-        Group selected rows by card identity (appid, name):
-        - Same card in N rows → one dialog applies one price to all copies
-          (typical bulk: sold 5 copies at the same price).
-        - Different cards → one dialog per unique card, in sequence;
-          Cancel on a dialog skips THAT card (its rows stay in the list
-          untouched) and moves on to the next.
+        No price question: actual prices come from the Steam import on the
+        «Історія» tab. «Знов до списку» on «Архів» undoes the move.
         """
-        from steam import pretty_name
-
         selected = self._require_selection()
         if not selected:
             return
@@ -6437,45 +6402,14 @@ class App(tb.Window):
             ident = (item.get("appid"), item.get("name"))
             groups.setdefault(ident, []).append(item)
 
-        # Walk groups, ask per-group; collect closed ids + purchase rows.
-        body_key_single = ("dlg.completed.body_buy" if kind == "buy"
-                           else "dlg.completed.body_sell")
-        body_key_multi = ("dlg.completed.body_buy_multi" if kind == "buy"
-                          else "dlg.completed.body_sell_multi")
-
+        # The real price arrives with the Steam import on «Історія»; the
+        # archive row just keeps the lot's target for reference.
         closed_ids: set = set()
         new_purchases: list[dict] = []
-        for ident, group in groups.items():
-            sample = group[0]
-            pretty = pretty_name(sample)
-            if len(group) == 1:
-                body = t(body_key_single, name=pretty, sym=sym)
-                target = sample.get("target_price")
-                default_str = (f"{target:.2f}" if isinstance(target, (int, float))
-                               else str(target or ""))
-            else:
-                body = t(body_key_multi, count=len(group), sym=sym)
-                # Heterogeneous targets across duplicates are unusual but
-                # possible — leave the field empty rather than guess.
-                default_str = ""
-            price_str = simpledialog.askstring(
-                t("dlg.completed.title"), body,
-                initialvalue=default_str, parent=self,
-            )
-            if price_str is None:
-                # Cancel → skip this card entirely, keep going.
-                continue
-            try:
-                price_val = float(price_str.replace(",", "."))
-            except ValueError:
-                # Bad number on this card → show error, skip it.
-                messagebox.showerror(
-                    t("dlg.error.title"), t("dlg.bad_number"), parent=self,
-                )
-                continue
-            price_formatted = f"{price_val:.2f} {sym}".rstrip()
+        for group in groups.values():
             for item in group:
                 closed_ids.add(item["id"])
+                target = item.get("target_price")
                 new_purchases.append({
                     "name": item.get("name"),
                     "display_name": item.get("display_name") or item.get("name"),
@@ -6483,16 +6417,13 @@ class App(tb.Window):
                     "image_url": item.get("image_url"),
                     "appid": item.get("appid"),
                     "market_hash_name": item.get("market_hash_name"),
-                    "price": price_formatted,
-                    "target": item.get("target_price"),
+                    "price": (f"{target:.2f} {sym}".rstrip()
+                              if isinstance(target, (int, float)) else "—"),
+                    "target": target,
                     "operation": kind,
                     "timestamp": ts,
                     "_created": ts,
                 })
-
-        if not closed_ids:
-            # Either the user cancelled everything or all groups errored out.
-            return
 
         items = load_json(path, [])
         purchases = load_json(PURCHASES_PATH, [])
@@ -6503,7 +6434,7 @@ class App(tb.Window):
         save_json(path, items)
         save_json(PURCHASES_PATH, purchases)
         self._refresh_card_list(kind)
-        self._refresh_history()
+        self._refresh_archive()
 
     def _mark_not_bought(self):
         selected = self._require_selection()
@@ -8125,7 +8056,7 @@ class App(tb.Window):
         if hasattr(self, "hist_tree"):
             self._apply_row_tags(self.hist_tree)
         self._refresh_watchlist()
-        self._refresh_history()
+        self._refresh_archive()
         # New theme → new title-bar colour.
         self._apply_native_titlebar_theme()
 
@@ -8181,7 +8112,7 @@ class App(tb.Window):
         # Only skip when we have LIVE cookies (session not expired) —
         # then Steam's own wallet fetch owns the label. If the session
         # died, cookies still linger but we must not defer to them; the
-        # anchor-derived estimate is more truthful than a stale 0.00.
+        # last saved balance is more truthful than a stale 0.00.
         expired = getattr(self, "_session_warning_active", False)
         if has_cookies and not expired:
             return
@@ -8512,12 +8443,6 @@ class App(tb.Window):
         steam_section = self.config_data.get("steam")
         if steam_section is not None:
             cfg["steam"] = steam_section
-        # Same preservation contract for the History balance anchor —
-        # it's owned by the anchor dialog on the Історія tab, Settings
-        # doesn't touch it, so a Settings "Save" mustn't wipe it either.
-        anchor_section = self.config_data.get("balance_anchor")
-        if anchor_section is not None:
-            cfg["balance_anchor"] = anchor_section
         save_json(CONFIG_PATH, cfg)
         self.config_data = cfg
         # Apply font scale live so the change is visible without a restart.
@@ -8642,6 +8567,7 @@ class App(tb.Window):
     _BACKUP_FILES = (
         "config.json", "watchlist.json", "salelist.json", "gamelist.json",
         "gameblacklist.json", "purchases.json", "state.json",
+        "steam_history.json",
     )
 
     def _backup_export(self):
@@ -8824,7 +8750,7 @@ class App(tb.Window):
         if hasattr(self, "hist_tree"):
             self._apply_row_tags(self.hist_tree)
         self._refresh_watchlist()
-        self._refresh_history()
+        self._refresh_archive()
         self._apply_native_titlebar_theme()
 
         # Shrink window back to the launch geometry. minsize re-caps after
@@ -8999,7 +8925,9 @@ class App(tb.Window):
 
     # ---- History ---------------------------------------------------------
 
-    def _build_history_tab(self):
+    def _build_archive_tab(self):
+        # «Архів»: lots closed by hand via «Вже придбав» / «Продав» on
+        # the lists. Money lives on the «Історія» tab (Steam import).
         # AppID hidden here for the same reason as in Watchlist. Target /
         # delta dropped because they're irrelevant once the card is closed.
         # Operation tells buy vs sell at a glance. Price relabelled to a
@@ -9011,18 +8939,12 @@ class App(tb.Window):
         # buttons when the window is too narrow to fit both on one row
         # (otherwise the stats get clipped off the right edge). The
         # reflow is wired via _reflow_history_bottom below.
-        bottom = ttk.Frame(self.tab_history)
+        bottom = ttk.Frame(self.tab_archive)
         bottom.pack(side=BOTTOM, fill=X, padx=8, pady=(0, 8))
-        bottom.columnconfigure(0, weight=1)
         btn_f = ttk.Frame(bottom)
-        # sticky="nw" so buttons stay at the TOP-LEFT of the cell — without
-        # the "n" they'd center vertically when the row's height grows to
-        # fit a multi-row stats panel, drifting away from the table edge.
-        btn_f.grid(row=0, column=0, sticky="nw")
-        self._hist_bottom = bottom
-        self._hist_btn_f = btn_f
+        btn_f.pack(side=LEFT)
 
-        hist_frame = ttk.Frame(self.tab_history, borderwidth=1, relief="solid")
+        hist_frame = ttk.Frame(self.tab_archive, borderwidth=1, relief="solid")
         hist_frame.pack(side=TOP, fill=BOTH, expand=YES, padx=8, pady=8)
 
         self.hist_tree = ttk.Treeview(hist_frame, columns=cols, show="headings", selectmode="extended")
@@ -9046,23 +8968,19 @@ class App(tb.Window):
         self._apply_row_tags(self.hist_tree)
         self._setup_sortable_columns(self.hist_tree, list(cols))
         self._setup_column_widths(self.hist_tree)
-        # Selection handler is wired AFTER the action-button row builds —
-        # see further down (it needs `self.btn_hist_delete` to exist so
-        # the same callback can flip its enabled state). The
-        # `_mark_selected_rows` part lives in the combined handler.
+        self.hist_tree.bind(
+            "<<TreeviewSelect>>",
+            lambda e: self._mark_selected_rows(self.hist_tree))
         # Click on the link column opens the market listing in a browser.
         self.hist_tree.bind("<Button-1>", self._on_hist_tree_click, add="+")
-        # Delete → Видалити запис; Enter → Знов до списку; Space → Редагувати
-        # ціну; Esc → clear selection.
-        self.hist_tree.bind("<Delete>", lambda e: self._hist_delete(), add="+")
+        # Enter → Знов до списку; Esc → clear selection.
         self.hist_tree.bind("<Return>", lambda e: self._hist_readd(), add="+")
         self.hist_tree.bind("<KP_Enter>", lambda e: self._hist_readd(), add="+")
-        self.hist_tree.bind("<space>", lambda e: self._hist_edit(), add="+")
         self.hist_tree.bind("<Escape>", self._clear_tree_selection, add="+")
         self.hist_tree.bind("<Motion>", self._on_hist_tree_motion)
         # Same Ctrl+A toggle as the card-list trees.
         self.hist_tree.bind("<Control-KeyPress>", self._on_tree_ctrl_a)
-        # Right-click context menu mirroring the History buttons.
+        # Right-click context menu mirroring the Archive buttons.
         self.hist_tree.bind("<Button-3>", self._show_hist_context_menu)
         vsb2 = ttk.Scrollbar(hist_frame, orient=VERTICAL, command=self.hist_tree.yview,
                              bootstyle="success")
@@ -9074,152 +8992,324 @@ class App(tb.Window):
         vsb2.grid(row=0, column=1, sticky="ns")
         hist_frame.grid_rowconfigure(0, weight=1)
         hist_frame.grid_columnconfigure(0, weight=1)
-        # Buttons live in TWO rows now:
-        #   row1: Історія придбань / Експорт CSV / Додати
-        #   row2: Знов до списку   / Редагувати ціну / Видалити
-        # The three selection-dependent actions go to row 2 (they were
-        # always the "less common, requires a picked row" ones); the top
-        # row is the always-available actions the user needs at hand.
-        # `btn_f` itself is the outer grid cell that shares row=0 col=0
-        # with the stats panel; we stack two inner Frames vertically.
-        btn_row1 = ttk.Frame(btn_f)
-        btn_row1.pack(side=TOP, fill=X)
-        btn_row2 = ttk.Frame(btn_f)
-        btn_row2.pack(side=TOP, fill=X, pady=(4, 0))
-        self.btn_hist_delete = None
-        row_specs = [
-            (btn_row1, [
-                ("btn.history_market_log", self._open_market_history, None),
-                ("btn.history_export",     self._hist_export_csv,     None),
-                ("btn.history_add",        self._hist_add_dialog,     None),
-            ]),
-            (btn_row2, [
-                ("btn.history_readd",  self._hist_readd, None),
-                ("btn.history_edit",   self._hist_edit,  None),
-                ("btn.history_delete", self._hist_delete, "delete"),
-            ]),
-        ]
-        for row_frame, specs in row_specs:
-            for key, cmd, tag in specs:
-                btn = ttk.Button(row_frame, text=t(key), command=cmd)
-                btn.pack(side=LEFT, padx=2)
-                if tag == "delete":
-                    # Same enable-on-select / red-when-active contract as
-                    # the «Видалити» button on the Покупка / Продаж tabs.
-                    # State flips via `_update_hist_delete_state`, bound to
-                    # the tree's <<TreeviewSelect>> below.
-                    btn.configure(state=DISABLED, bootstyle="")
-                    self.btn_hist_delete = btn
+        for key, cmd in [
+            ("btn.history_market_log", self._open_market_history),
+            ("btn.history_export",     self._hist_export_csv),
+            ("btn.history_readd",      self._hist_readd),
+        ]:
+            ttk.Button(btn_f, text=t(key), command=cmd).pack(side=LEFT, padx=2)
 
-        # React to selection changes — the existing handler already
-        # paints the row highlights; we just chain our button update
-        # after it. Wrapping rather than re-binding so we don't
-        # replace the original handler.
-        prev_select_cb = self.hist_tree.bind("<<TreeviewSelect>>")
-        def _on_hist_select(_e=None, _orig=prev_select_cb):
-            self._mark_selected_rows(self.hist_tree)
-            self._update_hist_delete_state()
-        self.hist_tree.bind("<<TreeviewSelect>>", _on_hist_select)
+    # ------------------------------------------------------------------
+    # «Історія» tab — read-only Steam transaction history (imported)
+    # ------------------------------------------------------------------
+    _SHIST_LINK_COL_ID = "#8"  # num, date, name, game, type, operation, price, link
 
-        # Totals panel — purchases / sales / spent — laid out adaptively
-        # by _reflow_history_bottom (three modes: inline / vertical /
-        # stacked). Each "cell" is its own little Frame holding `label +
-        # value` so we can re-pack the whole group between horizontal
-        # and vertical orientations without recreating widgets. The "│"
-        # separators only render in inline mode.
+    def _build_history_tab(self):
+        cols = ("num", "date", "name", "game", "type", "operation", "price", "link")
+
+        # Bottom strip: buttons on the left, finance block on the right.
+        # Grid, so the block can drop under the buttons in a narrow window
+        # (see _reflow_history_bottom).
+        bottom = ttk.Frame(self.tab_history)
+        bottom.pack(side=BOTTOM, fill=X, padx=8, pady=(0, 8))
+        bottom.columnconfigure(0, weight=1)
+        btn_f = ttk.Frame(bottom)
+        # sticky="nw": keep the buttons at the top-left when the row grows
+        # to fit a two-line finance block.
+        btn_f.grid(row=0, column=0, sticky="nw")
+        self._hist_bottom = bottom
+        self._hist_btn_f = btn_f
+
+        frame = ttk.Frame(self.tab_history, borderwidth=1, relief="solid")
+        frame.pack(side=TOP, fill=BOTH, expand=YES, padx=8, pady=8)
+
+        tree = ttk.Treeview(frame, columns=cols, show="headings",
+                            selectmode="extended")
+        self.shist_tree = tree
+        for col, label_key, width in [
+            ("num",       "col.num",        50),
+            ("date",      "col.date",      140),
+            ("name",      "col.hist.card", 220),
+            ("game",      "col.hist.name", 190),
+            ("type",      "col.type",      150),
+            ("operation", "col.operation",  90),
+            ("price",     "col.price",      90),
+            ("link",      "col.link",      110),
+        ]:
+            if col == "price":
+                anchor = E
+            elif col in ("num", "link"):
+                anchor = CENTER
+            else:
+                anchor = W
+            tree.heading(col, text=t(label_key), anchor=anchor)
+            tree.column(col, width=width, anchor=anchor)
+        self._apply_row_tags(tree)
+        self._setup_sortable_columns(tree, list(cols))
+        self._setup_column_widths(tree)
+        tree.bind("<<TreeviewSelect>>",
+                  lambda e: self._mark_selected_rows(self.shist_tree))
+        tree.bind("<Button-1>", self._on_shist_tree_click, add="+")
+        tree.bind("<Escape>", self._clear_tree_selection, add="+")
+        tree.bind("<Motion>", self._on_shist_tree_motion)
+        tree.bind("<Control-KeyPress>", self._on_tree_ctrl_a)
+        tree.bind("<Button-3>", self._show_shist_context_menu)
+        scrollbar = ttk.Scrollbar(frame, orient=VERTICAL, command=tree.yview,
+                                  bootstyle="success")
+        tree.configure(
+            yscrollcommand=lambda f, l, sb=scrollbar: self._autohide_scrollbar(sb, f, l)
+        )
+        tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
+
+        ttk.Button(btn_f, text=t("btn.history_market_log"),
+                   command=self._open_market_history).pack(side=LEFT, padx=2)
+        ttk.Button(btn_f, text=t("btn.history_export"),
+                   command=self._shist_export_csv).pack(side=LEFT, padx=2)
+        self.btn_shist_import = ttk.Button(
+            btn_f, text=t("btn.history_import"), command=self._shist_import,
+            bootstyle="warning")
+        self.btn_shist_import.pack(side=LEFT, padx=2)
+
+        self._steam_history = steam_history.empty_history()
+        self._shist_rows: dict[str, dict] = {}
+        self._shist_importing = False
+        self._build_finance_block(bottom)
+
+    def _build_finance_block(self, bottom) -> None:
+        """Totals panel: purchases / sales / spent / Steam balance.
+
+        Laid out by _reflow_history_bottom. Cells are rebuilt (not
+        re-parented) on every relayout: Tk's pack-with-in_ doesn't
+        propagate reqsize to the cell's master, so a re-parented cell
+        leaves `stats` at zero width and the grid column collapses.
+        """
         stats = ttk.Frame(bottom)
         stats.grid(row=0, column=1, sticky="ne")
         self._hist_stats = stats
-        # Persistent definitions of which cells exist — used by
-        # _apply_stats_layout to recreate cells on every relayout.
-        # We recreate (rather than reparent) because Tk's pack-with-in_
-        # works geometrically but doesn't propagate reqsize back to the
-        # cell's master — so an `in_=inner` cell renders correctly inside
-        # `inner`, but `stats` thinks it's still empty (0 reqwidth) and
-        # the grid column collapses, leaving the whole panel invisible.
-        # Destroy-and-recreate avoids the issue at the cost of churning
-        # widgets on every reflow (cheap — three Labels per cell).
-        # Baseline anchor может добавлять четвертую ячейку «Баланс»
-        # (баланс Steam Wallet на дату якоря + операции после неё).
-        # Без якоря сумма Steam Wallet нам неизвестна → cell скрывается,
-        # блок остаётся трёх-ячеечным как раньше. Пересобирается
-        # `_rebuild_hist_cells_def` при изменении якоря.
-        self._hist_cells_def = []
-        self._rebuild_hist_cells_def()
+        self._hist_cells_def = [
+            ("hist.total_buy",  "lbl_total_buy"),
+            ("hist.total_sell", "lbl_total_sell"),
+            ("hist.spent",      "lbl_spent"),
+            # Not `lbl_balance` — that is the avatar widget's label, and
+            # setattr here would silently replace it.
+            ("hist.balance",    "lbl_hist_balance"),
+        ]
         self._hist_stats_rows = []   # row Frames (children of stats)
-        self._hist_stats_cells = []  # cell Frames (children of an inner frame inside a row)
-        # Signature of last-applied layout for idempotency — prevents
-        # Configure-event flap during drag resizes.
+        self._hist_stats_cells = []  # cell Frames inside those rows
+        # Signature of the last-applied layout — keeps Configure events
+        # during a drag-resize from rebuilding the same layout.
         self._hist_stats_signature = None
-        # Re-entry guard: destroying/packing row_frames triggers Configure
-        # events on `bottom`, which fires `_reflow_history_bottom`, which
-        # would call us again on half-built state → IndexError. We set
-        # this flag inside every `_apply_stats_layout*` call and the
-        # reflow returns early while it's up.
+        # Re-entry guard: rebuilding rows fires Configure on `bottom`,
+        # which would re-enter the reflow on half-built state.
         self._hist_stats_applying = False
-        # Approximate width of "│" separator + 2×padx(10) — used in
-        # _reflow's width math. Refined to a real measurement on the
-        # first reflow that renders a sep (sep widgets are short-lived,
-        # so a constant estimate is good enough until then).
+        # Estimated width of a "│" separator with its padding; refined
+        # to a real measurement the first time one is rendered.
         self._hist_sep_width = 30
 
-        # Build the initial inline layout so the cells appear right away.
-        # _reflow_history_bottom will swap to wrap / below mode on first
-        # Configure event if the measured width prefers them.
         self._apply_stats_layout(
             [list(range(len(self._hist_cells_def)))], "e", True
         )
-
-        # ⚙ button — opens the balance-anchor dialog. Sits in `bottom`
-        # (right of stats) rather than in `btn_f`, because it operates on
-        # the finance block, not the history list. Placed in column 2 so
-        # the stats keep their existing column 1 real estate.
-        self.btn_hist_anchor = ttk.Button(
-            bottom, text=t("btn.hist_anchor_gear"),
-            command=self._hist_anchor_dialog,
-            bootstyle="secondary-outline", width=3,
-        )
-        self.btn_hist_anchor.grid(row=0, column=2, sticky="ne",
-                                  padx=(8, 0))
-
-        # «* було відкореговано станом на: DD.MM.YYYY» — dedicated 3rd
-        # line INSIDE the stats block (so the whole block sits at ~= the
-        # two-rows-of-buttons height). Only visible when anchor is set;
-        # font is dropped a step so it reads as a footnote and doesn't
-        # push the block taller than the button column next to it.
-        # `fill=X + anchor="w"` stretches the label across the full width
-        # of the stats block and pins the text to the LEFT edge — the
-        # footnote should line up with "Сума покупок:" above it, not
-        # centre or jam against the right edge.
-        self.lbl_anchor_note = ttk.Label(
-            stats, text="", foreground="#888888",
-            font=self._smaller_font(), anchor="w",
-        )
-        self.lbl_anchor_note.pack(side=TOP, fill=X, pady=(2, 0))
-        self.lbl_anchor_note.pack_forget()
-
-        # Re-flow on every resize: pick the widest layout that still
-        # fits in the available space. Without this the stats either
-        # get clipped off the right edge (when packed) or always
-        # consume an extra row even when there's plenty of room.
         bottom.bind("<Configure>", self._reflow_history_bottom)
-        # Initial layout — schedule after current event loop tick so all
-        # children have their reqsize computed by the time we measure.
+        # After the current tick, so children have their reqsize.
         self.after_idle(self._reflow_history_bottom)
 
-    def _smaller_font(self) -> tuple:
-        """Return a `(family, size)` tuple one step smaller than the default
-        UI font — for footnote-style labels (anchor «було відкореговано»)
-        that shouldn't dominate the finance block visually. Falls back to
-        a sensible default if the running font can't be introspected.
-        """
+    def _refresh_history(self):
+        """Reload steam_history.json into the «Історія» table + totals."""
+        history = steam_history.load_history(STEAM_HISTORY_PATH)
+        self._steam_history = history
+        rows = sorted(
+            history["market"] + history["store"],
+            key=lambda row: (row.get("timestamp", ""), -row.get("seq", 0)),
+            reverse=True)
+
+        tree = self.shist_tree
+        tree.delete(*tree.get_children())
+        self._shist_rows = {}
+        for row_index, row in enumerate(rows):
+            is_market = row.get("source") == "market"
+            stamp = row.get("timestamp", "")
+            # Store rows only carry a date — don't show a fake 00:00:00.
+            date_text = stamp[:19].replace("T", " ") if is_market else stamp[:10]
+            op_key = row.get("operation") or "buy"
+            operation = t(f"operation.{op_key}")
+            if operation == f"operation.{op_key}":  # i18n miss
+                operation = op_key
+            # Tk item ids must not be arbitrary text (Steam ids carry
+            # spaces and currency glyphs) — map a plain index instead.
+            iid = f"r{row_index}"
+            self._shist_rows[iid] = row
+            tree.insert("", END, iid=iid, values=(
+                row_index + 1,
+                date_text,
+                row.get("display_name") or "—",
+                row.get("game_name") or "—",
+                (row.get("item_type") or "—") if is_market
+                else t("hist.type.store"),
+                operation,
+                self._fmt_money(row.get("price")),
+                t("col.link.open"),
+            ), tags=("even" if row_index % 2 == 0 else "odd",))
+        self._mark_selected_rows(tree)
+        self._restore_sort_state(tree)
+        self._refresh_history_stats()
+
+    def _shist_selected_rows(self) -> list[dict]:
+        return [self._shist_rows[iid] for iid in self.shist_tree.selection()
+                if iid in self._shist_rows]
+
+    def _shist_row_url(self, row: dict) -> str:
+        """Market listing for cards; store page (or store search) for games."""
+        from urllib.parse import quote
+        from steam import GAME_STORE_URL, market_url
+        if row.get("source") == "market":
+            return market_url(row.get("appid"), row.get("market_hash_name"))
+        # Account history has no appids — resolve through the «Ігри» list
+        # by exact name, else fall back to a store search.
+        name = (row.get("names") or [row.get("display_name") or ""])[0]
+        wanted = name.strip().casefold()
+        for game in load_json(GAMELIST_PATH, []) or []:
+            if str(game.get("name") or "").strip().casefold() == wanted:
+                return GAME_STORE_URL.format(appid=game.get("appid"))
+        return "https://store.steampowered.com/search/?term=" + quote(name)
+
+    def _on_shist_tree_click(self, event):
+        tree = self.shist_tree
+        if tree.identify_region(event.x, event.y) != "cell":
+            return
+        if tree.identify_column(event.x) != self._SHIST_LINK_COL_ID:
+            return
+        row = self._shist_rows.get(tree.identify_row(event.y))
+        if row:
+            webbrowser.open(self._shist_row_url(row))
+
+    def _on_shist_tree_motion(self, event):
+        tree = self.shist_tree
+        in_link = (
+            tree.identify_region(event.x, event.y) == "cell"
+            and tree.identify_column(event.x) == self._SHIST_LINK_COL_ID
+            and tree.identify_row(event.y)
+        )
+        tree.configure(cursor="hand2" if in_link else "")
+
+    def _shist_copy_link(self) -> None:
+        rows = self._shist_selected_rows()
+        if rows:
+            self._copy_to_clipboard(self._shist_row_url(rows[0]))
+
+    def _show_shist_context_menu(self, event) -> None:
+        """Right-click menu on «Історія» — mirrors its buttons."""
+        tree = self.shist_tree
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in tree.selection():
+            tree.selection_set(iid)
+            tree.focus(iid)
+            self._mark_selected_rows(tree)
+        menu = tk.Menu(self, tearoff=0, font=self._context_menu_font())
+        menu.add_command(label=t("btn.history_market_log"),
+                         command=self._open_market_history)
+        menu.add_command(label=t("ctx.copy_link"),
+                         command=self._shist_copy_link)
+        menu.add_command(label=t("btn.history_export"),
+                         command=self._shist_export_csv)
+        menu.add_separator()
+        menu.add_command(label=t("btn.history_import"),
+                         command=self._shist_import)
         try:
-            import tkinter.font as tkfont
-            f = tkfont.nametofont("TkDefaultFont")
-            size = max(7, int(f.cget("size")) - 1)
-            return (f.cget("family"), size)
-        except (tk.TclError, ValueError):
-            return ("TkDefaultFont", 8)
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _shist_export_csv(self):
+        """Save the «Історія» table to CSV — the visible columns, plus URL."""
+        from tkinter.filedialog import asksaveasfilename
+
+        path = asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            initialfile=t("dlg.export.filename_default"),
+        )
+        if not path:
+            return
+        tree = self.shist_tree
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([t(key) for key in (
+                "col.date", "col.hist.card", "col.hist.name", "col.type",
+                "col.operation", "col.price", "col.link")])
+            # Tree order, so the file matches the sort the user is looking at.
+            for iid in tree.get_children():
+                row = self._shist_rows.get(iid)
+                if row is None:
+                    continue
+                values = tree.item(iid, "values")
+                # Raw number, not the "1 234.00₴" cell text — spreadsheets
+                # can sum it.
+                writer.writerow([values[1], values[2], values[3], values[4],
+                                 values[5], f"{row.get('price', 0):.2f}",
+                                 self._shist_row_url(row)])
+        messagebox.showinfo(t("dlg.export.title"), t("dlg.export.saved", path=path))
+
+    def _shist_import(self) -> None:
+        """Pull market + store history from Steam into steam_history.json."""
+        if self._shist_importing:
+            return
+        cookies = (self.config_data.get("steam") or {}).get("cookies")
+        community = (cookies or {}).get("steamcommunity.com") or {}
+        if "steamLoginSecure" not in community:
+            messagebox.showinfo(t("dlg.import.title"),
+                                t("dlg.import.no_cookies"), parent=self)
+            return
+
+        self._shist_importing = True
+        self.btn_shist_import.configure(state=DISABLED,
+                                        text=t("hist.import.running"))
+
+        def on_progress(done: int, total: int) -> None:
+            self.after(0, lambda: self.btn_shist_import.configure(
+                text=t("hist.import.progress", done=done, total=total)))
+
+        def worker() -> None:
+            import steam
+            result = None
+            error = None
+            try:
+                result = steam_history.import_history(
+                    STEAM_HISTORY_PATH, cookies, on_progress)
+            except steam.SteamSessionExpired:
+                error = t("import.session_expired")
+                log.warning("history import aborted — session expired")
+                self.after(0, lambda: self._set_session_warning(True))
+            except steam.RateLimitedError:
+                error = t("hist.import.rate_limited")
+                log.warning("history import aborted — rate limited")
+            except Exception as exc:
+                error = str(exc)
+                log.exception("history import failed")
+            self.after(0, lambda: self._shist_import_done(result, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _shist_import_done(self, result: dict | None, error: str | None) -> None:
+        self._shist_importing = False
+        self.btn_shist_import.configure(state=NORMAL,
+                                        text=t("btn.history_import"))
+        if error is not None:
+            messagebox.showerror(t("dlg.error.title"), error, parent=self)
+            return
+        self._refresh_history()
+        self._refresh_balance_placeholder(
+            (self.config_data.get("market") or {}).get("currency", 18))
+        lines = [t("hist.import.done", market=result["market_added"],
+                   store=result["store_added"])]
+        if result["store_error"]:
+            lines.append(t("hist.import.store_skipped"))
+        messagebox.showinfo(t("dlg.import.title"), "\n\n".join(lines),
+                            parent=self)
 
     def _apply_stats_layout_grid(self, rows_spec) -> None:
         """Rectangular layout using grid so cells align vertically across rows.
@@ -9426,12 +9516,8 @@ class App(tb.Window):
             avail = bottom.winfo_width()
             if avail <= 1:
                 return
-            # `_hist_stats_cells` may be stale — the anchor dialog updates
-            # `_hist_cells_def` (adds / removes «Баланс») and calls us right
-            # after, before the cells have been rebuilt. Force a fresh build
-            # with a default one-row layout so measurements below reflect
-            # the CURRENT cell count; a proper 2×2 or wrap layout is picked
-            # on the retry.
+            # Defensive: rebuild if the cell list ever disagrees with the
+            # definitions, so the measurements below are for real widgets.
             expected_n = len(self._hist_cells_def)
             if len(cells) != expected_n:
                 self._apply_stats_layout(
@@ -9447,8 +9533,7 @@ class App(tb.Window):
             inline_w = sum(cell_widths) + sep_w * (len(cell_widths) - 1)
             max_cell_w = max(cell_widths) if cell_widths else 0
 
-            # When the balance anchor is set, force the 2×2 layout the
-            # user asked for: row1 = [buys, spent], row2 = [sales, balance].
+            # 2×2 layout: row1 = [buys, spent], row2 = [sales, balance].
             # Uses the grid-based layout so the "│" separator lines up
             # vertically between the two rows (pack-based mode wouldn't).
             if len(cell_widths) == 4:
@@ -9508,7 +9593,7 @@ class App(tb.Window):
         except (tk.TclError, KeyError, ValueError):
             pass
 
-    def _refresh_history(self):
+    def _refresh_archive(self):
         from steam import pretty_name
 
         self.hist_tree.delete(*self.hist_tree.get_children())
@@ -9531,7 +9616,7 @@ class App(tb.Window):
                 operation = op_key
             row_tag = "even" if row_index % 2 == 0 else "odd"
             # iid = timestamp + mhn → uniquely identifies the row even when
-            # the same card was bought multiple times. Used by _hist_delete
+            # the same card was bought multiple times. Used by
             # / _hist_selected to match the exact record (display_name
             # alone would collide on duplicates).
             iid = f"{p.get('timestamp', '')}|{p.get('market_hash_name', '')}"
@@ -9544,569 +9629,72 @@ class App(tb.Window):
         # Persisted sort order across restarts — same contract as the
         # card-list trees.
         self._restore_sort_state(self.hist_tree)
-        # Re-sync the «Видалити» button — refresh wipes selection,
-        # which fires TreeviewSelect, but the button state could be
-        # stale if e.g. we just deleted the last selected row.
-        self._update_hist_delete_state()
-        self._refresh_history_stats(purchases)
-        # Any change to purchases.json shifts the History-derived wallet
-        # estimate — keep the avatar-widget label in sync too. On a live
-        # Steam session this is a no-op (the placeholder helper returns
-        # early); on an expired session it refreshes from the anchor.
-        try:
-            cur = (self.config_data.get("market")
-                   or {}).get("currency", 18)
-            self._refresh_balance_placeholder(cur)
-        except Exception:
-            pass
-
-    def _hist_add_dialog(self) -> None:
-        """Open the «Додати запис до історії» dialog.
-
-        Fields: Steam URL (Market listing or Store app), type
-        (card-buy / card-sell / game-buy), price, date (YYYY-MM-DD,
-        time defaults to 12:00 local — good enough for financial
-        bookkeeping, matches the «only date» spec).
-
-        Non-Steam URLs are rejected — the History requires proper
-        metadata (display_name / game_name / image_url) for the row
-        to be usable (clickable link, «Знов до списку», etc.), and
-        those fields we can only fetch for known Steam endpoints.
-        """
-        from steam import (parse_market_url, parse_store_url,
-                           fetch_card_metadata, fetch_game_name,
-                           GAME_HEADER_IMAGE_URL, clean_card_name)
-
-        dlg = tk.Toplevel(self)
-        dlg.title(t("dlg.hist_add.title"))
-        dlg.transient(self)
-        dlg.grab_set()
-        dlg.resizable(False, False)
-
-        outer = ttk.Frame(dlg, padding=14)
-        outer.pack(fill=BOTH, expand=YES)
-        ttk.Label(outer, text=t("dlg.hist_add.body"),
-                  wraplength=440, justify=LEFT).grid(
-            row=0, column=0, columnspan=2, sticky=W, pady=(0, 10))
-
-        # URL
-        ttk.Label(outer, text=t("dlg.hist_add.url")).grid(
-            row=1, column=0, sticky=W, pady=3, padx=(0, 8))
-        var_url = tk.StringVar()
-        ent_url = ttk.Entry(outer, textvariable=var_url, width=44)
-        ent_url.grid(row=1, column=1, sticky=W)
-
-        # Type
-        ttk.Label(outer, text=t("dlg.hist_add.type")).grid(
-            row=2, column=0, sticky=W, pady=3, padx=(0, 8))
-        var_type = tk.StringVar(value="card_buy")
-        types_frame = ttk.Frame(outer)
-        types_frame.grid(row=2, column=1, sticky=W)
-        for value, key in [("card_buy",  "dlg.hist_add.type.card_buy"),
-                           ("card_sell", "dlg.hist_add.type.card_sell"),
-                           ("game_buy",  "dlg.hist_add.type.game_buy")]:
-            ttk.Radiobutton(types_frame, text=t(key), value=value,
-                            variable=var_type).pack(side=LEFT, padx=(0, 8))
-
-        # Price
-        ttk.Label(outer, text=t("dlg.hist_add.price")).grid(
-            row=3, column=0, sticky=W, pady=3, padx=(0, 8))
-        var_price = tk.StringVar()
-        ttk.Entry(outer, textvariable=var_price, width=16).grid(
-            row=3, column=1, sticky=W)
-
-        # Date (default = today, format YYYY-MM-DD)
-        ttk.Label(outer, text=t("dlg.hist_add.date")).grid(
-            row=4, column=0, sticky=W, pady=3, padx=(0, 8))
-        var_date = tk.StringVar(
-            value=datetime.now().strftime("%Y-%m-%d"))
-        ttk.Entry(outer, textvariable=var_date, width=16).grid(
-            row=4, column=1, sticky=W)
-
-        sym = self._currency_symbol()
-
-        def do_save():
-            url = var_url.get().strip()
-            if not url:
-                messagebox.showerror(t("dlg.warn.title"),
-                                     t("dlg.hist_add.err_url"), parent=dlg)
-                return
-            try:
-                price_val = float(var_price.get().strip()
-                                   .replace(",", ".").replace(" ", ""))
-                if price_val < 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror(t("dlg.warn.title"),
-                                     t("dlg.hist_add.err_price"), parent=dlg)
-                return
-            try:
-                d = datetime.strptime(var_date.get().strip(), "%Y-%m-%d")
-            except ValueError:
-                messagebox.showerror(t("dlg.warn.title"),
-                                     t("dlg.hist_add.err_date"), parent=dlg)
-                return
-            # `timestamp` = operation date (what the user typed) at
-            # 12:00 — used for display/sorting in the history table.
-            # `created_at` (added below) is the anchor-filter cutoff — a
-            # back-dated record added AFTER the anchor still counts
-            # because its `_created` moment lands after the anchor's.
-            ts = d.replace(hour=12, minute=0, second=0).isoformat()
-            kind_val = var_type.get()
-
-            record: dict = {
-                "price": f"{price_val:.2f} {sym}".rstrip(),
-                "operation": "sell" if kind_val == "card_sell" else "buy",
-                "timestamp": ts,
-                # Moment the record was PHYSICALLY added to the file —
-                # the anchor cutoff filter uses this, not `timestamp`,
-                # so back-dated entries added after an anchor still get
-                # counted. `timestamp` stays as the operation date for
-                # the table/sorting.
-                "_created": datetime.now().isoformat(timespec="seconds"),
-            }
-
-            if kind_val == "game_buy":
-                appid = parse_store_url(url)
-                if not appid:
-                    messagebox.showerror(
-                        t("dlg.warn.title"),
-                        t("dlg.hist_add.err_url_store"), parent=dlg)
-                    return
-                try:
-                    game_name = fetch_game_name(appid)
-                except Exception:
-                    game_name = ""
-                if not game_name or game_name == "—":
-                    messagebox.showerror(
-                        t("dlg.warn.title"),
-                        t("dlg.hist_add.err_fetch"), parent=dlg)
-                    return
-                record.update({
-                    "name": game_name,
-                    "display_name": game_name,
-                    "game_name": game_name,
-                    "market_hash_name": game_name,
-                    "appid": int(appid),
-                    "image_url": GAME_HEADER_IMAGE_URL.format(appid=appid),
-                    "kind": "game",
-                })
-            else:
-                parsed = parse_market_url(url)
-                if not parsed:
-                    messagebox.showerror(
-                        t("dlg.warn.title"),
-                        t("dlg.hist_add.err_url_market"), parent=dlg)
-                    return
-                appid, mhn = parsed
-                try:
-                    meta = fetch_card_metadata(appid, mhn)
-                except Exception:
-                    meta = {}
-                display_name = (meta.get("display_name")
-                                or clean_card_name(mhn))
-                record.update({
-                    "name": mhn,
-                    "display_name": display_name,
-                    "game_name": meta.get("game_name") or "",
-                    "market_hash_name": mhn,
-                    "appid": int(appid),
-                    "image_url": meta.get("image_url") or None,
-                })
-
-            # Uniquify iid (timestamp|mhn) if a record with the same
-            # identity already exists — bump the timestamp by micros.
-            purchases = load_json(PURCHASES_PATH, []) or []
-            existing_iids = {
-                f"{p.get('timestamp')}|{p.get('market_hash_name')}"
-                for p in purchases
-            }
-            base_ts = record["timestamp"]
-            micro = 0
-            while f"{record['timestamp']}|{record['market_hash_name']}" \
-                    in existing_iids:
-                micro += 1
-                # ISO with `.NNNNNN` fractional — keeps chronological
-                # sort and iid uniqueness both intact.
-                record["timestamp"] = f"{base_ts}.{micro:06d}"
-            purchases.append(record)
-            save_json(PURCHASES_PATH, purchases)
-            dlg.destroy()
-            # `_refresh_history` now handles the avatar-balance sync too
-            # (see the finance-refresh at the end of it).
-            self._refresh_history()
-
-        btns = ttk.Frame(outer)
-        btns.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-        ttk.Button(btns, text=t("dlg.hist_add.save"), bootstyle="success",
-                   command=do_save).pack(side=LEFT, padx=(0, 6),
-                                         expand=YES, fill=X)
-        ttk.Button(btns, text=t("dlg.hist_add.cancel"),
-                   bootstyle="secondary",
-                   command=dlg.destroy).pack(side=LEFT, expand=YES, fill=X)
-
-        dlg.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_reqheight()) // 3
-        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
-        dlg.bind("<Escape>", lambda e: dlg.destroy())
-        ent_url.focus_set()
-
-    def _hist_anchor_dialog(self) -> None:
-        """Open the «Налаштувати якір балансу» dialog.
-
-        Baseline model: user types purchases/sales/wallet balance as they
-        stand on a chosen date; the History block then keeps them updated
-        by adding every purchase/sale AFTER that date on top. Витрачено is
-        derived (sales−buys), not user-editable, to avoid inconsistency.
-        Saves into `config.balance_anchor`; «Скинути якір» clears it.
-        """
-        cur = self._balance_anchor() or {}
-        dlg = tk.Toplevel(self)
-        dlg.title(t("dlg.anchor.title"))
-        dlg.transient(self)
-        dlg.grab_set()
-        dlg.resizable(False, False)
-
-        outer = ttk.Frame(dlg, padding=14)
-        outer.pack(fill=BOTH, expand=YES)
-        ttk.Label(outer, text=t("dlg.anchor.body"),
-                  wraplength=440, justify=LEFT).grid(
-            row=0, column=0, columnspan=2, sticky=W, pady=(0, 10))
-
-        def add_row(row: int, label_key: str, initial: str) -> tk.StringVar:
-            ttk.Label(outer, text=t(label_key)).grid(
-                row=row, column=0, sticky=W, pady=3, padx=(0, 8))
-            var = tk.StringVar(value=initial)
-            ttk.Entry(outer, textvariable=var, width=16).grid(
-                row=row, column=1, sticky=W)
-            return var
-
-        today = datetime.now().strftime("%Y-%m-%d")
-        var_date = add_row(1, "dlg.anchor.date",
-                           str(cur.get("date") or today))
-        var_buys = add_row(2, "dlg.anchor.purchases",
-                           f"{cur.get('purchases', 0):.2f}"
-                           if cur else "0.00")
-        var_sales = add_row(3, "dlg.anchor.sales",
-                            f"{cur.get('sales', 0):.2f}"
-                            if cur else "0.00")
-        var_balance = add_row(4, "dlg.anchor.balance",
-                              f"{cur.get('balance', 0):.2f}"
-                              if cur else "0.00")
-
-        # Витрачено — live-preview (sales − buys); read-only, greyed out.
-        ttk.Label(outer, text=t("dlg.anchor.spent")).grid(
-            row=5, column=0, sticky=W, pady=3, padx=(0, 8))
-        lbl_spent = ttk.Label(outer, text="0.00", foreground="#888888")
-        lbl_spent.grid(row=5, column=1, sticky=W)
-
-        def _fnum(s: str) -> float:
-            return float((s or "0").strip().replace(",", ".").replace(" ", ""))
-
-        def recompute(*_):
-            try:
-                b = _fnum(var_buys.get())
-                s = _fnum(var_sales.get())
-                spent = s - b   # display sign: earned=+, spent=−
-                lbl_spent.configure(text=self._fmt_money(spent, signed=True))
-            except ValueError:
-                lbl_spent.configure(text="—")
-        for v in (var_buys, var_sales):
-            v.trace_add("write", recompute)
-        recompute()
-
-        result = {"action": "cancel"}
-
-        def on_save():
-            try:
-                datetime.strptime(var_date.get().strip(), "%Y-%m-%d")
-            except ValueError:
-                messagebox.showerror(t("dlg.warn.title"),
-                                     t("dlg.anchor.err_date"), parent=dlg)
-                return
-            try:
-                p = _fnum(var_buys.get())
-                s = _fnum(var_sales.get())
-                bal = _fnum(var_balance.get())
-            except ValueError:
-                messagebox.showerror(t("dlg.warn.title"),
-                                     t("dlg.anchor.err_number"), parent=dlg)
-                return
-            self.config_data.setdefault("balance_anchor", {})
-            # `created_at` — точный момент сохранения якоря; фильтр по
-            # timestamp'у операций опирается на него, не на «дату», чтобы
-            # запись, добавленная В ТОТ ЖЕ ДЕНЬ но после якоря, попала в
-            # подсчёт. Иначе «Додати» с датой якоря молча теряется.
-            self.config_data["balance_anchor"] = {
-                "date": var_date.get().strip(),
-                "purchases": round(p, 2),
-                "sales":     round(s, 2),
-                "balance":   round(bal, 2),
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            }
-            save_json(CONFIG_PATH, self.config_data)
-            result["action"] = "save"
-            dlg.destroy()
-
-        def on_reset():
-            if not self._confirm(t("dlg.anchor.title"),
-                                 t("dlg.anchor.confirm_reset")):
-                return
-            self.config_data.pop("balance_anchor", None)
-            save_json(CONFIG_PATH, self.config_data)
-            result["action"] = "reset"
-            dlg.destroy()
-
-        def on_cancel():
-            dlg.destroy()
-
-        btns = ttk.Frame(outer)
-        btns.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-        ttk.Button(btns, text=t("dlg.anchor.save"), bootstyle="success",
-                   command=on_save).pack(side=LEFT, padx=(0, 6),
-                                         expand=YES, fill=X)
-        # «Скинути якір» is enabled only when an anchor exists — no point
-        # showing it as active for a brand-new setup.
-        reset_state = NORMAL if cur else DISABLED
-        ttk.Button(btns, text=t("dlg.anchor.reset"),
-                   bootstyle="danger-outline",
-                   command=on_reset, state=reset_state).pack(
-            side=LEFT, padx=(0, 6), expand=YES, fill=X)
-        ttk.Button(btns, text=t("dlg.anchor.cancel"), bootstyle="secondary",
-                   command=on_cancel).pack(side=LEFT, expand=YES, fill=X)
-
-        dlg.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_reqwidth()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_reqheight()) // 3
-        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
-        dlg.bind("<Escape>", lambda e: on_cancel())
-        dlg.wait_window()
-
-        # Anchor state may have changed — rebuild the cell defs (adds or
-        # removes the «Баланс» cell), reset signature to force a fresh
-        # layout, and repopulate all numbers. Also refresh the avatar
-        # wallet label — its History-derived fallback keys off the
-        # anchor, so the header should update in the same beat.
-        if result["action"] != "cancel":
-            self._rebuild_hist_cells_def()
-            self._reflow_history_bottom()
-            self._refresh_history_stats()
-            try:
-                cur = (self.config_data.get("market")
-                       or {}).get("currency", 18)
-                self._refresh_balance_placeholder(cur)
-            except Exception:
-                pass
 
     def _history_wallet_estimate(self) -> float | None:
-        """Best-effort wallet balance derived from the History block.
+        """Last wallet balance saved in steam_history.json, or None.
 
-        Returns `anchor.balance + Σ(sells − buys since anchor.date)` when
-        an anchor is set, else None. Used as a fallback for the avatar
-        wallet label when Steam's session cookie has expired and we can't
-        pull the live number — better a stale-but-informed figure than a
-        flat 0.00. Shape mirrors `_refresh_history_stats` — kept in a
-        separate helper because the label update runs on the wallet
-        refresh path, not the History-tab refresh path.
+        Written by a live wallet refresh and by the history import; read
+        back for the avatar label once the Steam session has expired.
         """
-        anchor = self._balance_anchor()
-        if anchor is None:
-            return None
-        anchor_cutoff = anchor["created_at"]
-        purchases = load_json(PURCHASES_PATH, []) or []
-        delta = 0.0
-        for p in purchases:
-            amount = _try_parse_money(p.get("price"))
-            if amount is None:
-                continue
-            # Same «moment added, not operation date» rule as
-            # _refresh_history_stats — back-dated entries logged after
-            # an anchor still count. Legacy rows fall back to timestamp.
-            ref = str(p.get("_created") or p.get("timestamp") or "")
-            if not ref or ref <= anchor_cutoff:
-                continue
-            if (p.get("operation") or "buy") == "sell":
-                delta += amount
-            else:
-                delta -= amount
-        return anchor["balance"] + delta
+        wallet = steam_history.load_history(STEAM_HISTORY_PATH).get("wallet") or {}
+        balance = wallet.get("balance")
+        return float(balance) if isinstance(balance, (int, float)) else None
 
-    def _balance_anchor(self) -> dict | None:
-        """Return the current balance anchor from config, or None if unset.
+    def _store_wallet_balance(self, balance_text: str) -> None:
+        """Persist a live wallet balance so it outlives the session."""
+        value = _try_parse_money(balance_text)
+        # An import in flight rewrites the file at its end (with a fresh
+        # balance of its own) — don't race it.
+        if value is None or getattr(self, "_shist_importing", False):
+            return
+        history = steam_history.load_history(STEAM_HISTORY_PATH)
+        if (history.get("wallet") or {}).get("balance") == value:
+            return
+        history["wallet"] = {
+            "balance": value,
+            "balance_raw": str(balance_text),
+            "updated": datetime.now().isoformat(timespec="seconds"),
+        }
+        steam_history.save_history(STEAM_HISTORY_PATH, history)
+        self._steam_history = history
+        self._refresh_history_stats()
 
-        Shape: `{"date": "YYYY-MM-DD", "purchases": float, "sales": float,
-        "balance": float}`. Missing/malformed keys → None (i.e. anchor
-        treated as disabled). See DESIGN — «Кнопка Баланс від дати».
+    def _refresh_history_stats(self) -> None:
+        """Recompute «Сума покупок / Сума продажів / Витрачено / Баланс Steam».
+
+        Sums cover Community Market operations only — game purchases are
+        listed in the table but deliberately kept out of the totals, so
+        «Витрачено» stays a card-trading result. The balance is the last
+        wallet value saved in steam_history.json.
         """
-        raw = (self.config_data or {}).get("balance_anchor") or None
-        if not isinstance(raw, dict):
-            return None
-        try:
-            d = str(raw["date"])
-            # sanity check the date shape early so downstream code trusts it
-            datetime.strptime(d, "%Y-%m-%d")
-            # `created_at` — timestamp момент сохранения якоря. Для старых
-            # якорей (сохранённых до этой ревизии) — синтезируем 23:59:59
-            # даты якоря: все операции, добавленные ДО этой ревизии на
-            # anchor.date, считаются «уже включены в baseline».
-            created_raw = raw.get("created_at")
-            try:
-                if created_raw:
-                    datetime.fromisoformat(str(created_raw))
-                    created = str(created_raw)
-                else:
-                    raise ValueError
-            except (TypeError, ValueError):
-                created = f"{d}T23:59:59"
-            return {
-                "date": d,
-                "purchases": float(raw.get("purchases", 0) or 0),
-                "sales":     float(raw.get("sales", 0) or 0),
-                "balance":   float(raw.get("balance", 0) or 0),
-                "created_at": created,
-            }
-        except (KeyError, ValueError, TypeError):
-            return None
+        if not hasattr(self, "lbl_total_buy"):
+            return
+        history = getattr(self, "_steam_history", None) or steam_history.empty_history()
+        total_buy = sum(row.get("price") or 0 for row in history["market"]
+                        if row.get("operation") == "buy")
+        total_sell = sum(row.get("price") or 0 for row in history["market"]
+                         if row.get("operation") == "sell")
+        result = total_sell - total_buy
+        balance = (history.get("wallet") or {}).get("balance")
 
-    def _rebuild_hist_cells_def(self) -> None:
-        """Rebuild the stats-panel cell definitions based on anchor state.
+        gain_color, loss_color = "#16A34A", "#FF6B6B"
 
-        Anchor set → 4 cells (Всього покупок / Сума продажів / Витрачено /
-        Баланс). Anchor unset → 3 cells (no «Баланс», it's unknown without
-        a starting reference point). Called after any anchor change.
-        """
-        base = [
-            ("hist.total_buy",  "lbl_total_buy"),
-            ("hist.total_sell", "lbl_total_sell"),
-            ("hist.spent",      "lbl_spent"),
-        ]
-        if self._balance_anchor() is not None:
-            # Attr name is deliberately distinct from the avatar-widget's
-            # `lbl_balance` — same short name collides via setattr and the
-            # avatar's balance label ends up being replaced by the History
-            # cell (avatar then stays stuck at "0.00").
-            base.append(("hist.balance", "lbl_hist_balance"))
-        self._hist_cells_def = base
-        # Force a fresh layout on next reflow — the signature check would
-        # otherwise short-circuit us into keeping the stale cell list.
-        self._hist_stats_signature = None
+        def sign_color(value) -> str:
+            if not isinstance(value, (int, float)) or value == 0:
+                return ""
+            return gain_color if value > 0 else loss_color
 
-    def _refresh_history_stats(self, purchases: list | None = None) -> None:
-        """Recompute "Всього покупок / Сума продажів / Витрачено / Баланс".
-
-        Baseline model: if `config.balance_anchor` is set, the anchored
-        numbers count as the state on that date, and only purchases with
-        `date(timestamp) > anchor.date` are summed on top. Without an
-        anchor we sum everything (old behaviour, no «Баланс» cell).
-
-        Pass `purchases` to avoid a second disk read when called from
-        _refresh_history; otherwise we load it ourselves.
-        """
-        if purchases is None:
-            purchases = load_json(PURCHASES_PATH, []) or []
-
-        anchor = self._balance_anchor()
-        anchor_cutoff = anchor["created_at"] if anchor else None
-
-        add_buy = 0.0
-        add_sell = 0.0
-        for p in purchases:
-            amount = _try_parse_money(p.get("price"))
-            if amount is None:
-                continue
-            if anchor_cutoff is not None:
-                # Filter by the moment the record was ADDED (`_created`),
-                # not by its operation date (`timestamp`). This lets a
-                # back-dated entry — logged on the 6th for a purchase
-                # that happened on the 3rd — still count if the anchor
-                # itself was saved on the 1st. Legacy records without
-                # `_created` fall back to `timestamp` (best available).
-                ref = str(p.get("_created") or p.get("timestamp") or "")
-                if not ref or ref <= anchor_cutoff:
-                    continue
-            # Legacy entries without `operation` default to "buy".
-            if (p.get("operation") or "buy") == "sell":
-                add_sell += amount
-            else:
-                add_buy += amount
-
-        if anchor is not None:
-            total_buy = anchor["purchases"] + add_buy
-            total_sell = anchor["sales"] + add_sell
-            # balance movement = sales−buys since anchor; add to the wallet
-            # snapshot the user captured on that date.
-            balance = anchor["balance"] + (add_sell - add_buy)
-        else:
-            total_buy = add_buy
-            total_sell = add_sell
-            balance = None
-
-        spent = total_buy - total_sell
-
-        if hasattr(self, "lbl_total_buy"):
-            # Blue for purchases (matches the primary-bootstyle buttons on
-            # the tab) and warning-yellow for sales — visual hint that
-            # matches the deal-direction language everywhere else.
-            self.lbl_total_buy.configure(
-                text=self._fmt_money(total_buy),
-                foreground=self.style.colors.primary,
-            )
-            self.lbl_total_sell.configure(
-                text=self._fmt_money(total_sell),
-                foreground=self.style.colors.warning,
-            )
-            # Spent: green-ish if positive (we earned more than spent? no —
-            # actually spent = buy - sell, so negative means we earned).
-            # Per the user's mock-up, negative goes red.
-            # We compute `spent = buy − sell`, but display the OPPOSITE
-            # sign so the number reads like a balance: `+X` means earned,
-            # `−X` means lost. Colour matches: red on a loss, green on a
-            # gain, neutral when even.
-            display = -spent
-            self.lbl_spent.configure(text=self._fmt_money(display, signed=True))
-            if spent > 0:        # purchases outweigh sales → loss
-                self.lbl_spent.configure(foreground="#FF6B6B")
-            elif spent < 0:      # sales outweigh purchases → gain
-                self.lbl_spent.configure(foreground="#16A34A")
-            else:
-                self.lbl_spent.configure(foreground="")
-
-        # Balance cell exists only when anchor is set (see _hist_cells_def).
-        # Distinct attr name — `lbl_balance` alone would collide with the
-        # avatar-widget balance label.
-        if balance is not None and hasattr(self, "lbl_hist_balance"):
-            self.lbl_hist_balance.configure(text=self._fmt_money(balance))
-            # Positive/negative sign of the wallet number itself (matches
-            # the avatar-widget colouring): green for money in the wallet,
-            # red if the balance ever went negative, neutral at zero.
-            if balance > 0:
-                self.lbl_hist_balance.configure(foreground="#16A34A")
-            elif balance < 0:
-                self.lbl_hist_balance.configure(foreground="#FF6B6B")
-            else:
-                self.lbl_hist_balance.configure(foreground="")
-
-        # «Було відкореговано станом на: dd.mm.yyyy» — helper строка под
-        # блоком; показывается только когда anchor есть.
-        note = getattr(self, "lbl_anchor_note", None)
-        if note is not None:
-            if anchor is not None:
-                try:
-                    d = datetime.strptime(anchor["date"], "%Y-%m-%d")
-                    stamp = d.strftime("%d.%m.%Y")
-                except ValueError:
-                    stamp = anchor["date"]
-                note.configure(text=t("hist.adjusted_note", date=stamp))
-                # Re-pack every refresh so it stays UNDER the row-frames
-                # that _apply_stats_layout re-creates on each reflow (pack
-                # order is insertion order — a note packed once at init
-                # would end up above the freshly-recreated cell rows).
-                note.pack_forget()
-                note.pack(side=TOP, fill=X, pady=(2, 0))
-            else:
-                if note.winfo_ismapped():
-                    note.pack_forget()
+        # Blue for purchases, yellow for sales — same colours as the
+        # buy / sell buttons elsewhere.
+        self.lbl_total_buy.configure(text=self._fmt_money(total_buy),
+                                     foreground=self.style.colors.primary)
+        self.lbl_total_sell.configure(text=self._fmt_money(total_sell),
+                                      foreground=self.style.colors.warning)
+        # Shown as a result: +X earned, −X lost.
+        self.lbl_spent.configure(text=self._fmt_money(result, signed=True),
+                                 foreground=sign_color(result))
+        self.lbl_hist_balance.configure(text=self._fmt_money(balance),
+                                        foreground=sign_color(balance))
 
     def _hist_selected(self):
         """Return the first purchase record under the currently-selected row.
@@ -10151,35 +9739,6 @@ class App(tb.Window):
         if not sel:
             messagebox.showwarning(t("dlg.select.title"), t("dlg.select.body"), parent=self)
         return sel
-
-    def _hist_delete(self):
-        """Remove selected purchase record(s) + refresh totals."""
-        from steam import pretty_name
-
-        selected = self._require_hist_selection()
-        if not selected:
-            return
-        if len(selected) == 1:
-            body = t("dlg.hist_delete.body", name=pretty_name(selected[0]))
-        else:
-            body = t("dlg.hist_delete.body_multi", count=len(selected))
-        if not self._confirm(t("dlg.hist_delete.title"), body):
-            return
-        targets = {
-            (p.get("timestamp"), p.get("market_hash_name"))
-            for p in selected
-        }
-        purchases = load_json(PURCHASES_PATH, [])
-        purchases = [
-            x for x in purchases
-            if (x.get("timestamp"), x.get("market_hash_name")) not in targets
-        ]
-        save_json(PURCHASES_PATH, purchases)
-        self._refresh_history()  # also recalculates the totals panel
-
-    # ------------------------------------------------------------------
-    # History link-column click handling
-    # ------------------------------------------------------------------
 
     _HIST_LINK_COL_ID = "#7"  # num=#1, date=#2, name=#3, game=#4, operation=#5, price=#6, link=#7
 
@@ -10248,56 +9807,6 @@ class App(tb.Window):
         way (browsing → see what's there, not logged in → log in).
         """
         webbrowser.open("https://steamcommunity.com/market/#myhistory")
-
-    def _hist_edit(self):
-        """Edit the price on selected History record(s).
-
-        Multi-select: one dialog per record, with the current price as
-        initial value. Cancel skips THAT record and moves on to the next —
-        the rest of the selection keeps going.
-        """
-        from steam import pretty_name
-
-        selected = self._require_hist_selection()
-        if not selected:
-            return
-        sym = self._currency_symbol()
-        purchases = load_json(PURCHASES_PATH, []) or []
-        # Index by (timestamp, mhn) — that's the unique key per history row.
-        index = {(p.get("timestamp", ""), p.get("market_hash_name", "")): p
-                 for p in purchases}
-        edited = 0
-        for chosen in selected:
-            key = (chosen.get("timestamp", ""), chosen.get("market_hash_name", ""))
-            target = index.get(key)
-            if target is None:
-                continue
-            current = _try_parse_money(target.get("price"))
-            default_str = (f"{current:.2f}" if isinstance(current, (int, float))
-                           else "")
-            price_str = simpledialog.askstring(
-                t("dlg.hist_edit.title"),
-                t("dlg.hist_edit.body", name=pretty_name(target), sym=sym),
-                initialvalue=default_str,
-                parent=self,
-            )
-            if price_str is None:
-                # Cancel → skip this record, keep walking the selection.
-                continue
-            try:
-                price_val = float(price_str.replace(",", "."))
-            except ValueError:
-                # Malformed number → show error, skip this row (don't abort).
-                messagebox.showerror(
-                    t("dlg.error.title"), t("dlg.bad_number"), parent=self,
-                )
-                continue
-            target["price"] = f"{price_val:.2f} {sym}".rstrip()
-            edited += 1
-
-        if edited:
-            save_json(PURCHASES_PATH, purchases)
-            self._refresh_history()  # also recalculates the totals panel
 
     def _hist_export_csv(self):
         """Save the History tab to a CSV — only the columns the user sees.
@@ -10381,7 +9890,6 @@ class App(tb.Window):
             tree.selection_set(iid)
             tree.focus(iid)
             self._mark_selected_rows(tree)
-            self._update_hist_delete_state()
         menu = tk.Menu(self, tearoff=0, font=self._context_menu_font())
         menu.add_command(label=t("btn.history_market_log"),
                          command=self._open_market_history)
@@ -10389,16 +9897,9 @@ class App(tb.Window):
                          command=self._hist_copy_link)
         menu.add_command(label=t("btn.history_export"),
                          command=self._hist_export_csv)
-        menu.add_command(label=t("btn.history_add"),
-                         command=self._hist_add_dialog)
         menu.add_separator()
         menu.add_command(label=t("btn.history_readd"),
                          command=self._hist_readd)
-        menu.add_command(label=t("btn.history_edit"),
-                         command=self._hist_edit)
-        menu.add_separator()
-        menu.add_command(label=t("btn.history_delete"),
-                         command=self._hist_delete)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -10934,6 +10435,8 @@ class App(tb.Window):
             self._refresh_games_list()
         elif selected == _path(self.tab_history):
             self._refresh_history()
+        elif selected == _path(self.tab_archive):
+            self._refresh_archive()
         elif selected == _path(self.tab_log):
             self._refresh_log()
 
