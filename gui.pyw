@@ -849,6 +849,15 @@ class App(tb.Window):
                   background=[("active", _shift(head_bg, +12))])
             s.configure("Treeview", borderwidth=0)
         self._ROW_TAGS.update(self._state_row_tags(ui, base_bg))
+        # «Історія»: the operation colours the row's text — purchases
+        # light blue, sales soft yellow. Pastel like the state accents, so
+        # a table full of them stays easy on the eye; a theme can override
+        # them in `ui.row_colors` (keys op_buy / op_sell).
+        row_colors = ui.get("row_colors") or {}
+        self._ROW_TAGS["op_buy"] = {
+            "foreground": row_colors.get("op_buy", "#7DB7F0")}
+        self._ROW_TAGS["op_sell"] = {
+            "foreground": row_colors.get("op_sell", "#E8C56A")}
         # Selection tint: per-theme override wins (e.g. claude.json sets a
         # muted gold tone via _meta.row_select_bg), otherwise we lift the
         # base by the same amount as text-selection inside Entry so the two
@@ -932,7 +941,10 @@ class App(tb.Window):
         if mode not in ("text", "tint"):
             return {tag: dict(opts)
                     for tag, opts in self._STATE_TAGS_CLASSIC.items()}
-        accents = {**self._STATE_ACCENTS, **(ui.get("row_colors") or {})}
+        accents = {**self._STATE_ACCENTS,
+                   **{tag: color
+                      for tag, color in (ui.get("row_colors") or {}).items()
+                      if tag in self._STATE_ACCENTS}}
         if mode == "text":
             return {tag: {"foreground": color}
                     for tag, color in accents.items()}
@@ -9748,7 +9760,10 @@ class App(tb.Window):
             # gets a full name and its own link. (A Treeview row can't
             # grow taller for one multi-line cell — row height is global.)
             games = [] if is_market else (row.get("names") or [])
+            # Zebra + operation colour (refunds keep the default text).
             zebra = ("even" if row_index % 2 == 0 else "odd",)
+            if op_key in ("buy", "sell"):
+                zebra += (f"op_{op_key}",)
             tree.insert("", END, iid=iid, open=True, values=(
                 row_index + 1,
                 date_text,
