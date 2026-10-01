@@ -39,8 +39,11 @@ sale, or the same game becomes cheaper on the Epic Games Store.
 - **Telegram alerts** — large image preview, HTML formatting, deep
   market URL on the inline button. Supports a «Не турбувати» (DND)
   quiet window.
-- **History tab** — every purchase / sale is logged with totals
-  (купівлі / продажі / баланс).
+- **History tab** — your real Steam history, imported with one click:
+  every Community Market purchase and sale plus store game purchases
+  and refunds, with totals and wallet balance; each row links to the
+  market listing or the game's store page
+- **Archive tab** — lots you closed by hand, with one-click re-add
 - **UI niceties** — ttkbootstrap themes (including a custom Claude
   theme), uk/en localization, font scaling, persistent column widths,
   Excel-style header double-click autofit, Ctrl+A / Delete / Enter
