@@ -307,6 +307,11 @@ class App(tb.Window):
     # Picked to play with the superhero (dark) theme; if the user switches
     # to a light theme, _configure_styles re-derives them on the fly.
     _ROW_TAGS = {
+        # The row the «Знайти» window is currently on. First in this dict
+        # on purpose — Tk resolves an option set by several tags in favour
+        # of the tag configured first, and this one has to beat the zebra
+        # and every state / operation colour. Filled in _configure_styles.
+        "found":        {"background": "#2F6B3F", "foreground": "#FFFFFF"},
         # Green/red are the "deal status" tints — applied per row based
         # on the lowest_price vs target_price comparison (direction
         # depends on kind: buy wants ≤, sell wants ≥). See the picker
@@ -850,6 +855,10 @@ class App(tb.Window):
                   background=[("active", _shift(head_bg, +12))])
             s.configure("Treeview", borderwidth=0)
         self._ROW_TAGS.update(self._state_row_tags(ui, base_bg))
+        # Search hit: the theme's green, toned down to a row background.
+        self._ROW_TAGS["found"] = {
+            "background": _mix(base_bg, s.colors.success, 0.55),
+            "foreground": "#FFFFFF" if _is_dark(base_bg) else "#000000"}
         # «Історія»: the operation colours the row's text — purchases
         # light blue, sales soft yellow. Pastel like the state accents, so
         # a table full of them stays easy on the eye; a theme can override
@@ -6050,6 +6059,9 @@ class App(tb.Window):
         dlg.bind("<KP_Enter>", lambda e: self._find_step(+1))
         dlg.bind("<Shift-Return>", lambda e: self._find_step(-1))
         dlg.bind("<Escape>", lambda e: dlg.destroy())
+        # Take the green mark off the table when the window goes away.
+        dlg.bind("<Destroy>", lambda e: self._find_unmark()
+                 if e.widget is dlg else None)
 
         # Top-right corner of the table, so it doesn't cover the rows.
         dlg.update_idletasks()
@@ -6063,6 +6075,7 @@ class App(tb.Window):
         """Recompute the matches for the current query; jump to the first."""
         tree = self._find_tree()
         query = self._find_var.get().strip().casefold()
+        self._find_unmark()
         self._find_hits = []
         self._find_pos = -1
         if tree is None or not query:
@@ -6084,6 +6097,17 @@ class App(tb.Window):
             return
         self._find_show(0)
 
+    def _find_unmark(self) -> None:
+        """Remove the green «found» mark from the row that carries it."""
+        tree, iid = getattr(self, "_find_marked", None) or (None, None)
+        self._find_marked = None
+        try:
+            if tree is not None and tree.exists(iid):
+                tree.item(iid, tags=tuple(
+                    tag for tag in tree.item(iid, "tags") if tag != "found"))
+        except tk.TclError:
+            pass
+
     def _find_step(self, delta: int) -> None:
         tree = self._find_tree()
         # The table was reloaded or the tab switched since the last search —
@@ -6099,7 +6123,12 @@ class App(tb.Window):
         tree = self._find_tree_ref
         iid = self._find_hits[position]
         self._find_pos = position
-        tree.selection_set(iid)
+        # The hit is marked with its own green tag rather than selected:
+        # selection stays the user's (and stays blue).
+        self._find_unmark()
+        tree.selection_remove(*tree.selection())
+        tree.item(iid, tags=(*tree.item(iid, "tags"), "found"))
+        self._find_marked = (tree, iid)
         tree.focus(iid)
         tree.see(iid)
         self._find_count.configure(
