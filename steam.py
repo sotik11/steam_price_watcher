@@ -473,10 +473,13 @@ def fetch_game_name(game_appid: str | int) -> str:
     if key in _GAME_NAME_CACHE:
         return _GAME_NAME_CACHE[key]
     try:
+        # NOT _DEFAULT_HEADERS: those carry `Host: steamcommunity.com`
+        # (they mimic a market tab), and the store answers 403 to a
+        # request whose Host names another site.
         resp = requests.get(
             APPDETAILS_URL,
             params={"appids": key, "filters": "basic", "l": "english"},
-            timeout=_TIMEOUT, headers=_DEFAULT_HEADERS,
+            timeout=_TIMEOUT, headers={"User-Agent": _UA},
         )
         resp.raise_for_status()
         data = resp.json() or {}
@@ -491,10 +494,9 @@ def fetch_game_name(game_appid: str | int) -> str:
         _GAME_NAME_CACHE[key] = "—"
         return "—"
     except Exception as exc:
-        # Network error or HTTP 403 — Steam's appdetails throttles bursts
-        # with a 403 (not 429). This is transient, so log it quietly and
-        # DON'T cache the failure: a later call (after the throttle lifts)
-        # can still resolve the real name.
+        # Network error or throttling — transient, so log it quietly and
+        # DON'T cache the failure: a later call can still resolve the
+        # real name.
         log.debug("fetch_game_name(%s) failed: %s", key, exc)
         return "—"
 

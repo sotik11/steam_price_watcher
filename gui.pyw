@@ -5420,7 +5420,10 @@ class App(tb.Window):
                 or item.get("game_name") == "—"
                 or not item.get("image_url")
             )
-            if not needs:
+            # Game purchases are complete as written: their name IS the
+            # market_hash_name, so the `display_name == mhn` test above
+            # would re-fetch them (as if they were cards) on every start.
+            if not needs or item.get("kind") == "game":
                 continue
             meta = None
             if other:
