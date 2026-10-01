@@ -9,8 +9,9 @@ v0.2.0.0 (2026-10-01)
   takes everything, later ones only what is new; no duplicates.
 - The former «History» is now «Archive»: lots closed with «Already
   purchased» / «Sold» land here. Cards no longer ask for a price — it comes
-  from the import. Archive keeps «Purchase history», «Export CSV» and
-  «Re-add to watchlist»; the manual «Add / Edit price / Delete» are gone.
+  from the import. Archive keeps «Purchase history», «Export CSV»,
+  «Re-add to watchlist» and «Delete»; the manual «Add» and «Edit price»
+  are gone.
 - The finance block moved to the new «History» and is computed from the
   imported Market operations (games are not included in the sums). The
   balance anchor and the ⚙ button are gone: «Steam balance» is the last

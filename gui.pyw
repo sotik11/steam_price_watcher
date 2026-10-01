@@ -3994,6 +3994,48 @@ class App(tb.Window):
                     state=NORMAL if sel_items else DISABLED,
                 )
 
+    def _update_hist_delete_state(self) -> None:
+        """Mirror card-list «Видалити» contract on the Archive tab.
+
+        Disabled + plain-style when nothing is selected; enabled with
+        the `danger` bootstyle the moment the click would do real work.
+        Bound to `hist_tree.<<TreeviewSelect>>` so the state tracks
+        whatever the user has highlighted, including multi-select.
+        """
+        btn = getattr(self, "btn_hist_delete", None)
+        tree = getattr(self, "hist_tree", None)
+        if btn is None or tree is None:
+            return
+        try:
+            has_sel = bool(tree.selection())
+        except tk.TclError:
+            return
+        if has_sel:
+            btn.configure(state=NORMAL, bootstyle="danger")
+        else:
+            btn.configure(state=DISABLED, bootstyle="")
+
+    # ------------------------------------------------------------------
+    # «Ігри» tab — wishlist game price tracking (bonus content)
+    # ------------------------------------------------------------------
+    #
+    # A third tracked list, but for store games instead of market cards:
+    #   * rows come from the user's Steam wishlist (one-click import);
+    #   * "Мінімум" is the historical-low price reconstructed from the
+    #     deepest recorded discount (Augmented Steam / ITAD data — the
+    #     same number SteamDB shows as "Lowest Recorded Price") applied
+    #     to Steam's regular price in the user's currency;
+    #   * alert rule: current price <= minimum → the discount matched
+    #     (or beat) the all-time low. kind="game" in the shared
+    #     antispam state.
+    # Lives behind the «Бонусний контент» Settings checkbox: hiding the
+    # tab stops polling/alerts but keeps gamelist.json intact.
+
+    # Column ids in the games tree (1-based "#n", order = `cols` below):
+    # num#1 name#2 regular#3 minimum#4 discount#5 price#6 epic#7 status#8
+    # link#9 imported#10 no_check#11 no_alert#12
+    _GAMES_LINK_COL_ID = "#9"   # «Посилання» («Steam | Epic», clickable)
+
     def _build_games_tab(self) -> None:
         parent = self.tab_games
         # Order per user spec: Ціна → Мінімальна → Знижка → Поточна Steam →
@@ -8968,12 +9010,11 @@ class App(tb.Window):
         self._apply_row_tags(self.hist_tree)
         self._setup_sortable_columns(self.hist_tree, list(cols))
         self._setup_column_widths(self.hist_tree)
-        self.hist_tree.bind(
-            "<<TreeviewSelect>>",
-            lambda e: self._mark_selected_rows(self.hist_tree))
+        self.hist_tree.bind("<<TreeviewSelect>>", self._on_hist_select)
         # Click on the link column opens the market listing in a browser.
         self.hist_tree.bind("<Button-1>", self._on_hist_tree_click, add="+")
-        # Enter → Знов до списку; Esc → clear selection.
+        # Delete → Видалити; Enter → Знов до списку; Esc → clear selection.
+        self.hist_tree.bind("<Delete>", lambda e: self._hist_delete(), add="+")
         self.hist_tree.bind("<Return>", lambda e: self._hist_readd(), add="+")
         self.hist_tree.bind("<KP_Enter>", lambda e: self._hist_readd(), add="+")
         self.hist_tree.bind("<Escape>", self._clear_tree_selection, add="+")
@@ -8998,6 +9039,12 @@ class App(tb.Window):
             ("btn.history_readd",      self._hist_readd),
         ]:
             ttk.Button(btn_f, text=t(key), command=cmd).pack(side=LEFT, padx=2)
+        # Same contract as «Видалити» on the card lists: disabled until a
+        # row is selected, red once it is (_update_hist_delete_state).
+        self.btn_hist_delete = ttk.Button(
+            btn_f, text=t("btn.history_delete"), command=self._hist_delete,
+            state=DISABLED, bootstyle="")
+        self.btn_hist_delete.pack(side=LEFT, padx=2)
 
     # ------------------------------------------------------------------
     # «Історія» tab — read-only Steam transaction history (imported)
@@ -9268,10 +9315,16 @@ class App(tb.Window):
         self._shist_importing = True
         self.btn_shist_import.configure(state=DISABLED,
                                         text=t("hist.import.running"))
+        self._set_status(t("status.history_importing"))
+
+        def show_progress(done: int, total: int) -> None:
+            self.btn_shist_import.configure(
+                text=t("hist.import.progress", done=done, total=total))
+            self._set_status(t("status.history_import_progress",
+                               done=done, total=total))
 
         def on_progress(done: int, total: int) -> None:
-            self.after(0, lambda: self.btn_shist_import.configure(
-                text=t("hist.import.progress", done=done, total=total)))
+            self.after(0, lambda: show_progress(done, total))
 
         def worker() -> None:
             import steam
@@ -9299,8 +9352,12 @@ class App(tb.Window):
         self.btn_shist_import.configure(state=NORMAL,
                                         text=t("btn.history_import"))
         if error is not None:
+            self._set_status(t("status.games_import_error", err=error))
             messagebox.showerror(t("dlg.error.title"), error, parent=self)
             return
+        self._set_status(t("status.history_import_done",
+                           market=result["market_added"],
+                           store=result["store_added"]))
         self._refresh_history()
         self._refresh_balance_placeholder(
             (self.config_data.get("market") or {}).get("currency", 18))
@@ -9593,6 +9650,10 @@ class App(tb.Window):
         except (tk.TclError, KeyError, ValueError):
             pass
 
+    def _on_hist_select(self, _event=None) -> None:
+        self._mark_selected_rows(self.hist_tree)
+        self._update_hist_delete_state()
+
     def _refresh_archive(self):
         from steam import pretty_name
 
@@ -9629,6 +9690,8 @@ class App(tb.Window):
         # Persisted sort order across restarts — same contract as the
         # card-list trees.
         self._restore_sort_state(self.hist_tree)
+        # A refresh wipes the selection — re-sync the «Видалити» button.
+        self._update_hist_delete_state()
 
     def _history_wallet_estimate(self) -> float | None:
         """Last wallet balance saved in steam_history.json, or None.
@@ -9739,6 +9802,35 @@ class App(tb.Window):
         if not sel:
             messagebox.showwarning(t("dlg.select.title"), t("dlg.select.body"), parent=self)
         return sel
+
+    def _hist_delete(self):
+        """Remove selected archive record(s)."""
+        from steam import pretty_name
+
+        selected = self._require_hist_selection()
+        if not selected:
+            return
+        if len(selected) == 1:
+            body = t("dlg.hist_delete.body", name=pretty_name(selected[0]))
+        else:
+            body = t("dlg.hist_delete.body_multi", count=len(selected))
+        if not self._confirm(t("dlg.hist_delete.title"), body):
+            return
+        targets = {
+            (p.get("timestamp"), p.get("market_hash_name"))
+            for p in selected
+        }
+        purchases = load_json(PURCHASES_PATH, [])
+        purchases = [
+            x for x in purchases
+            if (x.get("timestamp"), x.get("market_hash_name")) not in targets
+        ]
+        save_json(PURCHASES_PATH, purchases)
+        self._refresh_archive()
+
+    # ------------------------------------------------------------------
+    # History link-column click handling
+    # ------------------------------------------------------------------
 
     _HIST_LINK_COL_ID = "#7"  # num=#1, date=#2, name=#3, game=#4, operation=#5, price=#6, link=#7
 
@@ -9890,6 +9982,7 @@ class App(tb.Window):
             tree.selection_set(iid)
             tree.focus(iid)
             self._mark_selected_rows(tree)
+            self._update_hist_delete_state()
         menu = tk.Menu(self, tearoff=0, font=self._context_menu_font())
         menu.add_command(label=t("btn.history_market_log"),
                          command=self._open_market_history)
@@ -9900,6 +9993,9 @@ class App(tb.Window):
         menu.add_separator()
         menu.add_command(label=t("btn.history_readd"),
                          command=self._hist_readd)
+        menu.add_separator()
+        menu.add_command(label=t("btn.history_delete"),
+                         command=self._hist_delete)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
