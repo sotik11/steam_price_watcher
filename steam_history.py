@@ -15,7 +15,13 @@ File shape:
         "store":  [row, ...],      # newest first
         "wallet": {"balance": 834.24, "balance_raw": "834,24₴",
                    "updated": "2026-10-01T13:40:00"},
+        "links":  {"464589613221310074|Diablo® IV - Standard Edition":
+                       "https://store.steampowered.com/app/2344520/"},
+        "links_guess": {...},      # same keys, name-search fallbacks
     }
+
+`links` / `links_guess` cache "transid|name" → store page, because account
+history carries no appids (see «Store page lookup for purchases»).
 
 Every row carries a stable `id` from Steam, so re-importing never
 duplicates: `merge_rows` keeps one row per id.
@@ -68,7 +74,8 @@ _MONTHS = {m: i for i, m in enumerate(
 # ---------------------------------------------------------------------------
 
 def empty_history() -> dict:
-    return {"market": [], "store": [], "wallet": {}}
+    return {"market": [], "store": [], "wallet": {}, "links": {},
+            "links_guess": {}}
 
 
 def load_history(path: Path) -> dict:
@@ -83,8 +90,9 @@ def load_history(path: Path) -> dict:
     for section in ("market", "store"):
         if isinstance(data.get(section), list):
             result[section] = data[section]
-    if isinstance(data.get("wallet"), dict):
-        result["wallet"] = data["wallet"]
+    for section in ("wallet", "links", "links_guess"):
+        if isinstance(data.get(section), dict):
+            result[section] = data[section]
     return result
 
 
@@ -320,6 +328,7 @@ def _parse_store_rows(page_html: str, seq_start: int) -> tuple[list[dict], str]:
         row_id = (transid_match.group(1) if transid_match
                   else f"{year:04d}{month:02d}{day:02d}|{'|'.join(names)}|{total_raw}")
         rows.append({
+            "transid":       transid_match.group(1) if transid_match else "",
             # A refund reuses its purchase's transid, and a split
             # (wallet + card) refund is two rows on one transid — so the
             # operation and amount are part of the identity.
@@ -397,14 +406,263 @@ def fetch_store_history(cookies: dict | None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Store page lookup for purchases
+# ---------------------------------------------------------------------------
+#
+# Account history has no appids. Two ways to get a store page for a row:
+#
+#  1. Exact — Steam Support's page for the transaction:
+#     HelpWithTransaction?transid=… lists the receipt's items, each item
+#     page (HelpWithMyPurchase) lists the apps in that package as
+#     HelpWithGame/?appid=… links; the first is the game itself, DLC and
+#     keys follow. A one-item receipt redirects straight to the item page.
+#     The help site is its own session (token audience web:help), separate
+#     from store and community, and expires on its own.
+#  2. Guess — the public store search by name, used when the help session
+#     is unavailable or had no app for the receipt. Kept in a separate
+#     cache so an exact lookup can replace it on a later import.
+
+_HELP_TRANSACTION_URL = "https://help.steampowered.com/en/wizard/HelpWithTransaction"
+_STORE_APP_URL = "https://store.steampowered.com/app/{appid}/"
+_STORE_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
+_STORE_PAGE_URL = "https://store.steampowered.com/{kind}/{item_id}/"
+_HELP_DELAY_SEC = 0.5
+_SEARCH_DELAY_SEC = 0.4
+
+_WALLET_CREDIT_RE = re.compile(r"Wallet Credit$", re.IGNORECASE)
+_HELP_APP_LINK_RE = re.compile(r'href="[^"]*HelpWithGame/?\?[^"]*appid=(\d+)')
+_HELP_ITEM_LINK_RE = re.compile(
+    r'<a[^>]*href="([^"]*HelpWithMyPurchase\?[^"]*line_item=\d+[^"]*)"[^>]*>'
+    r'(.*?)</a>', re.DOTALL)
+
+_TRADEMARKS_RE = re.compile(r"[™®©]")
+# "… - Standard Edition", "…: Reloaded Edition", "… Deluxe Edition"
+_EDITION_RE = re.compile(
+    r"\s*[-–—:]?\s*(?:\b[\w']+\s+){1,2}edition\b.*$", re.IGNORECASE)
+# Package-only tails that are not part of the game's own name: bundle
+# words, regional SKUs ("RU-CN", "RU CIS IN"), "Pre-2024-08", "+ Vergil".
+_PACKAGE_TAIL_RE = re.compile(
+    r"\s*(?:"
+    r"[-–—:]?\s*\b(?:digital\s+)?(?:deluxe|gold|ultimate|premium|complete"
+    r"|bundle|collection|pack|upgrade|launch)"
+    r"|(?:[-\s]+(?:RU|CIS|IN|CN|ROW|EU|US|UA|TR|LATAM)\b)+"
+    r"|\s*-\s*pre-\d{4}-\d{2}"
+    r"|\s*\+.*"
+    r")\s*$", re.IGNORECASE)
+
+
+def _transid(row: dict) -> str:
+    transid = row.get("transid")
+    if transid:
+        return transid
+    # Rows imported before `transid` was stored: it is inside the id.
+    match = re.match(r"store_[a-z]+_(\d{10,})_", row.get("id", ""))
+    return match.group(1) if match else ""
+
+
+def _link_key(row: dict, name: str) -> str:
+    """Cache key for one item of a receipt: transid alone is not enough,
+    a receipt can hold several games."""
+    return f"{_transid(row)}|{name}"
+
+
+def transaction_url(row: dict) -> str:
+    """Steam's own page for one store transaction, or "" if unknown."""
+    transid = _transid(row)
+    return f"{_HELP_TRANSACTION_URL}?transid={transid}" if transid else ""
+
+
+def _normalize(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ",
+                  _TRADEMARKS_RE.sub("", html.unescape(name)).casefold()).strip()
+
+
+def _help_session(cookies: dict | None) -> requests.Session:
+    help_cookies = (cookies or {}).get("help.steampowered.com") or {}
+    if "steamLoginSecure" not in help_cookies:
+        raise SteamSessionExpired("no help.steampowered.com session cookies")
+    session = requests.Session()
+    session.headers.update({"User-Agent": steam._UA})
+    for name, value in help_cookies.items():
+        session.cookies.set(name, value, domain="help.steampowered.com")
+    return session
+
+
+def _help_get(session: requests.Session, url: str, **params) -> requests.Response:
+    resp = session.get(url, params=params or None, timeout=(5, 30))
+    if "/login" in resp.url:
+        raise SteamSessionExpired("help site redirected to login")
+    resp.raise_for_status()
+    return resp
+
+
+def find_transaction_app(session: requests.Session, transid: str,
+                         name: str, receipts: dict | None = None) -> str:
+    """Appid behind the receipt item called `name`, or "" (no app there).
+
+    On a multi-item receipt the item is picked by name, falling back to
+    the first one. `receipts` caches receipt pages by transid across
+    calls, so a five-game receipt is fetched once, not five times.
+    """
+    receipts = receipts if receipts is not None else {}
+    page = receipts.get(transid)
+    if page is None:
+        page = _help_get(session, _HELP_TRANSACTION_URL, transid=transid)
+        receipts[transid] = page
+    if "HelpWithMyPurchase" not in page.url:
+        items = [(html.unescape(link), _normalize(_TAG_RE.sub(" ", label)))
+                 for link, label in _HELP_ITEM_LINK_RE.findall(page.text)
+                 if f"transid={transid}" in link]
+        if not items:
+            return ""
+        wanted = _normalize(name)
+        named = [link for link, label in items if wanted and wanted in label]
+        time.sleep(_HELP_DELAY_SEC)
+        page = _help_get(session, named[0] if named else items[0][0])
+    match = _HELP_APP_LINK_RE.search(page.text)
+    return match.group(1) if match else ""
+
+
+def _name_candidates(name: str) -> list[str]:
+    """The purchase name, then progressively stripped down to the game."""
+    plain = _TRADEMARKS_RE.sub("", name).strip()
+    candidates = [plain]
+    current = plain
+    for pattern in (_EDITION_RE, _PACKAGE_TAIL_RE, _PACKAGE_TAIL_RE):
+        stripped = pattern.sub("", current).strip(" -–—:")
+        # Never strip a name down to nothing ("Deluxe Edition").
+        if stripped and stripped != current:
+            candidates.append(stripped)
+            current = stripped
+    return candidates
+
+
+def find_store_page(name: str) -> str:
+    """Guess a store page from the purchase name. Returns a URL or "".
+
+    Tries each candidate from `_name_candidates`; a result counts when its
+    normalized name equals the candidate, or — second choice — starts with
+    it ("Dying Light 2" → "Dying Light 2 Stay Human: Reloaded Edition").
+    """
+    for candidate in _name_candidates(name):
+        wanted = _normalize(candidate)
+        if not wanted:
+            continue
+        resp = requests.get(
+            _STORE_SEARCH_URL,
+            params={"term": candidate, "l": "english", "cc": "US"},
+            headers={"User-Agent": steam._UA}, timeout=(5, 15))
+        resp.raise_for_status()
+        items = [item for item in resp.json().get("items") or []
+                 if item.get("type") in ("app", "sub", "bundle")]
+        time.sleep(_SEARCH_DELAY_SEC)
+        exact = [item for item in items if _normalize(item["name"]) == wanted]
+        prefixed = [item for item in items if item.get("type") == "app"
+                    and _normalize(item["name"]).startswith(wanted + " ")]
+        for item in exact + prefixed:
+            return _STORE_PAGE_URL.format(kind=item["type"], item_id=item["id"])
+    return ""
+
+
+def resolve_store_links(history: dict, cookies: dict | None,
+                        progress=None) -> dict:
+    """Find store pages for purchased games not looked up yet.
+
+    history["links"]       — exact answers from the help site; "" is
+                             cached too, so a receipt with no app behind
+                             it is not asked about again.
+    history["links_guess"] — name-search fallbacks, for rows the help
+                             site could not answer. Such rows stay
+                             pending, so a later import with a live help
+                             session upgrades them.
+
+    Every game of a multi-game receipt is looked up on its own. Wallet
+    top-ups are skipped. Returns {"exact": n, "guessed": n,
+    "help_error": str | None}.
+    """
+    links = history.setdefault("links", {})
+    guesses = history.setdefault("links_guess", {})
+    pending: dict[str, tuple[dict, str]] = {}
+    for row in history["store"]:
+        if not _transid(row):
+            continue
+        for name in row.get("names") or []:
+            key = _link_key(row, name)
+            if key not in links and not _WALLET_CREDIT_RE.search(name):
+                pending.setdefault(key, (row, name))
+
+    result = {"exact": 0, "guessed": 0, "help_error": None}
+    if not pending:
+        return result
+    try:
+        session = _help_session(cookies)
+    except SteamSessionExpired as exc:
+        session = None
+        result["help_error"] = str(exc)
+
+    receipts: dict = {}
+    for index, (key, (row, name)) in enumerate(sorted(pending.items()),
+                                               start=1):
+        appid = ""
+        if session is not None:
+            try:
+                time.sleep(_HELP_DELAY_SEC)
+                appid = find_transaction_app(session, _transid(row), name,
+                                             receipts)
+                links[key] = (_STORE_APP_URL.format(appid=appid)
+                              if appid else "")
+                result["exact"] += bool(appid)
+            except (SteamSessionExpired, requests.RequestException) as exc:
+                # Session died or the site is unreachable — stop asking
+                # it, guess the rest by name.
+                session = None
+                result["help_error"] = str(exc)
+        if not appid and key not in guesses:
+            try:
+                guesses[key] = find_store_page(name)
+                result["guessed"] += bool(guesses[key])
+            except (requests.RequestException, ValueError) as exc:
+                log.warning("store search failed for %r: %s", name, exc)
+        if progress:
+            progress(index, len(pending))
+    log.info("store links: %d exact, %d guessed, %d receipts",
+             result["exact"], result["guessed"], len(pending))
+    return result
+
+
+def store_row_urls(history: dict, row: dict) -> list[str]:
+    """One link per game on the row's receipt, in receipt order.
+
+    A game's store page when known (exact, else guessed); otherwise
+    Steam's page for the transaction ("" only for rows without a transid).
+    """
+    fallback = transaction_url(row)
+    urls = []
+    for name in row.get("names") or [""]:
+        key = _link_key(row, name)
+        urls.append((history.get("links") or {}).get(key)
+                    or (history.get("links_guess") or {}).get(key)
+                    or fallback)
+    return urls
+
+
+def store_row_url(history: dict, row: dict) -> str:
+    """Single link for a store row: the game's page for a one-game
+    receipt, the transaction page for a multi-game one."""
+    urls = store_row_urls(history, row)
+    return urls[0] if len(urls) == 1 else transaction_url(row)
+
+
+# ---------------------------------------------------------------------------
 # One-call import
 # ---------------------------------------------------------------------------
 
-def import_history(path: Path, cookies: dict | None, progress=None) -> dict:
+def import_history(path: Path, cookies: dict | None, progress=None,
+                   link_progress=None) -> dict:
     """Fetch both sources, merge into the file at `path`, save.
 
     Returns {"market_added": n, "store_added": n, "history": dict,
-             "store_error": str | None}.
+             "store_error": str | None, "links_error": str | None}.
 
     The market part is mandatory (its errors propagate). The store part is
     best-effort: its own session cookie expires independently, and losing
@@ -431,6 +689,16 @@ def import_history(path: Path, cookies: dict | None, progress=None) -> dict:
                 "updated": datetime.now().isoformat(timespec="seconds"),
             }
 
+    # Save before the lookups: they take minutes on a first import and
+    # must not put the imported operations at risk. Best-effort, like the
+    # store part — the help site is a third session with its own expiry.
+    save_history(path, history)
+    links_error = resolve_store_links(
+        history, cookies, link_progress)["help_error"]
+    if links_error:
+        log.warning("store links: help site unavailable (%s) — "
+                    "guessed by name", links_error)
     save_history(path, history)
     return {"market_added": market_added, "store_added": store_added,
-            "history": history, "store_error": store_error}
+            "history": history, "store_error": store_error,
+            "links_error": links_error}

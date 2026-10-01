@@ -320,9 +320,13 @@ def wait_until_gone(exe_names: list[str], timeout_sec: float = 5.0,
 # browser. Community cookies authenticate market/listings endpoints;
 # store cookies authenticate wallet balance / purchase history.
 # We grab both so every authenticated call site has the cookies it needs.
+# The help site is a third session of its own (token audience web:help);
+# the history import reads transaction pages there to learn game appids.
+# Optional: present only if the user has opened help.steampowered.com.
 _STEAM_COMMUNITY = "steamcommunity.com"
 _STEAM_STORE = "store.steampowered.com"
-_STEAM_DOMAINS = (_STEAM_COMMUNITY, _STEAM_STORE)
+_STEAM_HELP = "help.steampowered.com"
+_STEAM_DOMAINS = (_STEAM_COMMUNITY, _STEAM_STORE, _STEAM_HELP)
 
 
 def _is_current_process_admin() -> bool:

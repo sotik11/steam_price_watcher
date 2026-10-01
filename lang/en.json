@@ -67,6 +67,7 @@
   "status.games_import_error":    "Import error: {err}",
   "status.history_importing": "Importing history from Steam…",
   "status.history_import_progress": "Importing history from Steam… {done}/{total}",
+  "status.history_links_progress": "Looking up purchased games… {done}/{total}",
   "status.history_import_done": "History import: new market operations — {market}, store purchases — {store}",
   "status.games_lows_importing":  "Fetching minimum prices…",
   "status.games_lows_done":        "Minimum prices: {count} of {total}  •  at all-time low: {at_min}",
@@ -304,6 +305,7 @@
   "hist.import.progress": "Importing… {done}/{total}",
   "hist.import.done": "Import finished.\nNew market operations: {market}\nNew store purchases: {store}",
   "hist.import.store_skipped": "Store history (games and wallet balance) could not be refreshed — the Steam store session has expired. Market operations were imported.",
+  "hist.import.links_skipped": "The Steam Support session has expired, so pages for new games were guessed by name (less accurate). For exact links open help.steampowered.com in the browser, refresh cookies and run the import again.",
   "hist.import.rate_limited": "Steam is rate-limiting requests. Try the import again later.",
   "hist.adjusted_note": "* adjusted as of: {date}",
 

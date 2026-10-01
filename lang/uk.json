@@ -67,6 +67,7 @@
   "status.games_import_error":    "Помилка імпорту: {err}",
   "status.history_importing": "Імпортую історію зі Steam…",
   "status.history_import_progress": "Імпортую історію зі Steam… {done}/{total}",
+  "status.history_links_progress": "Шукаю сторінки придбаних ігор… {done}/{total}",
   "status.history_import_done": "Імпорт історії: нових операцій на ринку — {market}, покупок у крамниці — {store}",
   "status.games_lows_importing":  "Тягну мінімальні ціни…",
   "status.games_lows_done":        "Мінімальні ціни: {count} з {total}  •  на історичному мінімумі: {at_min}",
@@ -304,6 +305,7 @@
   "hist.import.progress": "Імпорт… {done}/{total}",
   "hist.import.done": "Імпорт завершено.\nНових операцій на ринку: {market}\nНових покупок у крамниці: {store}",
   "hist.import.store_skipped": "Історію крамниці (ігри та баланс гаманця) оновити не вдалося — сесія крамниці Steam прострочена. Операції ринку імпортовано.",
+  "hist.import.links_skipped": "Сесія служби підтримки Steam прострочена, тому сторінки нових ігор підібрано за назвою (менш точно). Щоб отримати точні посилання, відкрийте help.steampowered.com у браузері, оновіть cookies і повторіть імпорт.",
   "hist.import.rate_limited": "Steam тимчасово обмежив запити. Спробуйте імпорт пізніше.",
   "hist.adjusted_note": "* було відкореговано станом на: {date}",
 

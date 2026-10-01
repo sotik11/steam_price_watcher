@@ -9199,30 +9199,68 @@ class App(tb.Window):
                 else t("hist.type.store"),
                 operation,
                 self._fmt_money(row.get("price")),
-                t("col.link.open"),
+                " | ".join(self._shist_link_labels(row)),
             ), tags=("even" if row_index % 2 == 0 else "odd",))
         self._mark_selected_rows(tree)
         self._restore_sort_state(tree)
         self._refresh_history_stats()
+
+    def _shist_link_labels(self, row: dict) -> list[str]:
+        """Link-cell parts: one «Відкрити», or «1 | 2 | 3» — a link per
+        game — for a receipt with several games (same idea as the
+        «Steam | Epic» cell on the Ігри tab)."""
+        names = row.get("names") or []
+        if row.get("source") == "store" and len(names) > 1:
+            return [str(number) for number in range(1, len(names) + 1)]
+        return [t("col.link.open")]
+
+    def _shist_link_part(self, iid: str, row: dict, x: int) -> int:
+        """Index of the link part under pixel `x` in the link cell.
+
+        The cell text is centred, so parts are located by measuring it
+        with the tree's font; a click on a " | " separator or the cell
+        padding goes to the nearest part.
+        """
+        import tkinter.font as tkfont
+        labels = self._shist_link_labels(row)
+        bbox = self.shist_tree.bbox(iid, self._SHIST_LINK_COL_ID)
+        if len(labels) == 1 or not bbox:
+            return 0
+        try:
+            font = tkfont.nametofont(
+                self.style.lookup("Treeview", "font") or "TkDefaultFont")
+        except tk.TclError:
+            font = tkfont.nametofont("TkDefaultFont")
+        separator = " | "
+        text_width = font.measure(separator.join(labels))
+        cursor = bbox[0] + (bbox[2] - text_width) / 2
+        boundary_step = font.measure(separator) / 2
+        for index, label in enumerate(labels):
+            cursor += font.measure(label)
+            # Part `index` owns everything up to the middle of the
+            # separator that follows it.
+            if x < cursor + boundary_step:
+                return index
+            cursor += font.measure(separator)
+        return len(labels) - 1
 
     def _shist_selected_rows(self) -> list[dict]:
         return [self._shist_rows[iid] for iid in self.shist_tree.selection()
                 if iid in self._shist_rows]
 
     def _shist_row_url(self, row: dict) -> str:
-        """Market listing for cards; store page (or store search) for games."""
+        """Market listing for cards; store / transaction page for games."""
         from urllib.parse import quote
-        from steam import GAME_STORE_URL, market_url
+        from steam import market_url
         if row.get("source") == "market":
             return market_url(row.get("appid"), row.get("market_hash_name"))
-        # Account history has no appids — resolve through the «Ігри» list
-        # by exact name, else fall back to a store search.
-        name = (row.get("names") or [row.get("display_name") or ""])[0]
-        wanted = name.strip().casefold()
-        for game in load_json(GAMELIST_PATH, []) or []:
-            if str(game.get("name") or "").strip().casefold() == wanted:
-                return GAME_STORE_URL.format(appid=game.get("appid"))
-        return "https://store.steampowered.com/search/?term=" + quote(name)
+        url = steam_history.store_row_url(self._steam_history, row)
+        if url:
+            return url
+        # No transaction id at all (very old rows) — a store search is
+        # the best we can offer.
+        return ("https://store.steampowered.com/search/?term="
+                + quote(row.get("display_name") or ""))
 
     def _on_shist_tree_click(self, event):
         tree = self.shist_tree
@@ -9230,9 +9268,17 @@ class App(tb.Window):
             return
         if tree.identify_column(event.x) != self._SHIST_LINK_COL_ID:
             return
-        row = self._shist_rows.get(tree.identify_row(event.y))
-        if row:
-            webbrowser.open(self._shist_row_url(row))
+        iid = tree.identify_row(event.y)
+        row = self._shist_rows.get(iid)
+        if not row:
+            return
+        if row.get("source") == "store" and len(row.get("names") or []) > 1:
+            urls = steam_history.store_row_urls(self._steam_history, row)
+            url = urls[self._shist_link_part(iid, row, event.x)]
+            if url:
+                webbrowser.open(url)
+            return
+        webbrowser.open(self._shist_row_url(row))
 
     def _on_shist_tree_motion(self, event):
         tree = self.shist_tree
@@ -9334,13 +9380,18 @@ class App(tb.Window):
         def on_progress(done: int, total: int) -> None:
             self.after(0, lambda: show_progress(done, total))
 
+        def on_link_progress(done: int, total: int) -> None:
+            self.after(0, lambda: self._set_status(
+                t("status.history_links_progress", done=done, total=total)))
+
         def worker() -> None:
             import steam
             result = None
             error = None
             try:
                 result = steam_history.import_history(
-                    STEAM_HISTORY_PATH, cookies, on_progress)
+                    STEAM_HISTORY_PATH, cookies, on_progress,
+                    on_link_progress)
             except steam.SteamSessionExpired:
                 error = t("import.session_expired")
                 log.warning("history import aborted — session expired")
@@ -9373,6 +9424,8 @@ class App(tb.Window):
                    store=result["store_added"])]
         if result["store_error"]:
             lines.append(t("hist.import.store_skipped"))
+        if result["links_error"]:
+            lines.append(t("hist.import.links_skipped"))
         messagebox.showinfo(t("dlg.import.title"), "\n\n".join(lines),
                             parent=self)
 
