@@ -7,6 +7,7 @@
     "active_tab_bg": "#6CB6FF",
     "ui": {
       "flat": true,
+      "tab_underline": "#4FA866",
       "neutral_buttons": true,
       "rows": "text"
     }

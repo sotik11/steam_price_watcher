@@ -871,6 +871,42 @@ class App(tb.Window):
 
         self._configure_notebook_tab_style()
 
+    def _underline_tab_element(self, bg: str, plate: str, accent: str) -> str:
+        """Create (once per colour set) a notebook-tab element: a plain
+        `bg` face normally; when the tab is selected, a `plate`-coloured
+        face with rounded top corners and a 3px `accent` line along the
+        bottom. Returns the element name for `style.layout`.
+
+        ttk has no "underline the active tab" option, so the face is an
+        image element: two small bitmaps stretched by Tk, with the edges
+        excluded from stretching (`border`) so the corners and the line
+        keep their shape. Elements and their images belong to the current
+        theme and must stay referenced for the life of the window.
+        """
+        cache = self.__dict__.setdefault("_tab_elements", {})
+        key = (self.style.theme_use(), bg, plate, accent)
+        if key in cache:
+            return cache[key][0]
+        size, line, radius = 20, 3, 4
+        plain = tk.PhotoImage(master=self, width=size, height=size)
+        plain.put(bg, to=(0, 0, size, size))
+        selected = tk.PhotoImage(master=self, width=size, height=size)
+        selected.put(plate, to=(0, 0, size, size))
+        # Round the two top corners: repaint the pixels outside a
+        # quarter-circle of `radius` back to the page background.
+        for y in range(radius):
+            for x in range(radius):
+                if (radius - x - 0.5) ** 2 + (radius - y - 0.5) ** 2 > radius ** 2:
+                    selected.put(bg, to=(x, y, x + 1, y + 1))
+                    selected.put(bg, to=(size - 1 - x, y, size - x, y + 1))
+        selected.put(accent, to=(0, size - line, size, size))
+        name = f"Underline{len(cache)}.tab"
+        self.style.element_create(
+            name, "image", plain, ("selected", selected),
+            border=(radius, radius, radius, line + 1), sticky="nsew")
+        cache[key] = (name, plain, selected)
+        return name
+
     def _theme_ui(self) -> dict:
         """The current theme's optional `_meta.ui` block ({} = classic look)."""
         meta = getattr(self, "_custom_theme_by_code", {}).get(
@@ -934,21 +970,28 @@ class App(tb.Window):
         # _build_ui), and that strip's height assumes compact tabs.
         ui = self._theme_ui()
         if ui.get("flat"):
-            # Flat tabs: no boxes, the active one is a lifted surface with
-            # accent-coloured text.
+            # Flat tabs: no boxes; the active one is a lifted plate with
+            # accent-coloured text and an underline (`ui.tab_underline`,
+            # else the same accent).
             bg = s.colors.bg
-            lifted = _shift(bg, +16) if _is_dark(bg) else _shift(bg, -12)
+            plate = _shift(bg, +16) if _is_dark(bg) else _shift(bg, -12)
             muted = _mix(s.colors.fg, bg, 0.35)
             s.configure("TNotebook", borderwidth=0, bordercolor=bg,
                         lightcolor=bg, darkcolor=bg)
-            s.configure("TNotebook.Tab", padding=(14, 6), borderwidth=0,
-                        background=bg, bordercolor=bg, lightcolor=bg,
-                        darkcolor=bg, foreground=muted)
+            s.layout("TNotebook.Tab", [
+                (self._underline_tab_element(
+                    bg, plate, ui.get("tab_underline") or active_tab_bg), {
+                    "sticky": "nswe", "children": [
+                        ("Notebook.padding", {
+                            "side": "top", "sticky": "nswe", "children": [
+                                ("Notebook.label",
+                                 {"side": "top", "sticky": ""})]})]})])
+            s.configure("TNotebook.Tab", padding=(14, 6, 14, 9),
+                        borderwidth=0, background=bg, foreground=muted)
+            # `background` is what the label paints behind its text — it
+            # has to match the plate, or the text sits in a darker box.
             s.map("TNotebook.Tab",
-                  background=[("selected", lifted)],
-                  lightcolor=[("selected", lifted)],
-                  darkcolor=[("selected", lifted)],
-                  bordercolor=[("selected", lifted)],
+                  background=[("selected", plate)],
                   foreground=[("selected", active_tab_bg)])
         else:
             s.configure("TNotebook.Tab", padding=(10, 4))
@@ -960,6 +1003,16 @@ class App(tb.Window):
         if hasattr(self, "statusbar"):
             self.statusbar.configure(
                 relief="flat" if ui.get("flat") else "sunken")
+        # The frame around each table: a hard 1px box in the classic look,
+        # none in the flat one.
+        for tree in self._all_trees():
+            try:
+                if ui.get("flat"):
+                    tree.master.configure(relief="flat", borderwidth=0)
+                else:
+                    tree.master.configure(relief="solid", borderwidth=1)
+            except tk.TclError:
+                pass
         if ui.get("neutral_buttons"):
             # Plain buttons become a quiet surface; only buttons with an
             # explicit bootstyle (success / warning / danger / info) keep a
