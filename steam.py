@@ -1362,6 +1362,8 @@ _TYPE_SUFFIXES_PLAIN = [
     " Trading Card",
     " Profile Background",
     " Emoticon",
+    " Booster Pack",
+    " Sticker",
 ]
 
 
