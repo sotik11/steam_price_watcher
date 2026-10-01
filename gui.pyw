@@ -237,6 +237,27 @@ def _shift(c: str, delta: int) -> str:
     return _rgb_to_hex(r + delta, g + delta, b + delta)
 
 
+def _excel_csv_locale() -> tuple[str, str]:
+    """(list separator, decimal sign) Excel expects on this machine.
+
+    Excel splits a .csv by the Windows «list separator», not by a fixed
+    comma: on a Ukrainian / Russian locale that is ";", and a
+    comma-separated file lands in column A as one long cell. Numbers
+    likewise need the regional decimal sign to be read as numbers.
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Control Panel\International") as key:
+            separator = winreg.QueryValueEx(key, "sList")[0]
+            decimal = winreg.QueryValueEx(key, "sDecimal")[0]
+        if len(separator) == 1 and len(decimal) == 1:
+            return separator, decimal
+    except (ImportError, OSError):
+        pass
+    return ",", "."
+
+
 def _try_parse_money(s) -> float | None:
     """Pull a float out of strings like '5,49 ₴', '$1.23', '—', or already-num.
 
@@ -9336,7 +9357,8 @@ class App(tb.Window):
             return
         tree = self.shist_tree
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
+            separator, decimal = _excel_csv_locale()
+            writer = csv.writer(f, delimiter=separator)
             writer.writerow([t(key) for key in (
                 "col.date", "col.hist.card", "col.hist.name", "col.type",
                 "col.operation", "col.price", "col.link")])
@@ -9346,11 +9368,11 @@ class App(tb.Window):
                 if row is None:
                     continue
                 values = tree.item(iid, "values")
-                # Raw number, not the "1 234.00₴" cell text — spreadsheets
-                # can sum it.
+                # A plain number (regional decimal sign), not the
+                # "1 234.00₴" cell text — spreadsheets can sum it.
+                price = f"{row.get('price', 0):.2f}".replace(".", decimal)
                 writer.writerow([values[1], values[2], values[3], values[4],
-                                 values[5], f"{row.get('price', 0):.2f}",
-                                 self._shist_iid_url(iid)])
+                                 values[5], price, self._shist_iid_url(iid)])
                 # Other games of the same receipt: name + link only, the
                 # receipt's price is already on the line above.
                 for child_iid in tree.get_children(iid):
@@ -9965,6 +9987,14 @@ class App(tb.Window):
         """
         webbrowser.open("https://steamcommunity.com/market/#myhistory")
 
+    @staticmethod
+    def _csv_price(raw, decimal: str) -> str:
+        """Archive prices are stored as text ("63.00 ₴"); export a number."""
+        amount = _try_parse_money(raw)
+        if amount is None:
+            return "" if raw in (None, "—") else str(raw)
+        return f"{amount:.2f}".replace(".", decimal)
+
     def _hist_export_csv(self):
         """Save the History tab to a CSV — only the columns the user sees.
 
@@ -10012,7 +10042,8 @@ class App(tb.Window):
             ("link",      t("col.link")),
         ]
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
+            separator, decimal = _excel_csv_locale()
+            writer = csv.writer(f, delimiter=separator)
             writer.writerow([header for _, header in columns])
             for p in purchases:
                 appid = p.get("appid")
@@ -10026,7 +10057,7 @@ class App(tb.Window):
                     pretty_name(p),
                     p.get("game_name", ""),
                     op_label,
-                    p.get("price", ""),
+                    self._csv_price(p.get("price"), decimal),
                     market_url(appid, mhn) if appid and mhn else "",
                 ])
         messagebox.showinfo(t("dlg.export.title"), t("dlg.export.saved", path=path))
