@@ -1,12 +1,10 @@
 Steam Price Watcher — Changelog
 ===============================
 
-v0.4.0.0 (2026-10-01)
+v0.2.0.0 (2026-10-01)
 - Find by name on «History» and «Archive»: Ctrl+F, the «Find» button or the
   context-menu item open a small window; the matching row is highlighted
   green, ◀ ▶ (or Enter / Shift+Enter) walk through the matches.
-
-v0.3.0.0 (2026-10-01)
 - «Add by URL» on the «Purchase» tab now also accepts a Market search link
   (for example all foil cards or all backgrounds of one game): a window lists
   every item found, you keep them all or untick some, then set a target for
@@ -24,8 +22,6 @@ v0.3.0.0 (2026-10-01)
 - Column widths now keep the proportions you set when the window is resized
   (before, the difference was split equally and the layout drifted).
 - Fixed: the fallback game-name lookup got 403 from the Steam store.
-
-v0.2.0.0 (2026-10-01)
 - New «History» tab — operations imported straight from Steam with the
   «Import from Steam» button: every Community Market purchase and sale
   (exact time, price, and the «received after fees» amount for sales), plus
