@@ -33,6 +33,7 @@ Anything with a missing/malformed file is logged and skipped — one bad
 theme can't take the whole app down.
 """
 import json
+import inspect
 import logging
 from pathlib import Path
 
@@ -97,10 +98,13 @@ def register_all() -> list[dict]:
             registered.append(theme)
             continue
         try:
+            # ttkbootstrap 2.x renamed `themetype` to `mode`.
+            params = inspect.signature(ThemeDefinition.__init__).parameters
+            type_kw = "mode" if "mode" in params else "themetype"
             tdef = ThemeDefinition(
                 name=theme["code"],
-                themetype=theme["type"],
                 colors=theme["colors"],
+                **{type_kw: theme["type"]},
             )
             style.register_theme(tdef)
             registered.append(theme)

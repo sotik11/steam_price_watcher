@@ -1,6 +1,13 @@
 Steam Price Watcher — Changelog
 ===============================
 
+v0.1.4.6 (2026-10-01)
+- Fixed: the app failed to start after a fresh install (seen on
+  Windows 11) with «unknown option "-bootstyle"». The installer pulled the
+  new ttkbootstrap 2.x, which is incompatible with our UI code. The library
+  is now pinned to 1.x (reinstalling restores the right version), and the
+  code additionally tolerates 2.x.
+
 v0.1.4.5 (2026-08-17)
 - Fixed the «API returned success=false» error when adding a card or
   refreshing prices. Steam's market rewrite wrapped the orderbook response

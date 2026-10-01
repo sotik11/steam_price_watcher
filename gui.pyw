@@ -3,6 +3,7 @@ import csv
 import json
 import logging
 import html
+import inspect
 import os
 import re
 import shutil
@@ -20,6 +21,38 @@ from tkinter import messagebox, simpledialog, ttk
 
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
+
+# ttkbootstrap 2.x compatibility. We pass `bootstyle=` to plain tkinter.ttk
+# widgets all over this file; 1.x patched tkinter.ttk on import, 2.x only
+# does it on request — without this every such widget dies with
+# TclError: unknown option "-bootstyle". requirements.txt pins <2 (the app
+# is tuned for 1.x looks); this keeps a stray 2.x install from crashing.
+if hasattr(tb, "enable_global_api"):
+    tb.enable_global_api()
+# "superhero" and friends are legacy (1.x) theme names in 2.x.
+if hasattr(tb, "install_legacy_themes"):
+    tb.install_legacy_themes()
+
+
+def _kwarg_name(func, new_name: str, old_name: str) -> str:
+    """Pick the keyword spelling `func` accepts (2.x renamed a few)."""
+    return new_name if new_name in inspect.signature(func).parameters else old_name
+
+
+def _sf_vbar(scrolled_frame):
+    """ScrolledFrame's vertical scrollbar: `vbar` in 2.x, `vscroll` in 1.x."""
+    vbar = getattr(scrolled_frame, "vbar", None)
+    return vbar if vbar is not None else getattr(scrolled_frame, "vscroll", None)
+
+
+def _sf_thumb(scrolled_frame) -> float:
+    """Visible fraction of a ScrolledFrame's content (>= ~1.0 means it fits)."""
+    vbar = _sf_vbar(scrolled_frame)
+    if vbar is not None:
+        first, last = vbar.get()
+        return float(last) - float(first)
+    _, thumb = scrolled_frame._measures()
+    return thumb
 
 import i18n
 import themes as custom_themes
@@ -320,7 +353,9 @@ class App(tb.Window):
         # aren't registered yet at this point. We switch to the user's
         # chosen theme below once Style exists and our custom themes are
         # loaded.
-        super().__init__(title=t("app.title"), themename="superhero", size=(1100, 620))
+        theme_kw = _kwarg_name(tb.Window.__init__, "theme", "themename")
+        super().__init__(title=t("app.title"), size=(1100, 620),
+                         **{theme_kw: "superhero"})
         # Show the version next to the app name in the (custom) title bar.
         self.title(f"{t('app.title')}   v{__version__}")
         # App icon in the title bar + taskbar. We use assets/app.ico, which
@@ -709,7 +744,7 @@ class App(tb.Window):
                 # content now fits in view. Snapping back to top is the
                 # right "reset to baseline" behaviour for a font change.
                 widget.yview_moveto(0)
-                _, thumb = widget._measures()
+                thumb = _sf_thumb(widget)
                 # Use < 0.999 not < 1.0 — floating-point rounding can
                 # leave thumb = 0.9998 when content just barely fits.
                 if thumb >= 0.999:
@@ -1392,7 +1427,8 @@ class App(tb.Window):
             # ttkbootstrap paint a tinted border around every scrollable
             # tab. We only want the scrollbar coloured; we set its bootstyle
             # directly below.
-            sf = ScrolledFrame(holder, autohide=True)
+            autohide_kw = _kwarg_name(ScrolledFrame.__init__, "auto_hide", "autohide")
+            sf = ScrolledFrame(holder, **{autohide_kw: True})
             sf.pack(fill=BOTH, expand=YES)
             # Stash the holder on the ScrolledFrame so the notebook.add
             # loop below can find it without us juggling two refs everywhere.
@@ -1400,8 +1436,8 @@ class App(tb.Window):
             # Tint ONLY the vertical scrollbar (matches Treeview's green
             # accent). Leaves the content frame styled like a plain Frame.
             try:
-                sf.vscroll.configure(bootstyle="success")
-            except tk.TclError:
+                _sf_vbar(sf).configure(bootstyle="success")
+            except (AttributeError, tk.TclError):
                 pass
             # ttkbootstrap's autohide is mouse-based — entering the frame
             # always pop the scrollbar, even when the content fits and
@@ -1411,8 +1447,8 @@ class App(tb.Window):
             _orig_show = sf.show_scrollbars
             def _smart_show(_orig=_orig_show, _sf=sf):
                 try:
-                    _, thumb = _sf._measures()
-                except (AttributeError, tk.TclError, ZeroDivisionError):
+                    thumb = _sf_thumb(_sf)
+                except (AttributeError, tk.TclError, ZeroDivisionError, ValueError):
                     thumb = 0.0
                 if thumb < 0.999:
                     _orig()
