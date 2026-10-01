@@ -858,6 +858,10 @@ class App(tb.Window):
             "foreground": row_colors.get("op_buy", "#7DB7F0")}
         self._ROW_TAGS["op_sell"] = {
             "foreground": row_colors.get("op_sell", "#E8C56A")}
+        # Refunds: money came back — the lists' "good" green.
+        self._ROW_TAGS["op_refund"] = {
+            "foreground": row_colors.get(
+                "op_refund", self._STATE_ACCENTS["good_match"])}
         # Selection tint: per-theme override wins (e.g. claude.json sets a
         # muted gold tone via _meta.row_select_bg), otherwise we lift the
         # base by the same amount as text-selection inside Entry so the two
@@ -1431,8 +1435,12 @@ class App(tb.Window):
           widest cell, like double-clicking a column border in Excel.
         """
         self._restore_column_widths(tree)
+        # Also without saved widths: the defaults are the proportions.
+        self._remember_column_shares(tree)
         tree.bind("<ButtonRelease-1>",
                   lambda e: self._persist_column_widths(e.widget), add="+")
+        tree.bind("<Configure>",
+                  lambda e: self._rescale_columns(e.widget, e.width), add="+")
         tree.bind("<Double-Button-1>",
                   self._on_column_separator_dblclick, add="+")
 
@@ -1453,6 +1461,7 @@ class App(tb.Window):
                 pass
         if not widths:
             return
+        tree._width_shares = dict(widths)
         cur = (self.config_data.get("ui", {})
                                .get("column_widths", {}) or {}).get(key)
         if cur == widths:
@@ -1489,6 +1498,39 @@ class App(tb.Window):
                     tree.column(col, width=int(width))
                 except (tk.TclError, ValueError):
                     pass
+        self._remember_column_shares(tree)
+
+    @staticmethod
+    def _remember_column_shares(tree: ttk.Treeview) -> None:
+        """Snapshot the columns' widths as the proportions to keep."""
+        try:
+            tree._width_shares = {col: int(tree.column(col, "width"))
+                                  for col in tree["columns"]}
+        except (tk.TclError, ValueError):
+            pass
+
+    @staticmethod
+    def _rescale_columns(tree: ttk.Treeview, width: int) -> None:
+        """Fit the columns to `width`, keeping the remembered proportions.
+
+        Left alone, Tk hands a width change out EQUALLY to every column —
+        so a table that comes up wider or narrower than it was saved at
+        (window resized, or the app killed before saving its geometry)
+        skews whatever the user set. Scaling from the remembered widths
+        keeps a 2:1 pair 2:1 at any window size.
+        """
+        shares = getattr(tree, "_width_shares", None)
+        if not shares or width <= 1:
+            return
+        total = sum(shares.values())
+        if total <= 0:
+            return
+        scale = 1.0 if abs(total - width) <= len(shares) else width / total
+        for col, share in shares.items():
+            try:
+                tree.column(col, width=max(20, round(share * scale)))
+            except tk.TclError:
+                return
 
     def _on_column_separator_dblclick(self, event) -> None:
         """Excel-style auto-fit: double-click a column border to size the
@@ -9760,16 +9802,21 @@ class App(tb.Window):
             # gets a full name and its own link. (A Treeview row can't
             # grow taller for one multi-line cell — row height is global.)
             games = [] if is_market else (row.get("names") or [])
-            # Zebra + operation colour (refunds keep the default text).
+            # Zebra + operation colour.
             zebra = ("even" if row_index % 2 == 0 else "odd",)
-            if op_key in ("buy", "sell"):
+            if op_key in ("buy", "sell", "refund"):
                 zebra += (f"op_{op_key}",)
+            # Store rows have no "game the item belongs to" — the row IS a
+            # game (or a wallet top-up); mark the kind instead of a dash.
+            store_mark = ("💰" if any(
+                steam_history.is_wallet_credit(name) for name in games)
+                else "🎮")
             tree.insert("", END, iid=iid, open=True, values=(
                 row_index + 1,
                 date_text,
                 (games[0] if len(games) > 1
                  else row.get("display_name") or "—"),
-                row.get("game_name") or "—",
+                (row.get("game_name") or "—") if is_market else store_mark,
                 (row.get("item_type") or "—") if is_market
                 else t("hist.type.store"),
                 operation,
@@ -9781,7 +9828,7 @@ class App(tb.Window):
                 self._shist_rows[child_iid] = row
                 self._shist_game_index[child_iid] = game_index
                 tree.insert(iid, END, iid=child_iid, values=(
-                    "", "", game, "", "", "", "", t("col.link.open"),
+                    "", "", game, store_mark, "", "", "", t("col.link.open"),
                 ), tags=zebra)
         self._mark_selected_rows(tree)
         self._restore_sort_state(tree)

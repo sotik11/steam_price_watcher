@@ -451,6 +451,11 @@ _PACKAGE_TAIL_RE = re.compile(
     r")\s*$", re.IGNORECASE)
 
 
+def is_wallet_credit(name: str) -> bool:
+    """True for a wallet top-up line ("Purchased 150₴ Wallet Credit")."""
+    return bool(_WALLET_CREDIT_RE.search(name or ""))
+
+
 def _transid(row: dict) -> str:
     transid = row.get("transid")
     if transid:
