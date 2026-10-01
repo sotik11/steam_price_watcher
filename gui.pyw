@@ -229,6 +229,14 @@ def _is_dark(c: str) -> bool:
     return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128
 
 
+def _mix(base: str, accent: str, share: float) -> str:
+    """Blend `share` (0..1) of `accent` into `base` — both "#rrggbb"."""
+    b = [int(base[i:i + 2], 16) for i in (1, 3, 5)]
+    a = [int(accent[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * share):02x}"
+                         for x, y in zip(b, a))
+
+
 def _shift(c: str, delta: int) -> str:
     try:
         r, g, b = _hex_to_rgb(c)
@@ -327,6 +335,23 @@ class App(tb.Window):
         "even":     {},   # placeholder — filled in _configure_styles()
         "odd":      {},
         "selected": {},   # placeholder — appended last to win tag priority
+    }
+    # The classic solid fills above, kept aside: a theme with a `ui.rows`
+    # mode rewrites the state tags in _ROW_TAGS, and switching back to a
+    # classic theme must restore them.
+    _STATE_TAGS_CLASSIC = {tag: dict(opts) for tag, opts in _ROW_TAGS.items()
+                           if opts}
+    # One accent per state for the `ui.rows` modes ("text": the row's text
+    # takes the accent over the zebra; "tint": the accent is blended
+    # faintly into the row background). A theme may override any of them
+    # in `ui.row_colors`.
+    _STATE_ACCENTS = {
+        "good_match":   "#6FCF97",
+        "bad_match":    "#EB7A7A",
+        "error":        "#EB7A7A",
+        "rate_limited": "#E2B93B",
+        "epic_cheaper": "#F2C94C",
+        "frozen":       "#8FA7B8",
     }
 
     def __init__(self):
@@ -806,6 +831,20 @@ class App(tb.Window):
         # subtle — strong stripes get noisy on five-row tables.
         base_bg = s.lookup("Treeview", "background") or "#2b3e50"
         alt_bg = _shift(base_bg, +14) if _is_dark(base_bg) else _shift(base_bg, -10)
+
+        ui = self._theme_ui()
+        if ui.get("flat"):
+            # Borderless header band a step off the table background,
+            # instead of a boxed cell per column.
+            head_bg = (_shift(base_bg, +10) if _is_dark(base_bg)
+                       else _shift(base_bg, -8))
+            s.configure("Treeview.Heading", padding=(8, 8), relief="flat",
+                        borderwidth=0, background=head_bg,
+                        foreground=_mix(s.colors.fg, base_bg, 0.25))
+            s.map("Treeview.Heading",
+                  background=[("active", _shift(head_bg, +12))])
+            s.configure("Treeview", borderwidth=0)
+        self._ROW_TAGS.update(self._state_row_tags(ui, base_bg))
         # Selection tint: per-theme override wins (e.g. claude.json sets a
         # muted gold tone via _meta.row_select_bg), otherwise we lift the
         # base by the same amount as text-selection inside Entry so the two
@@ -832,6 +871,44 @@ class App(tb.Window):
 
         self._configure_notebook_tab_style()
 
+    def _theme_ui(self) -> dict:
+        """The current theme's optional `_meta.ui` block ({} = classic look)."""
+        meta = getattr(self, "_custom_theme_by_code", {}).get(
+            self.style.theme_use(), {})
+        return meta.get("ui") or {}
+
+    def _state_row_tags(self, ui: dict, base_bg: str) -> dict:
+        """State-row tag options for the theme's `ui.rows` mode.
+
+        Rows carry BOTH a zebra tag and a state tag; Tk resolves an option
+        set by several tags in favour of the tag configured first, and
+        _ROW_TAGS lists the state tags before the zebra. So:
+          classic — the state tag's solid background covers the zebra;
+          "text"  — the state tag sets only the text colour, the zebra
+                    shows through;
+          "tint"  — a faint blend of the accent into the background.
+        """
+        mode = ui.get("rows")
+        if mode not in ("text", "tint"):
+            return {tag: dict(opts)
+                    for tag, opts in self._STATE_TAGS_CLASSIC.items()}
+        accents = {**self._STATE_ACCENTS, **(ui.get("row_colors") or {})}
+        if mode == "text":
+            return {tag: {"foreground": color}
+                    for tag, color in accents.items()}
+        share = float(ui.get("tint_share", 0.2))
+        return {tag: {"background": _mix(base_bg, color, share)}
+                for tag, color in accents.items()}
+
+    def _all_trees(self) -> list:
+        """Every table that carries row tags."""
+        trees = list(getattr(self, "list_trees", {}).values())
+        for name in ("games_tree", "hist_tree", "shist_tree"):
+            tree = getattr(self, name, None)
+            if tree is not None:
+                trees.append(tree)
+        return [tree for tree in trees if tree is not None]
+
     def _configure_notebook_tab_style(self) -> None:
         """Apply the active-tab tint. Extracted so we can call it after
         `_build_ui` too — at startup the notebook doesn't exist yet when
@@ -855,12 +932,54 @@ class App(tb.Window):
         # accidentally inflate the tab strip — the user widget floats in
         # the empty strip ABOVE the tabs (see notebook.pack pady in
         # _build_ui), and that strip's height assumes compact tabs.
-        s.configure("TNotebook.Tab", padding=(10, 4))
-        s.map("TNotebook.Tab",
-              background=[("selected", active_tab_bg)],
-              lightcolor=[("selected", active_tab_bg)],
-              bordercolor=[("selected", active_tab_bg)],
-              foreground=[("selected", active_tab_fg)])
+        ui = self._theme_ui()
+        if ui.get("flat"):
+            # Flat tabs: no boxes, the active one is a lifted surface with
+            # accent-coloured text.
+            bg = s.colors.bg
+            lifted = _shift(bg, +16) if _is_dark(bg) else _shift(bg, -12)
+            muted = _mix(s.colors.fg, bg, 0.35)
+            s.configure("TNotebook", borderwidth=0, bordercolor=bg,
+                        lightcolor=bg, darkcolor=bg)
+            s.configure("TNotebook.Tab", padding=(14, 6), borderwidth=0,
+                        background=bg, bordercolor=bg, lightcolor=bg,
+                        darkcolor=bg, foreground=muted)
+            s.map("TNotebook.Tab",
+                  background=[("selected", lifted)],
+                  lightcolor=[("selected", lifted)],
+                  darkcolor=[("selected", lifted)],
+                  bordercolor=[("selected", lifted)],
+                  foreground=[("selected", active_tab_bg)])
+        else:
+            s.configure("TNotebook.Tab", padding=(10, 4))
+            s.map("TNotebook.Tab",
+                  background=[("selected", active_tab_bg)],
+                  lightcolor=[("selected", active_tab_bg)],
+                  bordercolor=[("selected", active_tab_bg)],
+                  foreground=[("selected", active_tab_fg)])
+        if hasattr(self, "statusbar"):
+            self.statusbar.configure(
+                relief="flat" if ui.get("flat") else "sunken")
+        if ui.get("neutral_buttons"):
+            # Plain buttons become a quiet surface; only buttons with an
+            # explicit bootstyle (success / warning / danger / info) keep a
+            # colour, so colour means something again.
+            bg = s.colors.bg
+            surface = _shift(bg, +20) if _is_dark(bg) else _shift(bg, -14)
+            hover = _shift(surface, +14) if _is_dark(bg) else _shift(surface, -10)
+            border = s.colors.border
+            s.configure("TButton", background=surface, foreground=s.colors.fg,
+                        bordercolor=border, darkcolor=surface,
+                        lightcolor=surface, padding=(12, 6))
+            s.map("TButton",
+                  background=[("disabled", bg), ("pressed !disabled", hover),
+                              ("hover !disabled", hover)],
+                  darkcolor=[("disabled", bg), ("pressed !disabled", hover),
+                             ("hover !disabled", hover)],
+                  lightcolor=[("disabled", bg), ("pressed !disabled", hover),
+                              ("hover !disabled", hover)],
+                  bordercolor=[("disabled", border)],
+                  foreground=[("disabled", _mix(s.colors.fg, bg, 0.6))])
 
         # Scrollbar accent. ttkbootstrap paints the thumb from PhotoImage
         # assets (not via ttk colour options), so plain `style.configure`
@@ -1382,9 +1501,14 @@ class App(tb.Window):
         Treeview tag configuration is per-widget, not per-style, so we have
         to do this once per tree we create.
         """
+        # Always pass both options: "" clears what a previous theme set
+        # (a text-mode state tag must NOT keep an old background, or it
+        # would hide the zebra underneath).
         for tag, opts in self._ROW_TAGS.items():
             if opts:
-                tree.tag_configure(tag, **opts)
+                tree.tag_configure(tag,
+                                   background=opts.get("background", ""),
+                                   foreground=opts.get("foreground", ""))
 
     @staticmethod
     def _autohide_scrollbar(sb: ttk.Scrollbar, first, last) -> None:
@@ -3933,7 +4057,7 @@ class App(tb.Window):
                     "🚫" if item.get("no_check") else "",
                     "🔇" if item.get("no_alert") else "",
                 ),
-                tags=(row_tag,),
+                tags=(zebra,) if row_tag == zebra else (zebra, row_tag),
             )
             row_index += 1
         # Refresh wiped the tags — restore the "selected" marker so the
@@ -4291,7 +4415,7 @@ class App(tb.Window):
                     "🚫" if g.get("no_check") else "",
                     "🔇" if g.get("no_alert") else "",
                 ),
-                tags=(row_tag,),
+                tags=(zebra,) if row_tag == zebra else (zebra, row_tag),
             )
         self._mark_selected_rows(tree)
         self._restore_sort_state(tree)
@@ -8136,10 +8260,8 @@ class App(tb.Window):
             pass
         # New palette → new alt-row tint. Re-derive and reapply.
         self._configure_styles()
-        for tree in self.list_trees.values():
+        for tree in self._all_trees():
             self._apply_row_tags(tree)
-        if hasattr(self, "hist_tree"):
-            self._apply_row_tags(self.hist_tree)
         self._refresh_watchlist()
         self._refresh_archive()
         # New theme → new title-bar colour.
@@ -8830,10 +8952,8 @@ class App(tb.Window):
         except Exception:
             pass
         self._configure_styles()
-        for tree in self.list_trees.values():
+        for tree in self._all_trees():
             self._apply_row_tags(tree)
-        if hasattr(self, "hist_tree"):
-            self._apply_row_tags(self.hist_tree)
         self._refresh_watchlist()
         self._refresh_archive()
         self._apply_native_titlebar_theme()

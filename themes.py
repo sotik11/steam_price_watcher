@@ -75,6 +75,10 @@ def _load_files() -> list[dict]:
             # Per-theme accent for the active (selected) notebook tab. Empty
             # → gui.pyw falls back to the theme's `primary` colour.
             "active_tab_bg": meta.get("active_tab_bg"),
+            # Optional look-and-feel switches read by gui.pyw
+            # (_configure_styles): row colouring mode, flat headers / tabs,
+            # neutral buttons. Absent → the classic look, unchanged.
+            "ui": meta.get("ui") if isinstance(meta.get("ui"), dict) else {},
             "path": str(path),
         })
     return themes

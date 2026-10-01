@@ -1,0 +1,33 @@
+{
+  "_meta": {
+    "code": "slate_tint",
+    "name": "Slate (tint)",
+    "type": "dark",
+    "row_select_bg": "#2F4A66",
+    "active_tab_bg": "#6CB6FF",
+    "ui": {
+      "flat": true,
+      "neutral_buttons": true,
+      "rows": "tint",
+      "tint_share": 0.2
+    }
+  },
+  "colors": {
+    "primary":   "#4C9AFF",
+    "secondary": "#6B7280",
+    "success":   "#4FA866",
+    "info":      "#4C9AFF",
+    "warning":   "#D99A3A",
+    "danger":    "#D9534F",
+    "light":     "#E8E6E3",
+    "dark":      "#17181A",
+    "bg":        "#1B1C1E",
+    "fg":        "#E8E6E3",
+    "selectbg":  "#2F4A66",
+    "selectfg":  "#FFFFFF",
+    "border":    "#34373B",
+    "inputfg":   "#E8E6E3",
+    "inputbg":   "#232528",
+    "active":    "#2A2D31"
+  }
+}
