@@ -1,7 +1,7 @@
 Steam Price Watcher — Changelog
 ===============================
 
-UNRELEASED
+v0.3.0.0 (2026-10-01)
 - «Add by URL» on the «Purchase» tab now also accepts a Market search link
   (for example all foil cards or all backgrounds of one game): a window lists
   every item found, you keep them all or untick some, then set a target for
@@ -12,6 +12,12 @@ UNRELEASED
   where it means something. A row's state (price is good / not) is shown by
   text colour instead of filling the whole row. The older themes, including
   «Claude», are unchanged.
+- «History»: rows are coloured by operation — purchases light blue, sales
+  yellow, refunds green; games show a 🎮 mark instead of a dash.
+- «Games»: columns renamed and reordered — Price | Discount | Min | Max |
+  Epic Store.
+- Column widths now keep the proportions you set when the window is resized
+  (before, the difference was split equally and the layout drifted).
 - Fixed: the fallback game-name lookup got 403 from the Steam store.
 
 v0.2.0.0 (2026-10-01)
