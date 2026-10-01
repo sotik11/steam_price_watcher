@@ -66,6 +66,10 @@ WATCHLIST_PATH = BASE / "watchlist.json"
 SALELIST_PATH = BASE / "salelist.json"
 STATE_PATH = BASE / "state.json"
 PURCHASES_PATH = BASE / "purchases.json"
+# Theme for a fresh install / «reset to defaults». A custom theme from
+# themes/*.json; if that file is missing the app simply stays on the
+# built-in theme the window boots with.
+DEFAULT_THEME = "slate"
 STEAM_HISTORY_PATH = BASE / steam_history.HISTORY_FILENAME
 # Wishlist-games tracking («Ігри» tab). Survives the bonus_content
 # checkbox being switched off — the tab hides, the data stays.
@@ -379,7 +383,7 @@ class App(tb.Window):
 
         self.config_data = load_config()
         ui_cfg = self.config_data.get("ui", {})
-        theme = ui_cfg.get("theme", "superhero")
+        theme = ui_cfg.get("theme", DEFAULT_THEME)
         # Apply log toggles BEFORE we start doing anything significant
         # — system_log routes uncaught exceptions to our logger, and
         # we want that hook in place before any callback can fire.
@@ -7642,7 +7646,7 @@ class App(tb.Window):
         ]
         custom_codes = [c["code"] for c in self._custom_themes]
         themes = builtin_themes + custom_codes
-        self.var_theme = tk.StringVar(value=ui.get("theme", "superhero"))
+        self.var_theme = tk.StringVar(value=ui.get("theme", DEFAULT_THEME))
         cb_theme = ttk.Combobox(
             cols, values=themes, textvariable=self.var_theme,
             state="readonly", width=10,
@@ -8946,7 +8950,7 @@ class App(tb.Window):
             "poll_delay_sec":    1.5,
             "interval_minutes":  5,
             "games_interval_hours": 24,
-            "theme":             "superhero",
+            "theme":             DEFAULT_THEME,
             "language":          "en",
             "font_scale":        1,
             "repeat_if_lower":   True,

@@ -1,6 +1,14 @@
 Steam Price Watcher — Changelog
 ===============================
 
+UNRELEASED
+- New «Slate» theme (now the default): flat tabs with an underlined active
+  one, borderless table headers, quiet grey buttons — colour is kept only
+  where it means something. A row's state (price is good / not) is shown by
+  text colour instead of filling the whole row. The older themes, including
+  «Claude», are unchanged.
+- Fixed: the fallback game-name lookup got 403 from the Steam store.
+
 v0.2.0.0 (2026-10-01)
 - New «History» tab — operations imported straight from Steam with the
   «Import from Steam» button: every Community Market purchase and sale
