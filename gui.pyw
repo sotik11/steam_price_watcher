@@ -477,6 +477,7 @@ class App(tb.Window):
         # taste, then quit" path. _save_settings also stamps the current
         # geometry, so a Save click while resized works too.
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Control-KeyPress>", self._on_ctrl_f, add="+")
         self._refresh_watchlist()
         self._refresh_scheduler_status()
         self._refresh_history()
@@ -5981,6 +5982,130 @@ class App(tb.Window):
         )
         tree.configure(cursor="hand2" if in_link else "")
 
+    # ------------------------------------------------------------------
+    # Find by name — «Історія» and «Архів»
+    # ------------------------------------------------------------------
+
+    def _find_tree(self) -> ttk.Treeview | None:
+        """The table the search applies to: the one on the active tab."""
+        try:
+            selected = self.notebook.select()
+        except tk.TclError:
+            return None
+        for tab, name in ((self.tab_history, "shist_tree"),
+                          (self.tab_archive, "hist_tree")):
+            if selected == str(getattr(tab, "_holder", tab)):
+                return getattr(self, name, None)
+        return None
+
+    def _on_ctrl_f(self, event):
+        """Ctrl+F on «Історія» / «Архів» opens the search box. Dispatched
+        on keycode (F = 70), so it works on a Cyrillic layout too."""
+        if getattr(event, "keycode", -1) != 70 or self._find_tree() is None:
+            return None
+        self._open_find()
+        return "break"
+
+    def _open_find(self) -> None:
+        """Small non-modal «Знайти» window for the active tab's table.
+
+        Typing searches as you go (name and game columns, case-insensitive)
+        and selects the first match; ◀ ▶ / Enter / Shift+Enter walk the
+        matches, wrapping around. The window stays open while you click
+        around the table.
+        """
+        if self._find_tree() is None:
+            return
+        dlg = getattr(self, "_find_dlg", None)
+        if dlg is not None and dlg.winfo_exists():
+            dlg.lift()
+            self._find_entry.focus_set()
+            self._find_entry.selection_range(0, END)
+            return
+
+        dlg = tk.Toplevel(self)
+        self._find_dlg = dlg
+        dlg.title(t("find.title"))
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        body = ttk.Frame(dlg, padding=10)
+        body.pack(fill=BOTH, expand=YES)
+
+        ttk.Label(body, text=t("find.label")).pack(side=LEFT)
+        self._find_var = tk.StringVar()
+        self._find_entry = ttk.Entry(body, textvariable=self._find_var, width=28)
+        self._find_entry.pack(side=LEFT, padx=(8, 8))
+        ttk.Button(body, text="◀", width=3,
+                   command=lambda: self._find_step(-1)).pack(side=LEFT)
+        ttk.Button(body, text="▶", width=3,
+                   command=lambda: self._find_step(+1)
+                   ).pack(side=LEFT, padx=(4, 8))
+        self._find_count = ttk.Label(body, text="", width=14, anchor=W)
+        self._find_count.pack(side=LEFT)
+
+        self._find_hits: list[str] = []
+        self._find_pos = -1
+        self._find_var.trace_add("write", lambda *_: self._find_run())
+        dlg.bind("<Return>", lambda e: self._find_step(+1))
+        dlg.bind("<KP_Enter>", lambda e: self._find_step(+1))
+        dlg.bind("<Shift-Return>", lambda e: self._find_step(-1))
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+        # Top-right corner of the table, so it doesn't cover the rows.
+        dlg.update_idletasks()
+        tree = self._find_tree()
+        x = tree.winfo_rootx() + tree.winfo_width() - dlg.winfo_width() - 24
+        y = tree.winfo_rooty() + 8
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self._find_entry.focus_set()
+
+    def _find_run(self) -> None:
+        """Recompute the matches for the current query; jump to the first."""
+        tree = self._find_tree()
+        query = self._find_var.get().strip().casefold()
+        self._find_hits = []
+        self._find_pos = -1
+        if tree is None or not query:
+            self._find_count.configure(text="")
+            return
+
+        def all_rows(parent=""):
+            for iid in tree.get_children(parent):
+                yield iid
+                yield from all_rows(iid)
+
+        self._find_hits = [
+            iid for iid in all_rows()
+            if query in f"{tree.set(iid, 'name')} {tree.set(iid, 'game')}".casefold()
+        ]
+        self._find_tree_ref = tree
+        if not self._find_hits:
+            self._find_count.configure(text=t("find.none"))
+            return
+        self._find_show(0)
+
+    def _find_step(self, delta: int) -> None:
+        tree = self._find_tree()
+        # The table was reloaded or the tab switched since the last search —
+        # the row ids we hold are stale.
+        if (tree is not getattr(self, "_find_tree_ref", None)
+                or any(not tree.exists(iid) for iid in self._find_hits)):
+            self._find_run()
+            return
+        if self._find_hits:
+            self._find_show((self._find_pos + delta) % len(self._find_hits))
+
+    def _find_show(self, position: int) -> None:
+        tree = self._find_tree_ref
+        iid = self._find_hits[position]
+        self._find_pos = position
+        tree.selection_set(iid)
+        tree.focus(iid)
+        tree.see(iid)
+        self._find_count.configure(
+            text=t("find.count", index=position + 1,
+                   total=len(self._find_hits)))
+
     def _on_tree_ctrl_a(self, event):
         """Ctrl+A in a Treeview → toggle "select all" / "deselect all".
 
@@ -9642,6 +9767,7 @@ class App(tb.Window):
         for key, cmd in [
             ("btn.history_market_log", self._open_market_history),
             ("btn.history_export",     self._hist_export_csv),
+            ("btn.find",               self._open_find),
             ("btn.history_readd",      self._hist_readd),
         ]:
             ttk.Button(btn_f, text=t(key), command=cmd).pack(side=LEFT, padx=2)
@@ -9723,6 +9849,8 @@ class App(tb.Window):
                    command=self._open_account_history).pack(side=LEFT, padx=2)
         ttk.Button(btn_f, text=t("btn.history_export"),
                    command=self._shist_export_csv).pack(side=LEFT, padx=2)
+        ttk.Button(btn_f, text=t("btn.find"),
+                   command=self._open_find).pack(side=LEFT, padx=2)
         self.btn_shist_import = ttk.Button(
             btn_f, text=t("btn.history_import"), command=self._shist_import,
             bootstyle="warning")
@@ -9906,6 +10034,7 @@ class App(tb.Window):
                          command=self._shist_copy_link)
         menu.add_command(label=t("btn.history_export"),
                          command=self._shist_export_csv)
+        menu.add_command(label=t("btn.find"), command=self._open_find)
         menu.add_separator()
         menu.add_command(label=t("btn.history_import"),
                          command=self._shist_import)
@@ -10660,6 +10789,7 @@ class App(tb.Window):
                          command=self._hist_copy_link)
         menu.add_command(label=t("btn.history_export"),
                          command=self._hist_export_csv)
+        menu.add_command(label=t("btn.find"), command=self._open_find)
         menu.add_separator()
         menu.add_command(label=t("btn.history_readd"),
                          command=self._hist_readd)
