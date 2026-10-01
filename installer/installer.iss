@@ -61,6 +61,7 @@ Source: "..\alerts.py";               DestDir: "{app}"; Flags: ignoreversion
 Source: "..\browser_cookies.py";      DestDir: "{app}"; Flags: ignoreversion
 Source: "..\cookie_extract_helper.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\epic.py";                 DestDir: "{app}"; Flags: ignoreversion
+Source: "..\steam_history.py";        DestDir: "{app}"; Flags: ignoreversion
 Source: "..\gui.pyw";                 DestDir: "{app}"; Flags: ignoreversion
 Source: "..\i18n.py";                 DestDir: "{app}"; Flags: ignoreversion
 Source: "..\regions.py";              DestDir: "{app}"; Flags: ignoreversion

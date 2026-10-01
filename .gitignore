@@ -19,6 +19,7 @@ gameblacklist.json
 purchases.json
 salelist.json
 watchlist.json
+steam_history.json
 
 # Шаблоны конфигов — коммитим
 !config.example.json
