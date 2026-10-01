@@ -1,10 +1,10 @@
 Steam Price Watcher — Changelog
 ===============================
 
-UNRELEASED
+v0.4.0.0 (2026-10-01)
 - Find by name on «History» and «Archive»: Ctrl+F, the «Find» button or the
-  context-menu item open a small window; the match is selected as a row,
-  ◀ ▶ (or Enter / Shift+Enter) walk through the matches.
+  context-menu item open a small window; the matching row is highlighted
+  green, ◀ ▶ (or Enter / Shift+Enter) walk through the matches.
 
 v0.3.0.0 (2026-10-01)
 - «Add by URL» on the «Purchase» tab now also accepts a Market search link
