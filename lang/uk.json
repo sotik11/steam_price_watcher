@@ -286,6 +286,7 @@
   "scheduler.state_paused":  "⏸ вимкнена",
 
   "btn.history_market_log": "Історія придбань 🔗",
+  "btn.history_account_log": "Повна історія придбань 🔗",
   "btn.history_export":     "Експорт CSV",
   "btn.history_import":     "📥 Імпорт зі Steam",
   "btn.history_add":        "Додати",

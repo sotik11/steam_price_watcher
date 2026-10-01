@@ -286,6 +286,7 @@
   "scheduler.state_paused":  "⏸ disabled",
 
   "btn.history_market_log": "Purchase history 🔗",
+  "btn.history_account_log": "Full purchase history 🔗",
   "btn.history_export":     "Export CSV",
   "btn.history_import":     "📥 Import from Steam",
   "btn.history_add":        "Add",

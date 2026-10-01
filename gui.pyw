@@ -9113,6 +9113,8 @@ class App(tb.Window):
 
         ttk.Button(btn_f, text=t("btn.history_market_log"),
                    command=self._open_market_history).pack(side=LEFT, padx=2)
+        ttk.Button(btn_f, text=t("btn.history_account_log"),
+                   command=self._open_account_history).pack(side=LEFT, padx=2)
         ttk.Button(btn_f, text=t("btn.history_export"),
                    command=self._shist_export_csv).pack(side=LEFT, padx=2)
         self.btn_shist_import = ttk.Button(
@@ -9259,6 +9261,8 @@ class App(tb.Window):
         menu = tk.Menu(self, tearoff=0, font=self._context_menu_font())
         menu.add_command(label=t("btn.history_market_log"),
                          command=self._open_market_history)
+        menu.add_command(label=t("btn.history_account_log"),
+                         command=self._open_account_history)
         menu.add_command(label=t("ctx.copy_link"),
                          command=self._shist_copy_link)
         menu.add_command(label=t("btn.history_export"),
@@ -9270,6 +9274,10 @@ class App(tb.Window):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _open_account_history(self):
+        """Open Steam's full account purchase history (store side)."""
+        webbrowser.open("https://store.steampowered.com/account/history/")
 
     def _shist_export_csv(self):
         """Save the «Історія» table to CSV — the visible columns, plus URL."""
