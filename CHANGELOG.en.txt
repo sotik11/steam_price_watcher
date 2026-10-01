@@ -8,8 +8,8 @@ v0.2.0.0 (2026-10-01)
   game purchases and refunds from the account history. The first import
   takes everything, later ones only what is new; no duplicates.
 - Links on «History»: cards open the Market listing, games open the game's
-  store page. A receipt with several games shows «1 | 2 | 3» in the cell —
-  each number opens its own game. Game pages are taken from Steam Support
+  store page. A receipt with several games lists each game on its own line
+  under the receipt, with its own link. Game pages are taken from Steam Support
   (open help.steampowered.com in the browser once and refresh cookies);
   without that they are guessed by name.
 - The former «History» is now «Archive»: lots closed with «Already

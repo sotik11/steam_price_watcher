@@ -3925,7 +3925,14 @@ class App(tb.Window):
     @staticmethod
     def _mark_selected_rows(tree: ttk.Treeview) -> None:
         selection = set(tree.selection())
-        for iid in tree.get_children():
+
+        def all_rows(parent=""):
+            # Nested rows too — «Історія» nests a receipt's extra games.
+            for iid in tree.get_children(parent):
+                yield iid
+                yield from all_rows(iid)
+
+        for iid in all_rows():
             tags = [tag for tag in tree.item(iid, "tags") if tag != "selected"]
             if iid in selection:
                 tags.append("selected")
@@ -9177,6 +9184,7 @@ class App(tb.Window):
         tree = self.shist_tree
         tree.delete(*tree.get_children())
         self._shist_rows = {}
+        self._shist_game_index = {}
         for row_index, row in enumerate(rows):
             is_market = row.get("source") == "market"
             stamp = row.get("timestamp", "")
@@ -9190,59 +9198,44 @@ class App(tb.Window):
             # spaces and currency glyphs) — map a plain index instead.
             iid = f"r{row_index}"
             self._shist_rows[iid] = row
-            tree.insert("", END, iid=iid, values=(
+            # A receipt with several games: the first game sits on the
+            # receipt's own line, the rest follow as nested lines so each
+            # gets a full name and its own link. (A Treeview row can't
+            # grow taller for one multi-line cell — row height is global.)
+            games = [] if is_market else (row.get("names") or [])
+            zebra = ("even" if row_index % 2 == 0 else "odd",)
+            tree.insert("", END, iid=iid, open=True, values=(
                 row_index + 1,
                 date_text,
-                row.get("display_name") or "—",
+                (games[0] if len(games) > 1
+                 else row.get("display_name") or "—"),
                 row.get("game_name") or "—",
                 (row.get("item_type") or "—") if is_market
                 else t("hist.type.store"),
                 operation,
                 self._fmt_money(row.get("price")),
-                " | ".join(self._shist_link_labels(row)),
-            ), tags=("even" if row_index % 2 == 0 else "odd",))
+                t("col.link.open"),
+            ), tags=zebra)
+            for game_index, game in enumerate(games[1:], start=1):
+                child_iid = f"{iid}g{game_index}"
+                self._shist_rows[child_iid] = row
+                self._shist_game_index[child_iid] = game_index
+                tree.insert(iid, END, iid=child_iid, values=(
+                    "", "", game, "", "", "", "", t("col.link.open"),
+                ), tags=zebra)
         self._mark_selected_rows(tree)
         self._restore_sort_state(tree)
         self._refresh_history_stats()
 
-    def _shist_link_labels(self, row: dict) -> list[str]:
-        """Link-cell parts: one «Відкрити», or «1 | 2 | 3» — a link per
-        game — for a receipt with several games (same idea as the
-        «Steam | Epic» cell on the Ігри tab)."""
-        names = row.get("names") or []
-        if row.get("source") == "store" and len(names) > 1:
-            return [str(number) for number in range(1, len(names) + 1)]
-        return [t("col.link.open")]
-
-    def _shist_link_part(self, iid: str, row: dict, x: int) -> int:
-        """Index of the link part under pixel `x` in the link cell.
-
-        The cell text is centred, so parts are located by measuring it
-        with the tree's font; a click on a " | " separator or the cell
-        padding goes to the nearest part.
-        """
-        import tkinter.font as tkfont
-        labels = self._shist_link_labels(row)
-        bbox = self.shist_tree.bbox(iid, self._SHIST_LINK_COL_ID)
-        if len(labels) == 1 or not bbox:
-            return 0
-        try:
-            font = tkfont.nametofont(
-                self.style.lookup("Treeview", "font") or "TkDefaultFont")
-        except tk.TclError:
-            font = tkfont.nametofont("TkDefaultFont")
-        separator = " | "
-        text_width = font.measure(separator.join(labels))
-        cursor = bbox[0] + (bbox[2] - text_width) / 2
-        boundary_step = font.measure(separator) / 2
-        for index, label in enumerate(labels):
-            cursor += font.measure(label)
-            # Part `index` owns everything up to the middle of the
-            # separator that follows it.
-            if x < cursor + boundary_step:
-                return index
-            cursor += font.measure(separator)
-        return len(labels) - 1
+    def _shist_iid_url(self, iid: str) -> str:
+        """Link behind one table line (a receipt line or a nested game)."""
+        row = self._shist_rows.get(iid)
+        if row is None:
+            return ""
+        if row.get("source") == "store" and len(row.get("names") or []) > 1:
+            urls = steam_history.store_row_urls(self._steam_history, row)
+            return urls[self._shist_game_index.get(iid, 0)]
+        return self._shist_row_url(row)
 
     def _shist_selected_rows(self) -> list[dict]:
         return [self._shist_rows[iid] for iid in self.shist_tree.selection()
@@ -9268,17 +9261,9 @@ class App(tb.Window):
             return
         if tree.identify_column(event.x) != self._SHIST_LINK_COL_ID:
             return
-        iid = tree.identify_row(event.y)
-        row = self._shist_rows.get(iid)
-        if not row:
-            return
-        if row.get("source") == "store" and len(row.get("names") or []) > 1:
-            urls = steam_history.store_row_urls(self._steam_history, row)
-            url = urls[self._shist_link_part(iid, row, event.x)]
-            if url:
-                webbrowser.open(url)
-            return
-        webbrowser.open(self._shist_row_url(row))
+        url = self._shist_iid_url(tree.identify_row(event.y))
+        if url:
+            webbrowser.open(url)
 
     def _on_shist_tree_motion(self, event):
         tree = self.shist_tree
@@ -9290,9 +9275,10 @@ class App(tb.Window):
         tree.configure(cursor="hand2" if in_link else "")
 
     def _shist_copy_link(self) -> None:
-        rows = self._shist_selected_rows()
-        if rows:
-            self._copy_to_clipboard(self._shist_row_url(rows[0]))
+        selection = self.shist_tree.selection()
+        url = self._shist_iid_url(selection[0]) if selection else ""
+        if url:
+            self._copy_to_clipboard(url)
 
     def _show_shist_context_menu(self, event) -> None:
         """Right-click menu on «Історія» — mirrors its buttons."""
@@ -9352,7 +9338,13 @@ class App(tb.Window):
                 # can sum it.
                 writer.writerow([values[1], values[2], values[3], values[4],
                                  values[5], f"{row.get('price', 0):.2f}",
-                                 self._shist_row_url(row)])
+                                 self._shist_iid_url(iid)])
+                # Other games of the same receipt: name + link only, the
+                # receipt's price is already on the line above.
+                for child_iid in tree.get_children(iid):
+                    writer.writerow([values[1], tree.set(child_iid, "name"),
+                                     "", values[4], values[5], "",
+                                     self._shist_iid_url(child_iid)])
         messagebox.showinfo(t("dlg.export.title"), t("dlg.export.saved", path=path))
 
     def _shist_import(self) -> None:
